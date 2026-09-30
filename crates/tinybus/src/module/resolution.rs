@@ -87,7 +87,7 @@ impl From<Resolution> for Waited {
 }
 
 /// One slot per module, keyed by registry id.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct ResolutionTable {
     slots: Mutex<HashMap<String, Slot>>,
 }

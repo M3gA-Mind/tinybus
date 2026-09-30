@@ -338,6 +338,99 @@ fn refused(path: &Path, reason: &'static str) -> Error {
     Error::module_refused(path, reason)
 }
 
+/// Whether `component` is safe to use as one directory name.
+///
+/// The three values that build a cache path (a module id, its version, and a
+/// host key) are compiled-in data in a typical host, so nothing reaches this
+/// with a separator in it. It is checked anyway because of what sits at the end
+/// of the path: [`prune_stale_versions`] calls `remove_dir_all` on what these
+/// build. A registry edit or a future value that carried `..` or a separator
+/// would turn a cache tidy-up into deleting somewhere else entirely, and a rule
+/// that has to hold for a delete is worth stating rather than inferring from
+/// where the data happens to come from today.
+#[must_use]
+pub fn is_safe_path_component(component: &str) -> bool {
+    !component.is_empty()
+        && component != "."
+        && component != ".."
+        && !component.contains('/')
+        && !component.contains('\\')
+        && !component.contains('\0')
+        // A leading dot would collide with the `.staging-*` directories a
+        // concurrent download is filling.
+        && !component.starts_with('.')
+}
+
+/// Where one artifact of one module version is cached, when all three
+/// components are usable as directory names.
+///
+/// `None` rather than a sanitised path: a registry entry that cannot name a
+/// directory is a build-time mistake, and quietly rewriting it would hide the
+/// mistake behind a cache that silently never hits.
+#[must_use]
+pub fn artifact_dir(
+    install_root: &Path,
+    id: &str,
+    version: &str,
+    host_key: &str,
+) -> Option<PathBuf> {
+    for component in [id, version, host_key] {
+        if !is_safe_path_component(component) {
+            tracing::error!(
+                module = id,
+                "a cache path component cannot name a directory; refusing to build a cache path \
+                 from it"
+            );
+            return None;
+        }
+    }
+    Some(install_root.join(id).join(version).join(host_key))
+}
+
+/// Remove cached versions of module `id` other than `pinned_version`.
+///
+/// Best-effort and after the fact: a version that is no longer pinned will never
+/// be loaded again, so keeping it only costs disk. Staging directories are left
+/// alone (a concurrent process may be filling one) and every removal is logged,
+/// because a cache that empties itself is worth noticing.
+pub fn prune_stale_versions(install_root: &Path, id: &str, pinned_version: &str) {
+    // Both sides of the comparison below have to be real directory names, or
+    // "everything that is not the pinned version" is not a set this function
+    // should be handing to `remove_dir_all`.
+    if !is_safe_path_component(id) || !is_safe_path_component(pinned_version) {
+        tracing::error!(
+            module = id,
+            "refusing to prune: its id or version cannot name a directory"
+        );
+        return;
+    }
+    let module_root = install_root.join(id);
+    let Ok(entries) = std::fs::read_dir(&module_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        // `read_dir` never yields `.` or `..`, and the leading-dot skip covers
+        // the staging directories; the guard is here so the delete depends on
+        // this function's own check rather than on that being remembered.
+        if !path.is_dir() || name == pinned_version || !is_safe_path_component(&name) {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => tracing::info!(
+                module = id,
+                "removed cached version {name}; {pinned_version} is pinned"
+            ),
+            Err(error) => tracing::warn!(
+                module = id,
+                "could not remove cached version {name}: {error}"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,5 +658,65 @@ mod tests {
             !rendered.contains(&root.path().display().to_string()),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn a_component_that_cannot_name_a_directory_yields_no_cache_path() {
+        for bad in ["..", ".", "", "a/b", "a\\b", ".hidden", "a\0b"] {
+            assert!(!is_safe_path_component(bad), "{bad:?} must be refused");
+        }
+        for good in [
+            "tinydocs",
+            "0.1.15",
+            "macos-26-arm64",
+            "ubuntu-22.04-x86_64",
+        ] {
+            assert!(is_safe_path_component(good), "{good:?} is a real name");
+        }
+        let root = Path::new("/cache/modules");
+        assert_eq!(artifact_dir(root, "tinydocs", "0.1.15", ".."), None);
+        assert_eq!(artifact_dir(root, "tinydocs", "0.1.15", "a/b"), None);
+    }
+
+    #[test]
+    fn each_artifact_of_a_version_has_its_own_cache_directory() {
+        let root = Path::new("/cache/modules");
+        let dir = artifact_dir(root, "tinydocs", "0.1.15", "macos-26-arm64").expect("usable");
+        assert_eq!(
+            dir,
+            root.join("tinydocs").join("0.1.15").join("macos-26-arm64")
+        );
+        assert_ne!(
+            Some(dir),
+            artifact_dir(root, "tinydocs", "0.1.15", "macos-15-arm64")
+        );
+    }
+
+    #[test]
+    fn pruning_keeps_the_pinned_version_and_anything_still_being_staged() {
+        let install = tempfile::tempdir().expect("temp install dir");
+        let module_root = install.path().join("tinydocs");
+        let pinned = module_root.join("0.1.15");
+        let stale = module_root.join("0.0.1");
+        let staging = module_root.join(".staging-abc123");
+        for dir in [&pinned, &stale, &staging] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(dir.join("marker"), b"x").unwrap();
+        }
+        // A stray file beside the version directories is not a version.
+        std::fs::write(module_root.join("notes.txt"), b"x").unwrap();
+
+        prune_stale_versions(install.path(), "tinydocs", "0.1.15");
+
+        assert!(pinned.join("marker").is_file(), "the pinned version stays");
+        assert!(staging.join("marker").is_file(), "staging stays");
+        assert!(!stale.exists(), "an unpinned version is removed");
+        assert!(module_root.join("notes.txt").is_file());
+
+        // A module that was never cached has nothing to prune.
+        prune_stale_versions(&install.path().join("never"), "tinydocs", "0.1.15");
+        // An unsafe id or version prunes nothing.
+        prune_stale_versions(install.path(), "..", "0.1.15");
+        assert!(pinned.join("marker").is_file());
     }
 }

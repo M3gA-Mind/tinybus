@@ -11,6 +11,8 @@ mod cache;
 mod github;
 mod hash;
 pub mod manifest;
+#[cfg(feature = "modules")]
+pub mod resolution;
 
 #[cfg(feature = "modules")]
 pub(crate) mod host;
@@ -21,6 +23,8 @@ mod resolve;
 #[cfg(feature = "modules")]
 mod transport;
 
+#[cfg(feature = "modules")]
+pub use cache::{artifact_dir, is_safe_path_component, prune_stale_versions};
 #[cfg(feature = "modules")]
 pub use github::CachedRelease;
 #[cfg(feature = "modules")]
