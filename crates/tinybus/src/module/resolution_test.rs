@@ -79,6 +79,19 @@ async fn a_failure_is_terminal_and_carries_its_reason() {
 }
 
 #[tokio::test]
+async fn a_bounded_wait_returns_an_outcome_that_arrives_before_its_deadline() {
+    let table = ResolutionTable::default();
+    let (sender, receiver) = run_claim(&table, "m");
+    table.complete("m", Resolution::Ready, sender);
+    assert_eq!(
+        table
+            .wait("m", receiver, Some(Duration::from_secs(1)))
+            .await,
+        Waited::Ready
+    );
+}
+
+#[tokio::test]
 async fn a_bounded_wait_reports_still_loading_instead_of_hanging() {
     let table = ResolutionTable::default();
     let (sender, receiver) = run_claim(&table, "m");
@@ -121,6 +134,11 @@ fn test_hooks_plant_and_remove_a_slot() {
     assert_eq!(table.peek("m"), ResolutionState::Loading);
     table.forget("m");
     assert_eq!(table.peek("m"), ResolutionState::Unresolved);
+}
+
+#[test]
+fn the_process_wide_resolution_table_is_stable() {
+    assert!(std::ptr::eq(global(), global()));
 }
 
 #[test]
