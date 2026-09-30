@@ -124,13 +124,13 @@ impl ResolutionTable {
         resolution: Resolution,
         sender: watch::Sender<Option<Resolution>>,
     ) {
-        {
-            let mut slots = self
-                .slots
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            slots.insert(id.to_string(), Slot::Done(resolution.clone()));
-        }
+        let mut slots = self
+            .slots
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slots.insert(id.to_string(), Slot::Done(resolution.clone()));
+        // Notify while holding the same lock used by `mark_faulted`, so it
+        // cannot publish a later failure between this state update and send.
         let _ = sender.send(Some(resolution));
     }
 

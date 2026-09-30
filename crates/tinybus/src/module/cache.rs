@@ -265,11 +265,12 @@ fn collect_modules(path: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<()>
     Ok(())
 }
 
-/// A fresh staging directory beside `dir`.
+/// A fresh staging directory outside the version directory containing `dir`.
 ///
-/// Beside, not inside: the commit is a rename, and a rename is only atomic
-/// within one filesystem. The parent is created if it is missing, since the
-/// first launch on a machine has no cache tree at all.
+/// Staging sits in the module directory, above the version directory, so
+/// pruning a stale version cannot remove an active download. It remains on the
+/// same filesystem as the target, preserving atomic rename. Parents are created
+/// if missing, since the first launch has no cache tree yet.
 ///
 /// # Errors
 ///
@@ -281,9 +282,10 @@ pub(crate) fn stage(dir: &Path) -> Result<tempfile::TempDir> {
         .ok_or_else(|| refused(dir, "release cache directory has no parent"))?;
     std::fs::create_dir_all(parent)
         .map_err(|_| refused(dir, "release cache directory could not be created"))?;
+    let staging_parent = parent.parent().unwrap_or(parent);
     tempfile::Builder::new()
         .prefix(STAGING_PREFIX)
-        .tempdir_in(parent)
+        .tempdir_in(staging_parent)
         .map_err(|_| refused(dir, "release staging directory could not be created"))
 }
 
@@ -440,14 +442,25 @@ pub fn prune_stale_versions(install_root: &Path, id: &str, pinned_version: &str)
 /// Do not remove a version while another process stages an artifact inside it.
 fn contains_staging_directory(version: &Path) -> bool {
     let Ok(entries) = std::fs::read_dir(version) else {
-        return false;
+        return true;
     };
-    entries.flatten().any(|entry| {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return true;
+        };
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        name.starts_with(STAGING_PREFIX)
-            || (entry.path().is_dir() && contains_staging_directory(&entry.path()))
-    })
+        if name.starts_with(STAGING_PREFIX) {
+            return true;
+        }
+        let Ok(file_type) = entry.file_type() else {
+            return true;
+        };
+        if file_type.is_dir() && contains_staging_directory(&entry.path()) {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -614,11 +627,7 @@ mod tests {
         write(&dir.join("stale"), b"old");
 
         let staging = stage(&dir).unwrap();
-        assert_eq!(
-            staging.path().parent().unwrap(),
-            dir.parent().unwrap(),
-            "staging is a sibling of the target"
-        );
+        assert_eq!(staging.path().parent().unwrap(), root.path());
         write(&staging.path().join(ASSET), b"new archive");
         let staged_path = staging.path().to_path_buf();
 
@@ -745,5 +754,21 @@ mod tests {
         // An unsafe id or version prunes nothing.
         prune_stale_versions(install.path(), "..", "0.1.15");
         assert!(pinned.join("marker").is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pruning_does_not_follow_directory_symlinks_while_looking_for_staging() {
+        let install = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let stale = install.path().join("tinydocs").join("0.0.1");
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::create_dir_all(outside.path().join(".staging-active")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), stale.join("external")).unwrap();
+
+        prune_stale_versions(install.path(), "tinydocs", "0.1.15");
+
+        assert!(!stale.exists(), "the stale version is pruned");
+        assert!(outside.path().join(".staging-active").is_dir());
     }
 }
