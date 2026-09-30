@@ -12,8 +12,8 @@ mod first_admitted;
 #[cfg(feature = "modules")]
 mod github;
 mod hash;
-pub mod platform;
 pub mod manifest;
+pub mod platform;
 #[cfg(feature = "modules")]
 pub mod resolution;
 
