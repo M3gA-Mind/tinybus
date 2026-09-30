@@ -42,7 +42,9 @@ pub enum Claim {
     /// Nobody has asked for this module yet. The caller runs the resolution and
     /// reports through the sender; the receiver is its own seat in the queue.
     Run {
+        /// Reports the outcome through [`ResolutionTable::complete`].
         sender: watch::Sender<Option<Resolution>>,
+        /// The caller's own seat in the queue.
         receiver: watch::Receiver<Option<Resolution>>,
     },
     /// Someone else is resolving it: wait for their outcome.
@@ -58,14 +60,18 @@ pub enum ResolutionState {
     Unresolved,
     /// Being downloaded, verified, or initialised.
     Loading,
+    /// Serving.
     Ready,
+    /// Terminal; carries the reason.
     Failed(String),
 }
 
 /// How a wait on a slot ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Waited {
+    /// The module is serving.
     Ready,
+    /// Terminal; carries the reason.
     Failed(String),
     /// The bound passed before the outcome landed.
     StillLoading,
