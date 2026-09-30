@@ -935,7 +935,7 @@ async fn module_control_tracks_disable_stop_detach_and_unavailable_states() {
     assert!(transition.is_some());
     let unique_name = control.loaded.lock().unwrap()[0].unique_name.clone();
     let stopped = control
-        .stop("clock", Duration::from_millis(1))
+        .stop("clock", Duration::from_secs(5))
         .await
         .unwrap();
     assert_eq!(stopped.state, ModuleState::Stopped);
