@@ -42,13 +42,14 @@ fn modules_do_not_share_a_slot() {
 
 #[tokio::test]
 async fn an_outcome_reaches_every_waiter_and_is_remembered() {
-    let table = ResolutionTable::default();
+    let table = std::sync::Arc::new(ResolutionTable::default());
     let (sender, own) = run_claim(&table, "m");
     let Claim::Wait(other) = table.claim("m") else {
         panic!("second claim waits");
     };
 
-    let waiter = tokio::spawn(table.wait("m", other, None));
+    let waiter_table = table.clone();
+    let waiter = tokio::spawn(async move { waiter_table.wait("m", other, None).await });
     table.complete("m", Resolution::Ready, sender);
 
     assert_eq!(table.wait("m", own, None).await, Waited::Ready);
