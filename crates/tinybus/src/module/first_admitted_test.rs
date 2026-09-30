@@ -89,3 +89,39 @@ fn an_unbuildable_cache_path_falls_through_then_reports_the_miss() {
     .unwrap_err();
     assert!(error.contains("downloads are disabled"), "{error}");
 }
+
+#[test]
+fn an_unbuildable_bundle_path_is_skipped_and_the_release_cache_is_used() {
+    let host = ModuleHost::new(Broker::new());
+    let bundled = tempfile::tempdir().unwrap();
+    let user_cache = tempfile::tempdir().unwrap();
+    let bad = ReleaseAsset {
+        host_key: "../escape",
+        ..ASSET
+    };
+    let assets = [bad];
+    let error = load_first_admitted(
+        &host,
+        &plan(&assets, user_cache.path(), Some(bundled.path())),
+        &serde_json::json!({}),
+    )
+    .unwrap_err();
+    assert!(error.contains("downloads are disabled"), "{error}");
+    assert!(!error.contains("installer bundle"), "{error}");
+}
+
+#[test]
+fn a_terminal_failure_with_downloads_enabled_says_to_restart() {
+    let host = ModuleHost::new(Broker::new());
+    let root = tempfile::tempdir().unwrap();
+    let bad = ReleaseAsset {
+        host_key: "../escape",
+        ..ASSET
+    };
+    let assets = [bad];
+    let mut release = plan(&assets, root.path(), None);
+    release.allow_download = true;
+    let error = load_first_admitted(&host, &release, &serde_json::json!({})).unwrap_err();
+    assert!(error.contains("could not be loaded"), "{error}");
+    assert!(error.contains("restart the app"), "{error}");
+}

@@ -126,6 +126,7 @@ fn glibc_version() -> Option<(u32, u32)> {
 }
 
 /// Parse a `major.minor` glibc version string, ignoring any suffix.
+#[cfg_attr(not(all(target_os = "linux", target_env = "gnu")), allow(dead_code))]
 fn parse_glibc_version(raw: &str) -> Option<(u32, u32)> {
     let mut parts = raw.trim().split('.');
     let major = parts.next()?.parse().ok()?;
