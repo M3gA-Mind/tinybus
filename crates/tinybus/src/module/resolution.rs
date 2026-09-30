@@ -169,18 +169,31 @@ impl ResolutionTable {
     /// itself died before reporting; that is reported as a failure rather than
     /// waited on, because nothing will ever complete the slot.
     pub async fn wait(
+        &self,
+        id: &str,
         mut receiver: watch::Receiver<Option<Resolution>>,
         within: Option<Duration>,
     ) -> Waited {
+        let id = id.to_string();
+        let table = self;
         let settled = async move {
             loop {
                 if let Some(resolution) = receiver.borrow_and_update().clone() {
                     return resolution;
                 }
                 if receiver.changed().await.is_err() {
-                    return Resolution::Failed(
+                    let failure = Resolution::Failed(
                         "module resolution was abandoned; restart the app to try again".to_string(),
                     );
+                    let mut slots = table
+                        .slots
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if matches!(slots.get(&id), Some(Slot::InFlight(current)) if current.same_channel(&receiver))
+                    {
+                        slots.insert(id, Slot::Done(failure.clone()));
+                    }
+                    return failure;
                 }
             }
         };

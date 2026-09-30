@@ -48,10 +48,10 @@ async fn an_outcome_reaches_every_waiter_and_is_remembered() {
         panic!("second claim waits");
     };
 
-    let waiter = tokio::spawn(ResolutionTable::wait(other, None));
+    let waiter = tokio::spawn(table.wait("m", other, None));
     table.complete("m", Resolution::Ready, sender);
 
-    assert_eq!(ResolutionTable::wait(own, None).await, Waited::Ready);
+    assert_eq!(table.wait("m", own, None).await, Waited::Ready);
     assert_eq!(waiter.await.unwrap(), Waited::Ready);
     assert_eq!(table.peek("m"), ResolutionState::Ready);
     assert!(matches!(table.claim("m"), Claim::Done(Resolution::Ready)));
@@ -64,7 +64,7 @@ async fn a_failure_is_terminal_and_carries_its_reason() {
     table.complete("m", Resolution::Failed("refused".to_string()), sender);
 
     assert_eq!(
-        ResolutionTable::wait(receiver, None).await,
+        table.wait("m", receiver, None).await,
         Waited::Failed("refused".to_string())
     );
     assert_eq!(
@@ -83,7 +83,9 @@ async fn a_bounded_wait_reports_still_loading_instead_of_hanging() {
     let (sender, receiver) = run_claim(&table, "m");
 
     let started = std::time::Instant::now();
-    let outcome = ResolutionTable::wait(receiver.clone(), Some(Duration::from_millis(20))).await;
+    let outcome = table
+        .wait("m", receiver.clone(), Some(Duration::from_millis(20)))
+        .await;
     assert_eq!(outcome, Waited::StillLoading);
     assert!(started.elapsed() < Duration::from_secs(5));
 
@@ -91,7 +93,7 @@ async fn a_bounded_wait_reports_still_loading_instead_of_hanging() {
     // the outcome still arrives for a later, unbounded wait.
     assert_eq!(table.peek("m"), ResolutionState::Loading);
     table.complete("m", Resolution::Ready, sender);
-    assert_eq!(ResolutionTable::wait(receiver, None).await, Waited::Ready);
+    assert_eq!(table.wait("m", receiver, None).await, Waited::Ready);
 }
 
 #[tokio::test]
@@ -100,9 +102,15 @@ async fn a_resolver_that_dies_without_reporting_fails_its_waiters() {
     let (sender, receiver) = run_claim(&table, "m");
     drop(sender);
     assert!(matches!(
-        ResolutionTable::wait(receiver, None).await,
+        table.wait("m", receiver, None).await,
         Waited::Failed(reason) if reason.contains("abandoned")
     ));
+    assert!(
+        matches!(table.peek("m"), ResolutionState::Failed(reason) if reason.contains("abandoned"))
+    );
+    assert!(
+        matches!(table.claim("m"), Claim::Done(Resolution::Failed(reason)) if reason.contains("abandoned"))
+    );
 }
 
 #[test]

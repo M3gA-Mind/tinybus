@@ -356,6 +356,8 @@ pub fn is_safe_path_component(component: &str) -> bool {
         && !component.contains('/')
         && !component.contains('\\')
         && !component.contains('\0')
+        // Colons can introduce drive prefixes on Windows even without a slash.
+        && !component.contains(':')
         // A leading dot would collide with the `.staging-*` directories a
         // concurrent download is filling.
         && !component.starts_with('.')
@@ -415,7 +417,11 @@ pub fn prune_stale_versions(install_root: &Path, id: &str, pinned_version: &str)
         // `read_dir` never yields `.` or `..`, and the leading-dot skip covers
         // the staging directories; the guard is here so the delete depends on
         // this function's own check rather than on that being remembered.
-        if !path.is_dir() || name == pinned_version || !is_safe_path_component(&name) {
+        if !path.is_dir()
+            || name == pinned_version
+            || !is_safe_path_component(&name)
+            || contains_staging_directory(&path)
+        {
             continue;
         }
         match std::fs::remove_dir_all(&path) {
@@ -429,6 +435,19 @@ pub fn prune_stale_versions(install_root: &Path, id: &str, pinned_version: &str)
             ),
         }
     }
+}
+
+/// Do not remove a version while another process stages an artifact inside it.
+fn contains_staging_directory(version: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(version) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        name.starts_with(STAGING_PREFIX)
+            || (entry.path().is_dir() && contains_staging_directory(&entry.path()))
+    })
 }
 
 #[cfg(test)]
@@ -662,7 +681,7 @@ mod tests {
 
     #[test]
     fn a_component_that_cannot_name_a_directory_yields_no_cache_path() {
-        for bad in ["..", ".", "", "a/b", "a\\b", ".hidden", "a\0b"] {
+        for bad in ["..", ".", "", "a/b", "a\\b", ".hidden", "a\0b", "C:temp"] {
             assert!(!is_safe_path_component(bad), "{bad:?} must be refused");
         }
         for good in [
@@ -699,7 +718,8 @@ mod tests {
         let pinned = module_root.join("0.1.15");
         let stale = module_root.join("0.0.1");
         let staging = module_root.join(".staging-abc123");
-        for dir in [&pinned, &stale, &staging] {
+        let nested_staging = stale.join(".staging-download");
+        for dir in [&pinned, &stale, &staging, &nested_staging] {
             std::fs::create_dir_all(dir).unwrap();
             std::fs::write(dir.join("marker"), b"x").unwrap();
         }
@@ -710,7 +730,14 @@ mod tests {
 
         assert!(pinned.join("marker").is_file(), "the pinned version stays");
         assert!(staging.join("marker").is_file(), "staging stays");
-        assert!(!stale.exists(), "an unpinned version is removed");
+        assert!(
+            stale.join("marker").is_file(),
+            "a version with active nested staging stays"
+        );
+        assert!(
+            nested_staging.join("marker").is_file(),
+            "nested staging stays"
+        );
         assert!(module_root.join("notes.txt").is_file());
 
         // A module that was never cached has nothing to prune.
