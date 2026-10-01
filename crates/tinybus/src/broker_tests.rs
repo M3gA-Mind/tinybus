@@ -706,3 +706,62 @@ async fn the_stream_interface_gets_no_exemption_from_attestation() {
     assert_eq!(refused.wire_name(), Error::NOT_ATTESTED);
     drop(service);
 }
+
+#[tokio::test]
+async fn a_sensitive_call_is_refused_for_every_member_but_module_configuration() {
+    let (_bus, _service, client) = bus().await;
+    let bus_proxy = client
+        .proxy(crate::BUS_NAME, crate::BUS_PATH, crate::BUS_INTERFACE)
+        .unwrap();
+    let error = bus_proxy
+        .call_sensitive::<Value>("GetId", ())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("reserved for module configuration"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_sensitive_call_may_only_address_the_bus_module_host() {
+    let (_bus, _service, client) = bus().await;
+    let voice = client.proxy(VOICE_NAME, VOICE_PATH, VOICE_NAME).unwrap();
+    let error = voice
+        .call_sensitive::<Value>("Transcribe", ("/tmp/clip.wav",))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("must address the bus module host"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn remove_match_validates_its_rule_and_accepts_one_that_was_added() {
+    let (_bus, _service, client) = bus().await;
+    let bus_proxy = client
+        .proxy(crate::BUS_NAME, crate::BUS_PATH, crate::BUS_INTERFACE)
+        .unwrap();
+    let rule = "type=signal".to_string();
+    bus_proxy
+        .call::<Value>("AddMatch", (rule.clone(),))
+        .await
+        .unwrap();
+    bus_proxy
+        .call::<Value>("RemoveMatch", (rule,))
+        .await
+        .unwrap();
+    let error = bus_proxy
+        .call::<Value>("RemoveMatch", (42,))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.wire_name(),
+        "ai.tinyhumans.tinybus.Error.BadArguments"
+    );
+}
