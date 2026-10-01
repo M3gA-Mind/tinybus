@@ -791,6 +791,55 @@ async fn stopping_one_module_leaves_the_other_serving() {
 }
 
 #[tokio::test]
+async fn a_call_to_a_disabled_module_that_still_owns_its_name_is_refused_promptly() {
+    let _test_guard = FAKE_MODULE_TEST_LOCK.lock().await;
+    LAZY_INIT_COUNT.store(0, Ordering::Release);
+    let bus = MemoryBus::new();
+    let broker = Broker::new();
+    let broker_task = broker.spawn(bus.clone());
+    let host = ModuleHost::new(broker);
+    let mut lazy_manifest = manifest();
+    lazy_manifest.lazy_init = true;
+    unsafe {
+        host.attach_raw(
+            "clock.so",
+            TbAbiDescriptor::current("clock", "0.1.0"),
+            lazy_manifest,
+            lazy_echo_init,
+        )
+    }
+    .unwrap();
+    let connection = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let disabled = connection.enable_module("clock", false).await.unwrap();
+    assert_eq!(disabled.state, ModuleState::Disabled);
+    // The disabled module's peer is still attached and still owns the
+    // well-known name, so the router alone would deliver the call into a
+    // queue nobody drains. The broker must answer from the host's state.
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        connection
+            .proxy(
+                "ai.tinyhumans.module.Clock",
+                "/ai/tinyhumans/module/Clock",
+                "ai.tinyhumans.module.Clock",
+            )
+            .unwrap()
+            .call::<String>("Echo", ("disabled",)),
+    )
+    .await
+    .expect("a disabled module is refused, not left to time out")
+    .unwrap_err();
+    assert_eq!(
+        refused.wire_name(),
+        "ai.tinyhumans.tinybus.Error.ModuleUnavailable"
+    );
+    assert_eq!(LAZY_INIT_COUNT.load(Ordering::Acquire), 0);
+    broker_task.abort();
+}
+
+#[tokio::test]
 async fn a_module_that_never_replies_times_out_the_caller_and_leaves_the_bus_usable() {
     let _test_guard = FAKE_MODULE_TEST_LOCK.lock().await;
     let bus = MemoryBus::new();
@@ -934,10 +983,7 @@ async fn module_control_tracks_disable_stop_detach_and_unavailable_states() {
     assert_eq!(enabled.state, ModuleState::Resolved);
     assert!(transition.is_some());
     let unique_name = control.loaded.lock().unwrap()[0].unique_name.clone();
-    let stopped = control
-        .stop("clock", Duration::from_millis(1))
-        .await
-        .unwrap();
+    let stopped = control.stop("clock", Duration::from_secs(5)).await.unwrap();
     assert_eq!(stopped.state, ModuleState::Stopped);
     let transition = control.peer_detached(&unique_name);
     assert!(transition.is_none() || transition.unwrap().2 == ModuleState::Stopped);

@@ -8,9 +8,12 @@ pub mod abi;
 #[cfg(feature = "modules")]
 mod cache;
 #[cfg(feature = "modules")]
+mod first_admitted;
+#[cfg(feature = "modules")]
 mod github;
 mod hash;
 pub mod manifest;
+pub mod platform;
 #[cfg(feature = "modules")]
 pub mod resolution;
 
@@ -25,6 +28,8 @@ mod transport;
 
 #[cfg(feature = "modules")]
 pub use cache::{artifact_dir, is_safe_path_component, prune_stale_versions};
+#[cfg(feature = "modules")]
+pub use first_admitted::{ReleaseAsset, ReleasePlan, load_first_admitted};
 #[cfg(feature = "modules")]
 pub use github::CachedRelease;
 #[cfg(feature = "modules")]
