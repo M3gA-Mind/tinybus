@@ -477,6 +477,24 @@ fn configured_reinitializations_are_serialized_bounded_and_keep_the_runtime_aliv
     );
     assert_eq!(unsafe { (out.shutdown)(out.module_ctx, 10) }, TB_OK);
     assert_eq!(unsafe { (out.shutdown)(out.module_ctx, 10) }, TB_CLOSED);
+
+    // The first start above installed this module copy's global subscriber, so
+    // a second dynamic start cannot replace it and refuses with `TB_CLOSED`
+    // rather than running a module with the wrong logging hook.
+    let mut second = TbModuleVtable::default();
+    let again = self::host(config);
+    assert_eq!(
+        unsafe {
+            start_module_with_config::<serde_json::Value, _, _>(
+                &again,
+                &mut second,
+                1,
+                true,
+                |_, _| async { Ok(()) },
+            )
+        },
+        TB_CLOSED
+    );
 }
 
 /// Startup refuses a host vtable it cannot trust, before it builds anything.
@@ -569,4 +587,129 @@ fn configured_startup_refuses_a_host_vtable_it_cannot_trust() {
         TB_BAD_ARGUMENT,
         "an object is not a Vec<String>, and that is caught before setup"
     );
+}
+
+#[test]
+fn deliver_reports_closed_when_the_modules_queue_receiver_is_gone() {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+    drop(rx);
+    let state = RuntimeState {
+        inbound: StdMutex::new(Some(tx)),
+        runtime: StdMutex::new(None),
+        reinitialize: None,
+    };
+    let bytes = b"{}";
+    assert_eq!(
+        unsafe {
+            deliver(
+                std::ptr::from_ref(&state).cast_mut().cast(),
+                bytes.as_ptr(),
+                bytes.len(),
+            )
+        },
+        TB_CLOSED
+    );
+}
+
+#[test]
+fn reinitialize_validates_its_arguments_and_reports_closed_without_a_handler() {
+    let bytes = b"{}";
+    assert_eq!(
+        unsafe { reinitialize(std::ptr::null_mut(), bytes.as_ptr(), bytes.len()) },
+        TB_BAD_ARGUMENT
+    );
+    let state = RuntimeState {
+        inbound: StdMutex::new(None),
+        runtime: StdMutex::new(None),
+        reinitialize: None,
+    };
+    let ctx = std::ptr::from_ref(&state).cast_mut().cast();
+    assert_eq!(
+        unsafe { reinitialize(ctx, std::ptr::null(), 1) },
+        TB_BAD_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { reinitialize(ctx, bytes.as_ptr(), 1024 * 1024 + 1) },
+        TB_BAD_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { reinitialize(ctx, bytes.as_ptr(), bytes.len()) },
+        TB_CLOSED
+    );
+}
+
+#[tokio::test]
+async fn the_host_subscriber_hands_out_distinct_span_ids_and_accepts_recorded_fields() {
+    let _host_state = host_state_guard().await;
+    let subscriber = HostSubscriber {
+        host: HostCalls(host(&[])),
+        next_span: AtomicU64::new(1),
+        max_level: tracing::level_filters::LevelFilter::TRACE,
+    };
+    tracing::subscriber::with_default(subscriber, || {
+        let first = tracing::info_span!("first", value = tracing::field::Empty);
+        let second = tracing::info_span!("second");
+        first.record("value", 7);
+        assert_ne!(first.id(), second.id());
+    });
+}
+
+#[test]
+fn an_empty_host_config_parses_as_an_empty_object() {
+    let vtable = host(&[]);
+    let parsed = unsafe { parse_config::<serde_json::Value>(&vtable) }.unwrap();
+    assert_eq!(parsed, serde_json::json!({}));
+}
+
+#[test]
+fn a_linked_reconfigurable_module_refuses_bad_hosts_and_reports_closed_before_it_connects() {
+    let _host_state = blocking_host_state_guard();
+    HOST_SEND_CODE.store(TB_OK, Ordering::Release);
+    let mut out = TbModuleVtable::default();
+    assert_eq!(
+        unsafe {
+            start_linked_reconfigurable_module::<serde_json::Value, _, _>(
+                std::ptr::null(),
+                &mut out,
+                1,
+                true,
+                |_, _| async { Ok(()) },
+            )
+        },
+        TB_BAD_ARGUMENT
+    );
+
+    // An output table too small to hold the frozen prefix is refused.
+    let valid = host(&[]);
+    let mut too_small = TbModuleVtable {
+        size: 0,
+        ..TbModuleVtable::default()
+    };
+    assert_eq!(
+        unsafe { start_linked_module(&valid, &mut too_small, 1, true, |_| async { Ok(()) }) },
+        TB_BAD_ARGUMENT
+    );
+
+    // The host never answers `Hello`, so the module has no connection yet and
+    // a reinitialization (here with an empty body, defaulting to `{}`) has
+    // nothing to configure.
+    let mut out = TbModuleVtable::default();
+    assert_eq!(
+        unsafe {
+            start_linked_reconfigurable_module::<serde_json::Value, _, _>(
+                &valid,
+                &mut out,
+                1,
+                true,
+                |_, _| async { Ok(()) },
+            )
+        },
+        TB_OK
+    );
+    let callback = out.reinitialize.expect("configured module supports reinit");
+    assert_eq!(
+        unsafe { callback(out.module_ctx, std::ptr::null(), 0) },
+        TB_CLOSED
+    );
+    assert_eq!(unsafe { (out.shutdown)(out.module_ctx, 10) }, TB_OK);
 }

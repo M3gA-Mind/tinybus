@@ -381,3 +381,107 @@ fn stop_errors_keep_the_underlying_safe_error_for_both_lifecycle_phases() {
         assert!(matches!(Error::from(error), Error::MethodFailed { .. }));
     }
 }
+
+#[test]
+fn a_module_log_line_is_accepted_at_every_level_and_with_a_hostile_length() {
+    let (_transport, host) = ModuleTransport::new("levels".to_string(), Vec::new());
+    let bytes = vec![b'x'; 5000];
+    for level in 0..=5 {
+        unsafe { (host.log)(host.host_ctx, level, bytes.as_ptr(), bytes.len()) };
+    }
+}
+
+#[test]
+fn every_host_callback_refuses_null_arguments_without_crashing() {
+    let (_transport, host) = ModuleTransport::new("nulls".to_string(), Vec::new());
+    let byte = 0u8;
+    unsafe {
+        assert_eq!((host.send)(std::ptr::null_mut(), &byte, 1), TB_BAD_ARGUMENT);
+        assert_eq!(
+            (host.send)(host.host_ctx, std::ptr::null(), 1),
+            TB_BAD_ARGUMENT
+        );
+        assert_eq!(
+            (host.send)(host.host_ctx, &byte, MAX_FRAME_LEN + 1),
+            TB_BAD_ARGUMENT
+        );
+        (host.wake)(std::ptr::null_mut());
+        (host.log)(std::ptr::null_mut(), 1, &byte, 1);
+        (host.log)(host.host_ctx, 1, std::ptr::null(), 1);
+        (host.fault)(std::ptr::null_mut(), std::ptr::null(), 0);
+        (host.ready)(std::ptr::null_mut());
+    }
+}
+
+#[test]
+fn a_module_that_faults_is_detached_and_can_no_longer_send() {
+    let (transport, host) = ModuleTransport::new("faulty".to_string(), Vec::new());
+    let byte = 0u8;
+    unsafe {
+        (host.ready)(host.host_ctx);
+        (host.wake)(host.host_ctx);
+        (host.fault)(host.host_ctx, std::ptr::null(), 0);
+        assert_eq!((host.send)(host.host_ctx, &byte, 1), TB_CLOSED);
+    }
+    assert!(transport.is_faulted());
+}
+
+#[tokio::test]
+async fn a_reinitialization_that_times_out_reports_a_timeout_without_the_configuration() {
+    let _lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let (transport, _) = ModuleTransport::new("timeout".to_string(), Vec::new());
+    let mut module = TbModuleVtable::default();
+    unsafe { initialize_ok(std::ptr::null(), &mut module) };
+    transport.initialize(module).unwrap();
+    REINITIALIZE_CODE.store(TB_TIMEOUT, Ordering::Release);
+    let error = transport
+        .reinitialize(serde_json::json!({ "secret": "never printed" }))
+        .await
+        .unwrap_err();
+    REINITIALIZE_CODE.store(TB_OK, Ordering::Release);
+    assert!(matches!(error, Error::Timeout { .. }), "{error}");
+    assert!(!error.to_string().contains("never printed"));
+}
+
+#[tokio::test]
+async fn delivery_maps_a_faulted_transport_a_missing_module_and_module_refusals() {
+    let _lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    // No module installed yet.
+    let (bare, _) = ModuleTransport::new("bare".to_string(), Vec::new());
+    assert!(matches!(
+        bare.deliver_now(call()).await,
+        Err(Error::ConnectionClosed)
+    ));
+
+    // A module that refuses the frame, or fails in an unspecified way.
+    let (transport, host) = ModuleTransport::new("refuses".to_string(), Vec::new());
+    let mut module = TbModuleVtable::default();
+    unsafe { initialize_ok(std::ptr::null(), &mut module) };
+    transport.initialize(module).unwrap();
+    DELIVERY_CODE.store(TB_BAD_ARGUMENT, Ordering::Release);
+    let refused = transport.deliver_now(call()).await.unwrap_err();
+    assert!(
+        refused.to_string().contains("refused a valid frame"),
+        "{refused}"
+    );
+    DELIVERY_CODE.store(77, Ordering::Release);
+    let failed = transport.deliver_now(call()).await.unwrap_err();
+    assert!(
+        failed.to_string().contains("delivery callback failed"),
+        "{failed}"
+    );
+    DELIVERY_CODE.store(TB_OK, Ordering::Release);
+
+    // Once the module faults, delivery is refused before touching it.
+    unsafe { (host.fault)(host.host_ctx, std::ptr::null(), 0) };
+    assert!(matches!(
+        transport.deliver_now(call()).await,
+        Err(Error::ConnectionClosed)
+    ));
+}

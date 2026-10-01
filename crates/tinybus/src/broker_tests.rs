@@ -706,3 +706,113 @@ async fn the_stream_interface_gets_no_exemption_from_attestation() {
     assert_eq!(refused.wire_name(), Error::NOT_ATTESTED);
     drop(service);
 }
+
+#[tokio::test]
+async fn a_sensitive_call_is_refused_for_every_member_but_module_configuration() {
+    let (_bus, _service, client) = bus().await;
+    let bus_proxy = client
+        .proxy(crate::BUS_NAME, crate::BUS_PATH, crate::BUS_INTERFACE)
+        .unwrap();
+    let error = bus_proxy
+        .call_sensitive::<Value>("GetId", ())
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("reserved for module configuration"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_sensitive_call_may_only_address_the_bus_module_host() {
+    let (_bus, _service, client) = bus().await;
+    let voice = client.proxy(VOICE_NAME, VOICE_PATH, VOICE_NAME).unwrap();
+    let error = voice
+        .call_sensitive::<Value>("Transcribe", ("/tmp/clip.wav",))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("must address the bus module host"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn remove_match_validates_its_rule_and_accepts_one_that_was_added() {
+    let (_bus, _service, client) = bus().await;
+    let bus_proxy = client
+        .proxy(crate::BUS_NAME, crate::BUS_PATH, crate::BUS_INTERFACE)
+        .unwrap();
+    let rule = "type=signal".to_string();
+    bus_proxy
+        .call::<Value>("AddMatch", (rule.clone(),))
+        .await
+        .unwrap();
+    bus_proxy
+        .call::<Value>("RemoveMatch", (rule,))
+        .await
+        .unwrap();
+    let error = bus_proxy
+        .call::<Value>("RemoveMatch", (42,))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.wire_name(),
+        "ai.tinyhumans.tinybus.Error.BadArguments"
+    );
+}
+
+#[cfg(feature = "modules")]
+#[tokio::test]
+async fn module_control_calls_validate_their_arguments_and_answer_for_unknown_modules() {
+    let bus = MemoryBus::new();
+    let broker = Broker::new();
+    let _host = crate::module::host::ModuleHost::new(broker.clone());
+    broker.spawn(bus.clone());
+    let client = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let bus_proxy = client
+        .proxy(crate::BUS_NAME, crate::BUS_PATH, crate::BUS_INTERFACE)
+        .unwrap();
+    let bad_arguments = "ai.tinyhumans.tinybus.Error.BadArguments";
+
+    let listed: Value = bus_proxy.call("ListModules", ()).await.unwrap();
+    assert_eq!(listed, serde_json::json!([]));
+    let absent: Value = bus_proxy.call("GetModule", ("nope",)).await.unwrap();
+    assert_eq!(absent, Value::Null);
+    let no_manifest: Value = bus_proxy
+        .call("GetModuleManifest", ("nope",))
+        .await
+        .unwrap();
+    assert_eq!(no_manifest, Value::Null);
+
+    for (member, body) in [
+        ("GetModule", serde_json::json!([42])),
+        ("GetModuleManifest", serde_json::json!([42])),
+        ("StopModule", serde_json::json!([42])),
+        ("ReinitializeModule", serde_json::json!([42])),
+        ("LoadModule", serde_json::json!({})),
+        ("LoadModule", serde_json::json!([])),
+        ("LoadModule", serde_json::json!(["a", {}, "extra"])),
+        ("RescanModules", serde_json::json!({})),
+        ("RescanModules", serde_json::json!([[], false, "extra"])),
+    ] {
+        let message = Message::method_call(
+            BusName::new(crate::BUS_NAME).unwrap(),
+            ObjectPath::new(crate::BUS_PATH).unwrap(),
+            InterfaceName::new(crate::BUS_INTERFACE).unwrap(),
+            MemberName::new(member).unwrap(),
+            body,
+        );
+        let error = client
+            .call_raw(message, Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(error.wire_name(), bad_arguments, "{member}: {error}");
+    }
+}

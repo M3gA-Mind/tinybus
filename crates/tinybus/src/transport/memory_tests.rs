@@ -81,3 +81,33 @@ async fn connecting_hands_the_far_end_to_the_listener() {
         "Hello"
     );
 }
+
+#[tokio::test]
+async fn sending_on_a_closed_end_is_a_transport_error() {
+    let (a, _b) = MemoryTransport::pair();
+    a.close().await.unwrap();
+    // Closing twice is a normal shutdown race, not an error.
+    a.close().await.unwrap();
+    let err = a.send(message("Late")).await.unwrap_err();
+    assert!(err.to_string().contains("closed"), "{err}");
+}
+
+#[tokio::test]
+async fn sending_to_a_dropped_peer_is_a_transport_error() {
+    let (a, b) = MemoryTransport::pair();
+    drop(b);
+    let err = a.send(message("Orphan")).await.unwrap_err();
+    assert!(err.to_string().contains("dropped"), "{err}");
+}
+
+#[test]
+fn a_bus_describes_itself_as_the_memory_listener() {
+    assert_eq!(Listener::describe(&MemoryBus::new()), "memory");
+}
+
+#[test]
+fn a_transport_and_a_default_bus_describe_themselves() {
+    let (a, _b) = MemoryTransport::pair();
+    assert_eq!(Transport::describe(&a), "memory");
+    assert_eq!(Listener::describe(&MemoryBus::default()), "memory");
+}

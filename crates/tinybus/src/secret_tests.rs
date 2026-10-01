@@ -144,3 +144,10 @@ fn dropping_a_secret_does_not_panic_regardless_of_lock_state() {
         let _secret = Secret::new(Vec::new());
     }
 }
+
+#[test]
+fn hardening_the_process_is_callable_and_leaves_secrets_usable() {
+    harden_process();
+    let secret = Secret::new(vec![9, 8, 7]);
+    assert_eq!(secret.expose_secret(), &[9, 8, 7]);
+}

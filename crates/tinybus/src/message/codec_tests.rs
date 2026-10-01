@@ -35,3 +35,17 @@ fn an_oversize_payload_is_refused_at_encode_time() {
     let err = encode(&serde_json::json!(huge)).unwrap_err();
     assert!(err.to_string().contains("exceeds the"), "{err}");
 }
+
+#[test]
+fn a_value_that_cannot_be_serialized_is_an_encode_error_not_a_panic() {
+    // JSON object keys must be strings; a map keyed by a tuple cannot encode.
+    let mut unencodable = std::collections::BTreeMap::new();
+    unencodable.insert((1, 2), "value");
+    assert!(encode(&unencodable).is_err());
+}
+
+#[test]
+fn a_malformed_payload_is_a_decode_error_not_a_panic() {
+    let err = decode::<Message>(b"{not json").unwrap_err();
+    assert!(!err.to_string().is_empty());
+}
