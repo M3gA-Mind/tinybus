@@ -50,8 +50,9 @@ the ports are real seams rather than decoration.
 
 ## Testing Guidelines
 
-- Tests live **in-crate**: a `#[cfg(test)] mod tests` block at the bottom of the
-  module, moving to a sibling `test.rs` or `<name>_test.rs` when they grow.
+- Tests live **in-crate**, in a sibling `<module>_tests.rs` declared at the bottom of
+  the module (`#[cfg(test)] #[path = "<module>_tests.rs"] mod tests;`), never an
+  inline `mod tests` block.
   There is no `tests/` directory.
 - Tests run on the in-memory transport. A test that needs a socket is testing
   the socket, and belongs in `transport::unix`.
@@ -127,3 +128,28 @@ discussion in the pull request:
   caught panics bound misbehaviour; they cannot contain a segfault, abort, heap
   corruption, OOM, or deliberate memory access. An integration whose crash or
   compromise must not reach the kernel belongs in a separate process.
+
+## Tests live in `*_tests.rs` files
+
+- Unit tests are never inline. Do not write a `#[cfg(test)] mod tests { ... }`
+  block in a source file. Put the tests in a sibling `<module>_tests.rs`
+  (`mod_tests.rs` beside a `mod.rs`, `lib_tests.rs` beside `lib.rs`) and declare
+  it at the bottom of the module:
+
+  ```rust
+  #[cfg(test)]
+  #[path = "foo_tests.rs"]
+  mod tests;
+  ```
+
+- The test file starts with `use super::*;` and carries no `#[cfg(test)]` of its
+  own. It is still a child module, so it reaches private items exactly as an
+  inline module did.
+- Name test files `<module>_tests.rs`; a second group for the same module is
+  `<module>_<topic>_tests.rs`. Never `test.rs`, `tests.rs` or `<module>_test.rs`.
+- Integration tests stay in the crate's `tests/` directory.
+- OpenHuman's `scripts/externalize-inline-tests.mjs <repo-root> --write` moves
+  inline test modules out mechanically; without `--write` it only reports.
+- Existing `test.rs` and `<module>_test.rs` files predate this rule. Rename each
+  to `<module>_tests.rs` (keep its `mod` name, add the `#[path]` attribute) the
+  next time you touch it.
