@@ -681,8 +681,10 @@ fn a_linked_reconfigurable_module_refuses_bad_hosts_and_reports_closed_before_it
 
     // An output table too small to hold the frozen prefix is refused.
     let valid = host(&[]);
-    let mut too_small = TbModuleVtable::default();
-    too_small.size = 0;
+    let mut too_small = TbModuleVtable {
+        size: 0,
+        ..TbModuleVtable::default()
+    };
     assert_eq!(
         unsafe { start_linked_module(&valid, &mut too_small, 1, true, |_| async { Ok(()) }) },
         TB_BAD_ARGUMENT
