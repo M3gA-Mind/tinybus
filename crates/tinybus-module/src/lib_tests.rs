@@ -642,3 +642,54 @@ fn an_empty_host_config_parses_as_an_empty_object() {
     let parsed = unsafe { parse_config::<serde_json::Value>(&vtable) }.unwrap();
     assert_eq!(parsed, serde_json::json!({}));
 }
+
+#[test]
+fn a_linked_reconfigurable_module_refuses_bad_hosts_and_reports_closed_before_it_connects() {
+    let _host_state = blocking_host_state_guard();
+    HOST_SEND_CODE.store(TB_OK, Ordering::Release);
+    let mut out = TbModuleVtable::default();
+    assert_eq!(
+        unsafe {
+            start_linked_reconfigurable_module::<serde_json::Value, _, _>(
+                std::ptr::null(),
+                &mut out,
+                1,
+                true,
+                |_, _| async { Ok(()) },
+            )
+        },
+        TB_BAD_ARGUMENT
+    );
+
+    // An output table too small to hold the frozen prefix is refused.
+    let valid = host(&[]);
+    let mut too_small = TbModuleVtable::default();
+    too_small.size = 0;
+    assert_eq!(
+        unsafe { start_linked_module(&valid, &mut too_small, 1, true, |_| async { Ok(()) }) },
+        TB_BAD_ARGUMENT
+    );
+
+    // The host never answers `Hello`, so the module has no connection yet and
+    // a reinitialization (here with an empty body, defaulting to `{}`) has
+    // nothing to configure.
+    let mut out = TbModuleVtable::default();
+    assert_eq!(
+        unsafe {
+            start_linked_reconfigurable_module::<serde_json::Value, _, _>(
+                &valid,
+                &mut out,
+                1,
+                true,
+                |_, _| async { Ok(()) },
+            )
+        },
+        TB_OK
+    );
+    let callback = out.reinitialize.expect("configured module supports reinit");
+    assert_eq!(
+        unsafe { callback(out.module_ctx, std::ptr::null(), 0) },
+        TB_CLOSED
+    );
+    assert_eq!(unsafe { (out.shutdown)(out.module_ctx, 10) }, TB_OK);
+}
