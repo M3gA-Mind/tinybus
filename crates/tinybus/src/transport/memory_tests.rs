@@ -104,3 +104,10 @@ async fn sending_to_a_dropped_peer_is_a_transport_error() {
 fn a_bus_describes_itself_as_the_memory_listener() {
     assert_eq!(Listener::describe(&MemoryBus::new()), "memory");
 }
+
+#[test]
+fn a_transport_and_a_default_bus_describe_themselves() {
+    let (a, _b) = MemoryTransport::pair();
+    assert_eq!(Transport::describe(&a), "memory");
+    assert_eq!(Listener::describe(&MemoryBus::default()), "memory");
+}
