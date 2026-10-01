@@ -425,3 +425,63 @@ fn a_module_that_faults_is_detached_and_can_no_longer_send() {
     }
     assert!(transport.is_faulted());
 }
+
+#[tokio::test]
+async fn a_reinitialization_that_times_out_reports_a_timeout_without_the_configuration() {
+    let _lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let (transport, _) = ModuleTransport::new("timeout".to_string(), Vec::new());
+    let mut module = TbModuleVtable::default();
+    unsafe { initialize_ok(std::ptr::null(), &mut module) };
+    transport.initialize(module).unwrap();
+    REINITIALIZE_CODE.store(TB_TIMEOUT, Ordering::Release);
+    let error = transport
+        .reinitialize(serde_json::json!({ "secret": "never printed" }))
+        .await
+        .unwrap_err();
+    REINITIALIZE_CODE.store(TB_OK, Ordering::Release);
+    assert!(matches!(error, Error::Timeout { .. }), "{error}");
+    assert!(!error.to_string().contains("never printed"));
+}
+
+#[tokio::test]
+async fn delivery_maps_a_faulted_transport_a_missing_module_and_module_refusals() {
+    let _lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    // No module installed yet.
+    let (bare, _) = ModuleTransport::new("bare".to_string(), Vec::new());
+    assert!(matches!(
+        bare.deliver_now(call()).await,
+        Err(Error::ConnectionClosed)
+    ));
+
+    // A module that refuses the frame, or fails in an unspecified way.
+    let (transport, host) = ModuleTransport::new("refuses".to_string(), Vec::new());
+    let mut module = TbModuleVtable::default();
+    unsafe { initialize_ok(std::ptr::null(), &mut module) };
+    transport.initialize(module).unwrap();
+    DELIVERY_CODE.store(TB_BAD_ARGUMENT, Ordering::Release);
+    let refused = transport.deliver_now(call()).await.unwrap_err();
+    assert!(
+        refused.to_string().contains("refused a valid frame"),
+        "{refused}"
+    );
+    DELIVERY_CODE.store(77, Ordering::Release);
+    let failed = transport.deliver_now(call()).await.unwrap_err();
+    assert!(
+        failed.to_string().contains("delivery callback failed"),
+        "{failed}"
+    );
+    DELIVERY_CODE.store(TB_OK, Ordering::Release);
+
+    // Once the module faults, delivery is refused before touching it.
+    unsafe { (host.fault)(host.host_ctx, std::ptr::null(), 0) };
+    assert!(matches!(
+        transport.deliver_now(call()).await,
+        Err(Error::ConnectionClosed)
+    ));
+}
