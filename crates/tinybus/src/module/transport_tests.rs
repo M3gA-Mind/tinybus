@@ -396,10 +396,7 @@ fn every_host_callback_refuses_null_arguments_without_crashing() {
     let (_transport, host) = ModuleTransport::new("nulls".to_string(), Vec::new());
     let byte = 0u8;
     unsafe {
-        assert_eq!(
-            (host.send)(std::ptr::null_mut(), &byte, 1),
-            TB_BAD_ARGUMENT
-        );
+        assert_eq!((host.send)(std::ptr::null_mut(), &byte, 1), TB_BAD_ARGUMENT);
         assert_eq!(
             (host.send)(host.host_ctx, std::ptr::null(), 1),
             TB_BAD_ARGUMENT

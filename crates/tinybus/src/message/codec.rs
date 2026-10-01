@@ -28,7 +28,14 @@ pub const LENGTH_PREFIX_LEN: usize = 4;
 
 /// Encode `value` into a length-prefixed frame.
 pub fn encode<T: Serialize>(value: &T) -> Result<Vec<u8>> {
-    let payload = serde_json::to_vec(value)?;
+    // The generic part stays branch-free; framing is non-generic so it is
+    // compiled (and measured) once rather than once per message type.
+    serde_json::to_vec(value)
+        .map_err(Error::from)
+        .and_then(frame)
+}
+
+fn frame(payload: Vec<u8>) -> Result<Vec<u8>> {
     if payload.len() > MAX_FRAME_LEN {
         return Err(Error::protocol(format!(
             "frame of {} bytes exceeds the {MAX_FRAME_LEN}-byte cap",
@@ -54,7 +61,7 @@ pub fn decode_length(prefix: [u8; LENGTH_PREFIX_LEN]) -> Result<usize> {
 
 /// Decode a payload that has already been read in full.
 pub fn decode<T: DeserializeOwned>(payload: &[u8]) -> Result<T> {
-    Ok(serde_json::from_slice(payload)?)
+    serde_json::from_slice(payload).map_err(Error::from)
 }
 
 #[cfg(test)]
