@@ -570,3 +570,75 @@ fn configured_startup_refuses_a_host_vtable_it_cannot_trust() {
         "an object is not a Vec<String>, and that is caught before setup"
     );
 }
+
+#[test]
+fn deliver_reports_closed_when_the_modules_queue_receiver_is_gone() {
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(1);
+    drop(rx);
+    let state = RuntimeState {
+        inbound: StdMutex::new(Some(tx)),
+        runtime: StdMutex::new(None),
+        reinitialize: None,
+    };
+    let bytes = b"{}";
+    assert_eq!(
+        unsafe {
+            deliver(
+                std::ptr::from_ref(&state).cast_mut().cast(),
+                bytes.as_ptr(),
+                bytes.len(),
+            )
+        },
+        TB_CLOSED
+    );
+}
+
+#[test]
+fn reinitialize_validates_its_arguments_and_reports_closed_without_a_handler() {
+    let bytes = b"{}";
+    assert_eq!(
+        unsafe { reinitialize(std::ptr::null_mut(), bytes.as_ptr(), bytes.len()) },
+        TB_BAD_ARGUMENT
+    );
+    let state = RuntimeState {
+        inbound: StdMutex::new(None),
+        runtime: StdMutex::new(None),
+        reinitialize: None,
+    };
+    let ctx = std::ptr::from_ref(&state).cast_mut().cast();
+    assert_eq!(
+        unsafe { reinitialize(ctx, std::ptr::null(), 1) },
+        TB_BAD_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { reinitialize(ctx, bytes.as_ptr(), 1024 * 1024 + 1) },
+        TB_BAD_ARGUMENT
+    );
+    assert_eq!(
+        unsafe { reinitialize(ctx, bytes.as_ptr(), bytes.len()) },
+        TB_CLOSED
+    );
+}
+
+#[tokio::test]
+async fn the_host_subscriber_hands_out_distinct_span_ids_and_accepts_recorded_fields() {
+    let _host_state = host_state_guard().await;
+    let subscriber = HostSubscriber {
+        host: HostCalls(host(&[])),
+        next_span: AtomicU64::new(1),
+        max_level: tracing::level_filters::LevelFilter::TRACE,
+    };
+    tracing::subscriber::with_default(subscriber, || {
+        let first = tracing::info_span!("first", value = tracing::field::Empty);
+        let second = tracing::info_span!("second");
+        first.record("value", 7);
+        assert_ne!(first.id(), second.id());
+    });
+}
+
+#[test]
+fn an_empty_host_config_parses_as_an_empty_object() {
+    let vtable = host(&[]);
+    let parsed = unsafe { parse_config::<serde_json::Value>(&vtable) }.unwrap();
+    assert_eq!(parsed, serde_json::json!({}));
+}
