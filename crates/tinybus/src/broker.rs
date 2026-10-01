@@ -255,6 +255,30 @@ impl Broker {
                         .unwrap_or(error)
                 });
                 let target = target?;
+                // A stopped, disabled, failed or faulted module can keep its
+                // well-known name for a moment after the host settles its
+                // state: the peer detaches only once its reader sees the
+                // closed transport. A call routed into that window would sit
+                // in a queue nobody drains and the caller would wait out its
+                // whole deadline, so answer from the host's state instead.
+                #[cfg(feature = "modules")]
+                if message.header.kind == MessageKind::MethodCall && !destination.is_unique() {
+                    let control = self
+                        .modules
+                        .lock()
+                        .expect("module control lock")
+                        .as_ref()
+                        .and_then(Weak::upgrade);
+                    if let Some(error) =
+                        control.and_then(|control| control.unavailable_for(&destination))
+                    {
+                        tracing::debug!(
+                            destination = %destination,
+                            "refusing call to a module that is not accepting calls"
+                        );
+                        return Err(error);
+                    }
+                }
                 target
                     .send(message)
                     .await
