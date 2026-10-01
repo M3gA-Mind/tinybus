@@ -314,3 +314,9 @@ fn an_unreadable_allowlist_is_a_disagreement_not_a_pass() {
     std::fs::create_dir_all(dir.join("modules.toml")).unwrap();
     assert_eq!(find_verified(&dir, ASSET, Some(&sha)), None);
 }
+
+#[test]
+fn a_version_directory_that_cannot_be_listed_is_treated_as_being_staged() {
+    let root = tempfile::tempdir().unwrap();
+    assert!(contains_staging_directory(&root.path().join("missing")));
+}
