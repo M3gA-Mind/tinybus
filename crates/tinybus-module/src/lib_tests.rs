@@ -482,7 +482,7 @@ fn configured_reinitializations_are_serialized_bounded_and_keep_the_runtime_aliv
     // a second dynamic start cannot replace it and refuses with `TB_CLOSED`
     // rather than running a module with the wrong logging hook.
     let mut second = TbModuleVtable::default();
-    let again = host(config);
+    let again = self::host(config);
     assert_eq!(
         unsafe {
             start_module_with_config::<serde_json::Value, _, _>(
