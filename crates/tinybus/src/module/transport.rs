@@ -576,12 +576,21 @@ impl Transport for ModuleTransport {
             message.header.kind,
             MessageKind::MethodReturn | MessageKind::Error
         ) {
-            let _ =
-                self.context
-                    .inflight
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                        count.checked_sub(1)
-                    });
+            // Saturating decrement via a CAS loop (avoids `fetch_update`, which
+            // newer toolchains deprecate in favour of `try_update`).
+            let inflight = &self.context.inflight;
+            let mut current = inflight.load(Ordering::Acquire);
+            while let Some(next) = current.checked_sub(1) {
+                match inflight.compare_exchange_weak(
+                    current,
+                    next,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => current = observed,
+                }
+            }
         }
         Ok(Some(message))
     }
