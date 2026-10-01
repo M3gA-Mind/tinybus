@@ -381,3 +381,50 @@ fn stop_errors_keep_the_underlying_safe_error_for_both_lifecycle_phases() {
         assert!(matches!(Error::from(error), Error::MethodFailed { .. }));
     }
 }
+
+#[test]
+fn a_module_log_line_is_accepted_at_every_level_and_with_a_hostile_length() {
+    let (_transport, host) = ModuleTransport::new("levels".to_string(), Vec::new());
+    let bytes = vec![b'x'; 5000];
+    for level in 0..=5 {
+        unsafe { (host.log)(host.host_ctx, level, bytes.as_ptr(), bytes.len()) };
+    }
+}
+
+#[test]
+fn every_host_callback_refuses_null_arguments_without_crashing() {
+    let (_transport, host) = ModuleTransport::new("nulls".to_string(), Vec::new());
+    let byte = 0u8;
+    unsafe {
+        assert_eq!(
+            (host.send)(std::ptr::null_mut(), &byte, 1),
+            TB_BAD_ARGUMENT
+        );
+        assert_eq!(
+            (host.send)(host.host_ctx, std::ptr::null(), 1),
+            TB_BAD_ARGUMENT
+        );
+        assert_eq!(
+            (host.send)(host.host_ctx, &byte, MAX_FRAME_LEN + 1),
+            TB_BAD_ARGUMENT
+        );
+        (host.wake)(std::ptr::null_mut());
+        (host.log)(std::ptr::null_mut(), 1, &byte, 1);
+        (host.log)(host.host_ctx, 1, std::ptr::null(), 1);
+        (host.fault)(std::ptr::null_mut(), std::ptr::null(), 0);
+        (host.ready)(std::ptr::null_mut());
+    }
+}
+
+#[test]
+fn a_module_that_faults_is_detached_and_can_no_longer_send() {
+    let (transport, host) = ModuleTransport::new("faulty".to_string(), Vec::new());
+    let byte = 0u8;
+    unsafe {
+        (host.ready)(host.host_ctx);
+        (host.wake)(host.host_ctx);
+        (host.fault)(host.host_ctx, std::ptr::null(), 0);
+        assert_eq!((host.send)(host.host_ctx, &byte, 1), TB_CLOSED);
+    }
+    assert!(transport.is_faulted());
+}
