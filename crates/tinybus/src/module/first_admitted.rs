@@ -160,5 +160,5 @@ pub fn load_first_admitted(
 }
 
 #[cfg(test)]
-#[path = "first_admitted_test.rs"]
+#[path = "first_admitted_tests.rs"]
 mod tests;

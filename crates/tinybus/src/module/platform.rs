@@ -143,5 +143,5 @@ fn parse_glibc_version(raw: &str) -> Option<(u32, u32)> {
 }
 
 #[cfg(test)]
-#[path = "platform_test.rs"]
+#[path = "platform_tests.rs"]
 mod tests;
