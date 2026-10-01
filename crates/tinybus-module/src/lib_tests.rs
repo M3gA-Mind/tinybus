@@ -477,6 +477,24 @@ fn configured_reinitializations_are_serialized_bounded_and_keep_the_runtime_aliv
     );
     assert_eq!(unsafe { (out.shutdown)(out.module_ctx, 10) }, TB_OK);
     assert_eq!(unsafe { (out.shutdown)(out.module_ctx, 10) }, TB_CLOSED);
+
+    // The first start above installed this module copy's global subscriber, so
+    // a second dynamic start cannot replace it and refuses with `TB_CLOSED`
+    // rather than running a module with the wrong logging hook.
+    let mut second = TbModuleVtable::default();
+    let again = host(config);
+    assert_eq!(
+        unsafe {
+            start_module_with_config::<serde_json::Value, _, _>(
+                &again,
+                &mut second,
+                1,
+                true,
+                |_, _| async { Ok(()) },
+            )
+        },
+        TB_CLOSED
+    );
 }
 
 /// Startup refuses a host vtable it cannot trust, before it builds anything.
