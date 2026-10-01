@@ -81,3 +81,35 @@ async fn connecting_hands_the_far_end_to_the_listener() {
         "Hello"
     );
 }
+
+#[tokio::test]
+async fn sending_on_a_closed_end_is_a_transport_error() {
+    let (a, _b) = MemoryTransport::pair();
+    a.close().await.unwrap();
+    // Closing twice is a normal shutdown race, not an error.
+    a.close().await.unwrap();
+    let err = a.send(message("Late")).await.unwrap_err();
+    assert!(err.to_string().contains("closed"), "{err}");
+}
+
+#[tokio::test]
+async fn sending_to_a_dropped_peer_is_a_transport_error() {
+    let (a, b) = MemoryTransport::pair();
+    drop(b);
+    let err = a.send(message("Orphan")).await.unwrap_err();
+    assert!(err.to_string().contains("dropped"), "{err}");
+}
+
+#[tokio::test]
+async fn a_bus_describes_itself_and_refuses_connections_once_its_listener_is_gone() {
+    let bus = MemoryBus::new();
+    assert_eq!(Listener::describe(&bus), "memory");
+    let connector = bus.clone();
+    drop(bus);
+    // The accept side lived in the dropped bus, so connecting must fail.
+    let err = match connector.connect().await {
+        Ok(_) => panic!("connect should fail once the listener is gone"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("not accepting"), "{err}");
+}
