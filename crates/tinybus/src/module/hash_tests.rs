@@ -59,3 +59,45 @@ fn sha256_matches_the_published_million_a_vector() {
         "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
     );
 }
+
+/// Fails with `kind` on the first `read`, then behaves like `data`.
+struct FailsOnce<'a> {
+    data: &'a [u8],
+    kind: Option<std::io::ErrorKind>,
+}
+
+impl std::io::Read for FailsOnce<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(kind) = self.kind.take() {
+            return Err(kind.into());
+        }
+        let n = out.len().min(self.data.len());
+        out[..n].copy_from_slice(&self.data[..n]);
+        self.data = &self.data[n..];
+        Ok(n)
+    }
+}
+
+#[test]
+fn an_interrupted_read_is_retried_not_reported() {
+    let data = pattern(5000);
+    let reader = FailsOnce {
+        data: &data,
+        kind: Some(std::io::ErrorKind::Interrupted),
+    };
+    assert_eq!(
+        super::file_hex(reader).unwrap(),
+        super::file_hex(&data[..]).unwrap()
+    );
+}
+
+#[test]
+fn a_failing_read_is_an_error_not_a_digest_of_what_was_read() {
+    let data = pattern(5000);
+    let reader = FailsOnce {
+        data: &data,
+        kind: Some(std::io::ErrorKind::PermissionDenied),
+    };
+    let error = super::file_hex(reader).unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+}
