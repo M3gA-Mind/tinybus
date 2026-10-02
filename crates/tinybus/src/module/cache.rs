@@ -51,7 +51,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
-use crate::module::hash::file_hex;
+use crate::module::hash::{file_hex, file_hex_remembered};
 
 /// Suffix of the marker beside an archive holding the digest its release
 /// manifest published.
@@ -196,7 +196,7 @@ fn sidecar_matches(module: &Path) -> bool {
     let Ok(file) = std::fs::File::open(module) else {
         return false;
     };
-    file_hex(file).is_ok_and(|actual| actual == expected)
+    file_hex_remembered(file).is_ok_and(|actual| actual == expected)
 }
 
 /// Where the digest marker for `asset_name` lives in `dir`.
