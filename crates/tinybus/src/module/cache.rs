@@ -51,7 +51,8 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
-use crate::module::hash::{file_hex, file_hex_remembered};
+use crate::module::hash::file_hex;
+use crate::module::remembered_hash::file_hex_remembered;
 
 /// Suffix of the marker beside an archive holding the digest its release
 /// manifest published.

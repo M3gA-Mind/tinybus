@@ -22,6 +22,8 @@ pub(crate) mod host;
 #[cfg(feature = "modules")]
 mod loader;
 #[cfg(feature = "modules")]
+mod remembered_hash;
+#[cfg(feature = "modules")]
 mod resolve;
 #[cfg(feature = "modules")]
 mod transport;
