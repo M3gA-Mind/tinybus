@@ -18,6 +18,7 @@
 pub mod tree;
 
 #[cfg(test)]
+#[path = "macro_tests.rs"]
 mod macro_test;
 
 use async_trait::async_trait;

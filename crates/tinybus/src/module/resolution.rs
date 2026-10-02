@@ -237,5 +237,5 @@ pub fn global() -> &'static ResolutionTable {
 }
 
 #[cfg(test)]
-#[path = "resolution_test.rs"]
+#[path = "resolution_tests.rs"]
 mod tests;

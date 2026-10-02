@@ -877,4 +877,5 @@ pub(crate) fn body_contains_stream_ref(body: &Value) -> bool {
 }
 
 #[cfg(test)]
+#[path = "stream_tests.rs"]
 mod stream_test;
