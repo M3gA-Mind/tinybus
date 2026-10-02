@@ -55,11 +55,12 @@ pub(crate) fn file_hex(mut reader: impl Read) -> io::Result<String> {
 /// [`REMEMBER_AFTER`], because a write in the same clock tick as the hash would
 /// leave the identity unchanged. Platforms without the identity fields hash
 /// every time.
+#[cfg(feature = "modules")]
 pub(crate) fn file_hex_remembered(file: std::fs::File) -> io::Result<String> {
     remembered::hex(file, remembered::REMEMBER_AFTER).map(|(hex, _)| hex)
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "modules", unix))]
 mod remembered {
     use std::collections::HashMap;
     use std::fs::File;
@@ -124,7 +125,7 @@ mod remembered {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(all(feature = "modules", not(unix)))]
 mod remembered {
     use std::io;
     use std::time::Duration;

@@ -60,7 +60,7 @@ fn sha256_matches_the_published_million_a_vector() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(all(feature = "modules", unix))]
 mod remembered {
     use std::io::Write;
     use std::time::Duration;
