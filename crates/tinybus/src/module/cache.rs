@@ -131,6 +131,82 @@ pub(crate) fn find_verified(
         );
         return None;
     }
+    let module = usable_extraction(dir, asset_name)?;
+    debug!(asset = asset_name, "release cache: hit");
+    Some(CachedArtifact {
+        module,
+        sha256: expected,
+    })
+}
+
+/// Look for an installer-bundle entry that ships the archive's digest marker
+/// in place of the archive.
+///
+/// `Some` only when the archive is absent, the marker beside it is well formed
+/// and equal to `pin`, and the directory holds exactly one platform module
+/// whose own allowlist, if the release shipped one, still matches.
+///
+/// # Trust model
+///
+/// Nothing here hashes the archive, because it is not on disk: the bundle's
+/// build step verified it against this same pin, extracted it, and replaced it
+/// with the marker. The marker is therefore a claim made by the installer, and
+/// it is honoured only for the installer-shipped directory —
+/// [`super::load_first_admitted`] is the sole caller and passes only the
+/// bundled root. The user-writable download cache never reaches this function:
+/// a writable directory that could vouch for itself with a text file would
+/// make the pin meaningless. On macOS the installer directory is inside the
+/// signed `.app`, so the extracted library is covered by the bundle's
+/// code-signature seal instead; that is the reason this path exists, since
+/// notarization rejects the unsigned Mach-O inside a pinned archive and
+/// signing it would change the pinned bytes.
+///
+/// What is mapped is still checked. The extracted library is held to the
+/// release's `modules.toml` here and again by the allowlist gate on every
+/// load, exactly as on the hashing path. An installer that rewrites the
+/// library (the macOS signer does) must re-pin that entry, under the same
+/// seal that covers the marker, or the bundle is refused.
+pub(crate) fn find_marked(dir: &Path, asset_name: &str, pin: &str) -> Option<CachedArtifact> {
+    if dir.join(asset_name).exists() {
+        debug!(
+            asset = asset_name,
+            "installer bundle: archive present; it decides"
+        );
+        return None;
+    }
+    let pin = pin.to_ascii_lowercase();
+    if !crate::attest::is_hex_sha256(&pin) {
+        warn!(asset = asset_name, "installer bundle: pin is not a SHA-256");
+        return None;
+    }
+    let Some(recorded) = read_digest_marker(dir, asset_name) else {
+        debug!(
+            asset = asset_name,
+            "installer bundle: no archive and no digest marker"
+        );
+        return None;
+    };
+    if recorded != pin {
+        warn!(
+            asset = asset_name,
+            "installer bundle: digest marker does not match the pin"
+        );
+        return None;
+    }
+    let module = usable_extraction(dir, asset_name)?;
+    debug!(
+        asset = asset_name,
+        "installer bundle: marker matches the pin"
+    );
+    Some(CachedArtifact {
+        module,
+        sha256: pin,
+    })
+}
+
+/// The single platform module in `dir`, canonicalized, if it agrees with the
+/// `modules.toml` beside it.
+fn usable_extraction(dir: &Path, asset_name: &str) -> Option<PathBuf> {
     let module = match find_module(dir) {
         Ok(module) => module,
         Err(error) => {
@@ -152,11 +228,7 @@ pub(crate) fn find_verified(
         );
         return None;
     };
-    debug!(asset = asset_name, "release cache: hit");
-    Some(CachedArtifact {
-        module,
-        sha256: expected,
-    })
+    Some(module)
 }
 
 /// Whether `module` agrees with the `modules.toml` beside it.
