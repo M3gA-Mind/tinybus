@@ -453,9 +453,8 @@ impl ModuleHost {
     ///
     /// The pin is *not* recorded as the attestation: nothing on this path
     /// hashed bytes that match it, only a marker that claims so. Attestation
-    /// comes from the `modules.toml` beside the library, which activation
-    /// re-hashes against the mapped file, or there is none and the module is
-    /// not a confidential recipient.
+    /// comes from the `modules.toml` beside the library, which this path
+    /// requires and activation re-hashes against the mapped file.
     ///
     /// # Errors
     ///

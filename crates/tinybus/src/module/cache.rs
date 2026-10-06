@@ -143,8 +143,9 @@ pub(crate) fn find_verified(
 /// in place of the archive.
 ///
 /// `Some` only when the archive is absent, the marker beside it is well formed
-/// and equal to `pin`, and the directory holds exactly one platform module
-/// whose own allowlist, if the release shipped one, still matches.
+/// and equal to `pin`, and the directory holds exactly one platform module,
+/// resolving inside it, that the release's `modules.toml` names with its
+/// current hash. Unlike the archive path, the allowlist is required here.
 ///
 /// # Trust model
 ///
@@ -194,6 +195,19 @@ pub(crate) fn find_marked(dir: &Path, asset_name: &str, pin: &str) -> Option<Cac
         return None;
     }
     let module = usable_extraction(dir, asset_name)?;
+    // The marker vouches for an archive nobody hashes here, so the file that
+    // is mapped must be pinned by something that is hashed: the release's own
+    // allowlist. Without one, nothing on this path would check the library.
+    if !module
+        .parent()
+        .is_some_and(|parent| parent.join("modules.toml").is_file())
+    {
+        warn!(
+            asset = asset_name,
+            "installer bundle: a marker entry needs a modules.toml pinning its library"
+        );
+        return None;
+    }
     debug!(
         asset = asset_name,
         "installer bundle: marker matches the pin"
@@ -206,6 +220,10 @@ pub(crate) fn find_marked(dir: &Path, asset_name: &str, pin: &str) -> Option<Cac
 
 /// The single platform module in `dir`, canonicalized, if it agrees with the
 /// `modules.toml` beside it.
+///
+/// The module must resolve inside `dir`. It is canonicalized before it is
+/// handed on, so a symlink would otherwise carry the load (and the loader's
+/// no-follow open) to a file the directory's own protection does not cover.
 fn usable_extraction(dir: &Path, asset_name: &str) -> Option<PathBuf> {
     let module = match find_module(dir) {
         Ok(module) => module,
@@ -214,6 +232,21 @@ fn usable_extraction(dir: &Path, asset_name: &str) -> Option<PathBuf> {
             return None;
         }
     };
+    let (Ok(module), Ok(root)) = (std::fs::canonicalize(&module), std::fs::canonicalize(dir))
+    else {
+        warn!(
+            asset = asset_name,
+            "release cache: module path could not be canonicalized"
+        );
+        return None;
+    };
+    if !module.starts_with(&root) {
+        warn!(
+            asset = asset_name,
+            "release cache: module resolves outside its directory"
+        );
+        return None;
+    }
     if !sidecar_matches(&module) {
         warn!(
             asset = asset_name,
@@ -221,13 +254,6 @@ fn usable_extraction(dir: &Path, asset_name: &str) -> Option<PathBuf> {
         );
         return None;
     }
-    let Ok(module) = std::fs::canonicalize(&module) else {
-        warn!(
-            asset = asset_name,
-            "release cache: module path could not be canonicalized"
-        );
-        return None;
-    };
     Some(module)
 }
 

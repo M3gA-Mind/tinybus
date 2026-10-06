@@ -161,7 +161,11 @@ archives and rejects the unsigned Mach-O inside, and signing it would change
 the pinned bytes.
 
 A marker entry is admitted only when the archive is absent, the marker equals
-the compiled pin, and the extraction passes its `modules.toml` if one ships.
+the compiled pin, and a `modules.toml` beside the extraction names the
+library with its current hash. That allowlist is required on this path,
+because nothing else on it hashes the file that is mapped. On either path,
+the library must resolve inside its own directory: a symlink to a file
+elsewhere is refused.
 The marker is a claim made by the installer, which verified the archive
 against the same pin at build time. Integrity of the extraction then rests on
 the installer's own protection; on macOS that is the app's code-signature
@@ -178,8 +182,8 @@ changes the file.
 
 A marker entry is never attested with the pin, because nothing on that path
 hashed bytes matching it. Its attestation, and so its eligibility for
-confidential messages, comes only from the `modules.toml` that activation
-re-hashes against the mapped file.
+confidential messages, comes only from the required `modules.toml`, which
+activation re-hashes against the mapped file.
 
 A bundle with any candidate entry is authoritative. A refused entry is
 reported, not replaced by a download.

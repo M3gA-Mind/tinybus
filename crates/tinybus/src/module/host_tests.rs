@@ -653,7 +653,7 @@ async fn a_bundle_marker_equal_to_the_pin_admits_the_extraction_without_its_arch
 
 #[cfg(not(windows))]
 #[tokio::test]
-async fn a_bundle_marker_without_an_allowlist_admits_but_never_attests_the_pin() {
+async fn a_bundle_marker_without_an_allowlist_is_refused_rather_than_loaded_unhashed() {
     use crate::module::{ReleaseAsset, ReleasePlan, artifact_dir, load_first_admitted};
 
     let bundled = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
@@ -697,19 +697,9 @@ async fn a_bundle_marker_without_an_allowlist_admits_but_never_attests_the_pin()
         bundled_root: Some(bundled.path()),
         allow_download: false,
     };
-    let info = load_first_admitted(&host, &plan, &serde_json::json!({})).unwrap();
-    assert_eq!(info.state, ModuleState::Resolved);
-    let connection = Connection::connect(bus.connect().await.unwrap())
-        .await
-        .unwrap();
-    assert!(
-        connection
-            .attestation(info.manifest.bus_name.clone())
-            .await
-            .unwrap()
-            .is_none(),
-        "a marker alone must not make a confidential recipient"
-    );
+    let error = load_first_admitted(&host, &plan, &serde_json::json!({})).unwrap_err();
+    assert!(error.contains("installer bundle"), "{error}");
+    assert!(host.list().is_empty(), "nothing was registered");
     broker_task.abort();
 }
 
