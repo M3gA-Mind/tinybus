@@ -335,6 +335,34 @@ impl Broker {
             return (result, Vec::new(), module_states);
         }
 
+        // Negotiate conditional routing before building the call body. Keep
+        // module-state errors as specific as ordinary routing, and do not hold
+        // the router lock while consulting the module lifecycle owner.
+        if member.as_str() == "ResolveCallTarget" {
+            let result = (|| -> Result<Value> {
+                let (name,): (BusName,) = parse_args(member, body)?;
+                let owner = self.router.lock().expect("router lock").owner_of(&name);
+                match owner {
+                    Some(owner) => Ok(serde_json::to_value(owner)?),
+                    None => {
+                        #[cfg(feature = "modules")]
+                        if let Some(error) = self
+                            .modules
+                            .lock()
+                            .expect("module control lock")
+                            .as_ref()
+                            .and_then(Weak::upgrade)
+                            .and_then(|control| control.unavailable_for(&name))
+                        {
+                            return Err(error);
+                        }
+                        Err(Error::NameHasNoOwner(name))
+                    }
+                }
+            })();
+            return (result, Vec::new(), Vec::new());
+        }
+
         let mut changes = Vec::new();
         let mut router = self.router.lock().expect("router lock");
 
@@ -379,15 +407,6 @@ impl Broker {
                 "GetAttestation" => {
                     let (name,): (BusName,) = parse_args(member, body)?;
                     Ok(serde_json::to_value(router.attestation_of(&name))?)
-                }
-                // This method also negotiates conditional owner routing. An
-                // older broker fails loudly rather than ignoring the guard.
-                "ResolveCallTarget" => {
-                    let (name,): (BusName,) = parse_args(member, body)?;
-                    let owner = router
-                        .owner_of(&name)
-                        .ok_or_else(|| Error::NameHasNoOwner(name))?;
-                    Ok(serde_json::to_value(owner)?)
                 }
                 "GetNameOwner" => {
                     let (name,): (BusName,) = parse_args(member, body)?;
