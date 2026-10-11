@@ -220,6 +220,7 @@ impl ModuleTransport {
     pub(crate) async fn ensure_initialized(&self) -> Result<()> {
         loop {
             let changed = self.initialization_gate_changed.notified();
+            let terminal = self.context.init_notify.notified();
             let allowed = *self
                 .initialization_gate
                 .lock()
@@ -230,7 +231,10 @@ impl ModuleTransport {
             match allowed {
                 Some(true) => break,
                 Some(false) => return Err(Error::transport("module callback admission failed")),
-                None => changed.await,
+                None => tokio::select! {
+                    _ = changed => {},
+                    _ = terminal => {},
+                },
             }
         }
 
@@ -729,6 +733,7 @@ unsafe extern "C" fn host_fault(ctx: *mut c_void, _: *const u8, _: usize) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Some(context) = unsafe { ctx.cast::<HostContext>().as_ref() } {
             context.faulted.store(true, Ordering::Release);
+            context.init_notify.notify_waiters();
             context.ready_notify.notify_waiters();
             context.inbound.lock().expect("host inbound lock").take();
         }
