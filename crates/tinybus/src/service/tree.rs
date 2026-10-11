@@ -82,7 +82,7 @@ impl ObjectTree {
             })
     }
 
-    /// Resolve and invoke in one step.
+    /// Resolve and invoke an ordinary call with an unverified default context.
     pub async fn dispatch(
         &self,
         path: &ObjectPath,
@@ -96,6 +96,9 @@ impl ObjectTree {
 
     /// Resolve and invoke one call while enforcing the delivery's
     /// confidentiality flag before argument decoding reaches user code.
+    ///
+    /// Uses an unverified default context even when `confidential` is true;
+    /// the flag does not authenticate a caller.
     pub async fn dispatch_with_confidential(
         &self,
         path: &ObjectPath,
@@ -116,6 +119,10 @@ impl ObjectTree {
     }
 
     /// Resolve and invoke with out-of-band incoming context and delivery flags.
+    ///
+    /// Checks the member and its confidentiality requirement before calling
+    /// [`Interface::call_with_context`]. Passes `context` through unchanged;
+    /// this method does not derive caller identity from `args` or the flag.
     pub async fn dispatch_with_context(
         &self,
         path: &ObjectPath,

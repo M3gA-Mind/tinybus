@@ -52,6 +52,10 @@ pub struct CallContext {
 
 impl CallContext {
     /// The broker-stamped unique sender, only on a proven broker delivery path.
+    ///
+    /// Returns `None` for default contexts, unverified deliveries, and missing
+    /// or well-known sender names. A returned name identifies a peer within
+    /// this broker session; it does not grant permission for an operation.
     pub fn authenticated_sender(&self) -> Option<&BusName> {
         self.sender.as_ref()
     }
@@ -101,8 +105,9 @@ pub trait Interface: Send + Sync + 'static {
 
     /// Run a call with transport-authenticated incoming facts.
     ///
-    /// Context is out of band: positional arguments and legacy implementations
-    /// stay unchanged. Override this method to authorize callers; an unverified
+    /// The default delegates to [`Interface::call`] without inspecting context,
+    /// preserving legacy implementations and their positional arguments.
+    /// Override this method to authorize callers; an unverified
     /// context must fail closed when caller identity is required.
     async fn call_with_context(
         &self,

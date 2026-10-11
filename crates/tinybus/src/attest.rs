@@ -22,6 +22,12 @@
 //! as acceptable. The hash is computed by the host over bytes the host read
 //! itself; nothing a module says about itself participates.
 //!
+//! Admission also binds that record to the module's fixed unique peer. A unique
+//! lookup retains the original manifest name and digest even after alias release;
+//! extra aliases and successor peers inherit no attestation. Detach removes the
+//! record. This recipient check is separate from incoming [`crate::CallContext`]:
+//! neither an artifact digest nor a peer name authenticates a human.
+//!
 //! # What it does not establish, and this matters
 //!
 //! An in-process module shares the host's address space. It can read host
@@ -62,9 +68,12 @@ use crate::name::BusName;
 /// and checked on every confidential delivery. It carries no path: the hash and
 /// the name it was verified for are enough to audit the decision, and a
 /// filesystem layout is not something to publish on a bus.
+///
+/// Querying an admitted unique peer returns its original manifest identity;
+/// `name` does not become the unique destination used for that query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attestation {
-    /// The well-known name this artifact was verified *for*.
+    /// The original well-known name this artifact was verified *for*.
     ///
     /// Bound to the name rather than floating free, because "some allowlisted
     /// artifact is loaded" is not the question a sender is asking. The question

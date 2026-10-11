@@ -241,6 +241,10 @@ impl Connection {
     /// Used by the broker for its own side of a peer link, and by tests that
     /// drive the protocol by hand. Ordinary callers want
     /// [`Connection::connect`].
+    ///
+    /// This safe constructor grants no native routing authority. Concrete
+    /// memory links authenticate only deliveries sealed by the broker writer;
+    /// a public `Transport::send`, wrapper, or successful Hello cannot forge it.
     pub fn attach(transport: Arc<dyn Transport>) -> Self {
         Self::attach_inner(transport, false, None)
     }
@@ -385,6 +389,11 @@ impl Connection {
     }
 
     /// What the broker has verified about whoever owns `name`.
+    ///
+    /// Accepts either an exact well-known name or a fixed unique peer. For an
+    /// admitted unique peer, the record retains the artifact's original manifest
+    /// name and digest across alias release; extra aliases remain unattested.
+    /// A name handover gives the successor no record, and detach removes it.
     ///
     /// The check a sender makes before it commits to handing over a secret.
     /// `None` means the bus will refuse a confidential message to that name —

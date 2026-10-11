@@ -40,6 +40,10 @@ struct Delivery {
 
 /// One end of an in-process link.
 ///
+/// Broker-written deliveries carry private per-frame provenance. Public
+/// [`Transport::send`] cannot set it, and public [`Transport::recv`] discards it;
+/// replaying a sender header or wrapping this transport grants no call authority.
+///
 /// The outbound sender lives in an `Option` behind a *std* mutex so that
 /// [`Transport::close`] can drop it: dropping the sender is what makes the far
 /// end's `recv` return `None`, and without that a closed in-process link would

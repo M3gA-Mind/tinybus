@@ -3,6 +3,11 @@
 //! Each module owns a Tokio runtime. A statically linked `cdylib` has its own
 //! Tokio thread-locals, so attempting to borrow the host runtime is both
 //! incorrect and capable of silently blocking a host worker thread.
+//!
+//! Caller context depends on the trusted host's optional ABI-v1 routing callback.
+//! Its assertion is captured per frame at enqueue time; older host prefixes
+//! remain compatible but supply unverified context. Sender headers remain intact
+//! for protocol routing and streams even when they carry no caller authority.
 
 use std::ffi::c_void;
 use std::future::Future;
@@ -429,7 +434,10 @@ unsafe fn write_module_vtable(
 /// the macro, not this function directly.
 ///
 /// # Safety
-/// The host vtable must meet `TbHostVtable::read_compatible`'s requirements.
+/// The host vtable must meet [`TbHostVtable::read_compatible`]'s requirements.
+/// A non-null `out` must be aligned and writable for its declared capacity,
+/// with a readable size field; writes are bounded to that capacity. Borrowed
+/// configuration bytes must remain readable during initialization.
 /// In particular an affirmative routing callback is a trusted host assertion
 /// that only real broker deliveries enter `deliver`, not an arbitrary frame
 /// injection capability. Artifact attestation does not establish this fact.
@@ -459,6 +467,10 @@ where
 }
 
 /// Start a linked module without replacing the host's process-global hooks.
+///
+/// # Safety
+/// The caller must uphold the host, output, configuration, and routing contracts
+/// of [`start_module`].
 #[doc(hidden)]
 pub unsafe fn start_linked_module<F, Fut>(
     host: *const TbHostVtable,
@@ -657,6 +669,10 @@ unsafe fn parse_config<C: serde::de::DeserializeOwned>(
 /// This retains the original `FnOnce` contract for direct SDK callers. The
 /// export macro uses [`start_reconfigurable_module`] because a named setup
 /// function can safely be called again.
+///
+/// # Safety
+/// The caller must uphold the host, output, configuration, and routing contracts
+/// of [`start_module`].
 #[doc(hidden)]
 pub unsafe fn start_module_with_config<C, F, Fut>(
     host: *const TbHostVtable,
@@ -688,6 +704,10 @@ where
 }
 
 /// Initialize a configured module whose setup function may be called again.
+///
+/// # Safety
+/// The caller must uphold the host, output, configuration, and routing contracts
+/// of [`start_module`].
 #[doc(hidden)]
 pub unsafe fn start_reconfigurable_module<C, F, Fut>(
     host: *const TbHostVtable,
@@ -707,6 +727,10 @@ where
 }
 
 /// Start a configurable linked module without process-global hooks.
+///
+/// # Safety
+/// The caller must uphold the host, output, configuration, and routing contracts
+/// of [`start_module`].
 #[doc(hidden)]
 pub unsafe fn start_linked_reconfigurable_module<C, F, Fut>(
     host: *const TbHostVtable,
