@@ -84,7 +84,10 @@ the already selected peer remains the only accepted responder.
 Old clients omit the optional field and continue routing on a new broker.
 New clients refuse named calls when an old broker lacks `ResolveCallTarget`;
 they retain the typed `UnknownMethod` error rather than silently sending an
-unguarded call. Unique calls need no alias negotiation.
+unguarded call. Unique calls need no alias negotiation. Stream writers retain the unique
+responder from `Open` for every later `Write`, `Close`, and `Abort`; they
+neither re-resolve an alias per chunk nor redirect an existing stream after
+takeover. Unstamped direct-transport replies retain the original destination.
 
 These identity guarantees require the actual broker to overwrite ingress
 senders and protect its transport. A raw `Connection::attach` pair without

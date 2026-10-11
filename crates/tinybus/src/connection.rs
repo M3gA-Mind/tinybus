@@ -986,18 +986,22 @@ impl Connection {
         descriptor: StreamDescriptor,
         timeout: Duration,
     ) -> Result<StreamWriter> {
-        let id: String = serde_json::from_value(
-            self.call_stream_member(
+        let reply = self
+            .call_stream_member_message(
                 destination,
                 "Open",
                 serde_json::json!([descriptor]),
                 timeout,
             )
-            .await?,
-        )?;
+            .await?;
+        let id: String = serde_json::from_value(reply.body)?;
+        // The stream belongs to this responder for its whole lifetime, even
+        // if the well-known name moves before the next chunk. Direct raw
+        // transports with no stamped sender retain their original address.
+        let destination = reply.header.sender.unwrap_or_else(|| destination.clone());
         Ok(StreamWriter::new(
             self.clone(),
-            destination.clone(),
+            destination,
             id,
             descriptor,
             timeout,
@@ -1175,6 +1179,19 @@ impl Connection {
         args: Value,
         timeout: Duration,
     ) -> Result<Value> {
+        Ok(self
+            .call_stream_member_message(destination, member, args, timeout)
+            .await?
+            .body)
+    }
+
+    async fn call_stream_member_message(
+        &self,
+        destination: &BusName,
+        member: &str,
+        args: Value,
+        timeout: Duration,
+    ) -> Result<Message> {
         let message = Message::method_call(
             destination.clone(),
             ObjectPath::new(STREAM_PATH)?,
@@ -1182,7 +1199,7 @@ impl Connection {
             MemberName::new(member)?,
             args,
         );
-        self.call_raw(message, timeout).await
+        self.call_raw_message(message, timeout).await
     }
 
     /// Call a method on the broker's own interface.
