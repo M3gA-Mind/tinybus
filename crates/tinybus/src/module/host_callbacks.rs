@@ -374,6 +374,9 @@ impl ModuleHost {
         })?;
         let artifact = loader::load(path, self.inner.strict.load(Ordering::Acquire))?;
         self.ensure_dependencies(&artifact.manifest, path)?;
+        if allowlisted_hash(path, std::fs::File::open(path)?)?.as_ref() != Some(&hash) {
+            return Err(Error::module_refused(path, "verified artifact changed during loading"));
+        }
         let transport = {
             let _admission = self.inner.admission.lock().expect("module admission lock");
             let admitted = self.validate(path, &artifact.descriptor, &artifact.manifest)?;
@@ -436,7 +439,11 @@ impl ModuleHost {
             transport.release_initialization(true);
             transport
         };
-        if transport.ensure_initialized().await.is_err() {
+        let initialized = transport.ensure_initialized().await;
+        let ready = if initialized.is_ok() {
+            tokio::time::timeout(Duration::from_secs(5), transport.wait_ready()).await.is_ok() && transport.is_ready()
+        } else { false };
+        if !ready {
             binding.revoke();
             let _ = transport.stop_sync(Duration::ZERO);
             let _ = transport.close().await;
