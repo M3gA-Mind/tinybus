@@ -558,3 +558,22 @@ async fn owner_negotiation_rejects_non_unique_responder_before_delivery() {
         Err(Error::Protocol(_))
     ));
 }
+
+#[tokio::test]
+async fn stream_chunks_and_close_stay_with_the_peer_that_answered_open() {
+    let bus = MemoryBus::new();
+    Broker::new().spawn(bus.clone());
+    let original = Connection::connect(bus.connect().await.unwrap()).await.unwrap();
+    let replacement = Connection::connect(bus.connect().await.unwrap()).await.unwrap();
+    let requester = Connection::connect(bus.connect().await.unwrap()).await.unwrap();
+    let alias = BusName::new("ai.tinyhumans.Fixture").unwrap();
+    original.request_name(alias.clone()).await.unwrap();
+    let mut writer = requester.open_stream(&alias, StreamDescriptor::with_len(7)).await.unwrap();
+    let reader = original.accept_stream(&writer.stream_ref()).unwrap();
+    original.release_name(alias.clone()).await.unwrap();
+    replacement.request_name(alias).await.unwrap();
+    let received = tokio::spawn(reader.read_to_end_capped(16));
+    writer.write(b"payload").await.unwrap();
+    writer.finish().await.unwrap();
+    assert_eq!(received.await.unwrap().unwrap(), b"payload");
+}
