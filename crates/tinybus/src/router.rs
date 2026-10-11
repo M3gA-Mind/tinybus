@@ -549,6 +549,11 @@ impl Router {
         &mut self,
         capability: Arc<crate::module::host::callbacks::CallbackState>,
     ) -> Result<()> {
+        if self.host_callbacks.iter().any(|entry| {
+            Arc::ptr_eq(entry, &capability) || entry.module_peer() == capability.module_peer()
+        }) {
+            return Err(Error::failed("callback scope is already registered"));
+        }
         if self.host_callbacks.len() >= 128 {
             return Err(Error::failed("callback scope limit reached"));
         }

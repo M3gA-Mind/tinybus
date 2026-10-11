@@ -138,10 +138,33 @@ fn unverified_sources_cannot_be_enrolled_and_scopes_are_bounded() {
             sha256: "a".repeat(64),
         },
     );
-    for _ in 0..128 {
-        router.add_host_callbacks(state.clone()).unwrap();
-    }
+    router.add_host_callbacks(state.clone()).unwrap();
     assert!(router.add_host_callbacks(state).is_err());
+    for _ in 1..128 {
+        let (_, source) = router.attach(tokio::sync::mpsc::channel(8).0);
+        let (_, destination) = router.attach(tokio::sync::mpsc::channel(8).0);
+        router.set_attestation_for_unique(
+            &source,
+            crate::attest::Attestation {
+                name: "org.example.Module".parse().unwrap(),
+                sha256: "a".repeat(64),
+            },
+        );
+        router
+            .add_host_callbacks(super::tests::state(source, destination))
+            .unwrap();
+    }
+    let (_, source) = router.attach(tokio::sync::mpsc::channel(8).0);
+    let (_, destination) = router.attach(tokio::sync::mpsc::channel(8).0);
+    router.set_attestation_for_unique(
+        &source,
+        crate::attest::Attestation {
+            name: "org.example.Module".parse().unwrap(),
+            sha256: "a".repeat(64),
+        },
+    );
+    let extra = super::tests::state(source, destination);
+    assert!(router.add_host_callbacks(extra).is_err());
 }
 
 struct BlockingCallback {

@@ -9,7 +9,7 @@ struct Config {
     fail: bool,
 }
 async fn setup(connection: Connection, config: Config) -> Result<()> {
-    let result = async {
+    async {
         if config.fail {
             return Err(Error::failed("fixture initialization rejected"));
         }
@@ -19,8 +19,7 @@ async fn setup(connection: Connection, config: Config) -> Result<()> {
             .await?;
         connection.request_name("org.example.EagerCallback").await
     }
-    .await;
-    result
+    .await
 }
 
 tinybus_module::module_export! {
