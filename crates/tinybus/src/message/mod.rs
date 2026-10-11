@@ -335,8 +335,13 @@ impl Message {
                 "only a method call can request a streamed reply",
             ));
         }
-        if let Some(expected) = &self.header.expected_responder
-            && (self.header.kind != MessageKind::MethodCall || !expected.is_unique())
+        if self
+            .header
+            .expected_responder
+            .as_ref()
+            .is_some_and(|expected| {
+                self.header.kind != MessageKind::MethodCall || !expected.is_unique()
+            })
         {
             return Err(Error::protocol(
                 "expected responder must be unique and only accompany a call",
