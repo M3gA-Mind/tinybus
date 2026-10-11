@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::name::{InterfaceName, MemberName, ObjectPath};
-use crate::service::Interface;
+use crate::service::{CallContext, Interface};
 
 /// Everything one connection exports.
 #[derive(Default)]
@@ -82,7 +82,7 @@ impl ObjectTree {
             })
     }
 
-    /// Resolve and invoke in one step.
+    /// Resolve and invoke an ordinary call with an unverified default context.
     pub async fn dispatch(
         &self,
         path: &ObjectPath,
@@ -96,6 +96,9 @@ impl ObjectTree {
 
     /// Resolve and invoke one call while enforcing the delivery's
     /// confidentiality flag before argument decoding reaches user code.
+    ///
+    /// Uses an unverified default context even when `confidential` is true;
+    /// the flag does not authenticate a caller.
     pub async fn dispatch_with_confidential(
         &self,
         path: &ObjectPath,
@@ -104,7 +107,44 @@ impl ObjectTree {
         args: Value,
         confidential: bool,
     ) -> Result<Value> {
+        self.dispatch_with_context(
+            path,
+            interface,
+            member,
+            args,
+            confidential,
+            &CallContext::default(),
+        )
+        .await
+    }
+
+    /// Resolve and invoke with out-of-band incoming context and delivery flags.
+    ///
+    /// Checks the member and its confidentiality requirement before calling
+    /// [`Interface::call_with_context`]. Passes `context` through unchanged;
+    /// this method does not derive caller identity from `args` or the flag.
+    pub async fn dispatch_with_context(
+        &self,
+        path: &ObjectPath,
+        interface: &InterfaceName,
+        member: &MemberName,
+        args: Value,
+        confidential: bool,
+        context: &CallContext,
+    ) -> Result<Value> {
         let target = self.lookup(path, interface)?;
+        Self::invoke(target, interface, member, args, confidential, context).await
+    }
+
+    /// Invoke a resolved snapshot without holding the connection's tree lock.
+    pub(crate) async fn invoke(
+        target: Arc<dyn Interface>,
+        interface: &InterfaceName,
+        member: &MemberName,
+        args: Value,
+        confidential: bool,
+        context: &CallContext,
+    ) -> Result<Value> {
         if !target.members().contains(member) {
             return Err(Error::UnknownMethod {
                 interface: interface.clone(),
@@ -117,7 +157,7 @@ impl ObjectTree {
                 member: member.clone(),
             });
         }
-        target.call(member, args).await
+        target.call_with_context(member, args, context).await
     }
 }
 
