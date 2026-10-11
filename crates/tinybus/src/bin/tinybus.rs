@@ -16,5 +16,5 @@ fn main() -> std::process::ExitCode {
 }
 
 #[cfg(all(test, not(unix)))]
-#[path = "tinybus_platform_tests.rs"]
+#[path = "tinybus/tinybus_platform_tests.rs"]
 mod tests;
