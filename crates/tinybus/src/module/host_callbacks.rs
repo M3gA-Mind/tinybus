@@ -57,6 +57,7 @@ impl CallbackState {
     pub(crate) fn matches(&self, header: &Header) -> bool {
         let state = self.lifetime.lock().expect("callback lifetime lock");
         state.active
+            && header.confidential
             && header.sender.as_ref() == state.module.as_ref()
             && state.module.is_some()
             && header.destination.as_ref() == Some(&self.destination)
@@ -88,6 +89,7 @@ impl HostCallbackGuard {
     pub fn authorizes(&self, context: &CallContext) -> bool {
         let state = self.0.lifetime.lock().expect("callback lifetime lock");
         state.active
+            && context.is_confidential()
             && state.module.is_some()
             && context.authenticated_sender() == state.module.as_ref()
     }
@@ -218,6 +220,11 @@ impl Drop for HostCallbackBinding {
         // Drop cannot await. Closing the sender synchronously detaches the
         // owned peer without spawning a task that might never be polled.
         self.transport.close_outbound();
+        self.broker
+            .router
+            .lock()
+            .expect("router lock")
+            .detach_unique(&self.state.destination);
     }
 }
 
@@ -259,7 +266,8 @@ impl<I: Interface> Interface for GuardedInterface<I> {
         // check by carrying an earlier route admission through an await.
         let _running = {
             let mut state = self.state.lifetime.lock().expect("callback lifetime lock");
-            if !state.active
+            if !context.is_confidential()
+                || !state.active
                 || state.module.is_none()
                 || context.authenticated_sender() != state.module.as_ref()
                 || !self.endpoint.members.contains(member)
@@ -302,13 +310,20 @@ impl ModuleHost {
             return Err(Error::failed("callback endpoint declaration is invalid"));
         }
         let (host, peer) = MemoryTransport::pair();
-        self.inner.broker.attach(Arc::new(peer));
+        let unique = self.inner.broker.attach(Arc::new(peer));
         let transport = Arc::new(host);
+        let mut rollback = PeerRollback {
+            broker: self.inner.broker.clone(),
+            peer: unique,
+            transport: transport.clone(),
+            committed: false,
+        };
         let connection = Connection::attach(transport.clone());
         connection.handshake().await?;
         let destination = connection
             .unique_name()
             .ok_or_else(|| Error::failed("callback connection has no unique name"))?;
+        rollback.committed = true;
         Ok(HostCallbackBinding {
             broker: self.inner.broker.clone(),
             connection,
@@ -375,7 +390,10 @@ impl ModuleHost {
         let artifact = loader::load(path, self.inner.strict.load(Ordering::Acquire))?;
         self.ensure_dependencies(&artifact.manifest, path)?;
         if allowlisted_hash(path, std::fs::File::open(path)?)?.as_ref() != Some(&hash) {
-            return Err(Error::module_refused(path, "verified artifact changed during loading"));
+            return Err(Error::module_refused(
+                path,
+                "verified artifact changed during loading",
+            ));
         }
         let transport = {
             let _admission = self.inner.admission.lock().expect("module admission lock");
@@ -441,8 +459,13 @@ impl ModuleHost {
         };
         let initialized = transport.ensure_initialized().await;
         let ready = if initialized.is_ok() {
-            tokio::time::timeout(Duration::from_secs(5), transport.wait_ready()).await.is_ok() && transport.is_ready()
-        } else { false };
+            tokio::time::timeout(Duration::from_secs(5), transport.wait_ready())
+                .await
+                .is_ok()
+                && transport.is_ready()
+        } else {
+            false
+        };
         if !ready {
             binding.revoke();
             let _ = transport.stop_sync(Duration::ZERO);
@@ -477,6 +500,12 @@ impl Drop for LoadRollback<'_> {
         }
         self.binding.revoke();
         self.binding.transport.close_outbound();
+        self.binding
+            .broker
+            .router
+            .lock()
+            .expect("router lock")
+            .detach_unique(&self.binding.state.destination);
         if let Some(transport) = &self.transport {
             transport.release_initialization(false);
             let peer = self.binding.state.module_peer().or_else(|| {
@@ -526,3 +555,22 @@ impl Drop for ModuleHostInner {
 #[cfg(test)]
 #[path = "host_callbacks_tests.rs"]
 mod tests;
+
+struct PeerRollback {
+    broker: Broker,
+    peer: BusName,
+    transport: Arc<MemoryTransport>,
+    committed: bool,
+}
+impl Drop for PeerRollback {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.transport.close_outbound();
+            self.broker
+                .router
+                .lock()
+                .expect("router lock")
+                .detach_unique(&self.peer);
+        }
+    }
+}

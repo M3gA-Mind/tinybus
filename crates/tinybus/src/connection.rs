@@ -1544,7 +1544,7 @@ async fn dispatch(inner: &Inner, header: &Header, body: Value, brokered: bool) -
         return Err(Error::protocol("method call is missing an address"));
     };
     let context = if brokered {
-        crate::CallContext::brokered(header.sender.as_ref())
+        crate::CallContext::brokered(header.sender.as_ref(), header.confidential)
     } else {
         crate::CallContext::default()
     };

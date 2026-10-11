@@ -2574,7 +2574,47 @@ async fn a_verified_cdylib_can_deliver_a_confidential_host_callback() {
         1,
         "confidential callback required; result: {result:?}"
     );
-    assert_eq!(result.unwrap(), (binding.unique_name().clone(), module));
+    assert_eq!(
+        result.unwrap(),
+        (binding.unique_name().clone(), module.clone())
+    );
+    let ordinary = binding
+        .proxy(module.as_str(), "/context", "org.example.Context")
+        .unwrap()
+        .call::<serde_json::Value>("Callback", ())
+        .await;
+    assert!(
+        ordinary.is_err(),
+        "scoped confidential endpoints refuse ordinary calls even from their module"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let attacker = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let mut forged = crate::message::Message::method_call(
+        binding.unique_name().clone(),
+        "/callback".parse().unwrap(),
+        "org.example.Callback".parse().unwrap(),
+        "Observe".parse().unwrap(),
+        serde_json::json!([]),
+    );
+    forged.header.sender = Some(module.clone());
+    forged.header.confidential = true;
+    assert!(
+        attacker
+            .call_raw(forged, Duration::from_secs(2))
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    binding.revoke();
+    let revoked = binding
+        .proxy(module.as_str(), "/context", "org.example.Context")
+        .unwrap()
+        .call_confidential::<serde_json::Value>("ConfidentialCallback", ())
+        .await;
+    assert!(revoked.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     task.abort();
 }
 
@@ -2612,35 +2652,73 @@ impl crate::Interface for CountingNativeCallback {
 #[ignore = "requires TINYBUS_TEST_HOST_CALLBACK_MODULE to point at the built cdylib"]
 async fn eager_native_setup_callbacks_are_bound_before_ready_and_failures_rollback() {
     for failed in [false, true] {
-        let artifact = PathBuf::from(std::env::var_os("TINYBUS_TEST_HOST_CALLBACK_MODULE").unwrap());
+        let artifact =
+            PathBuf::from(std::env::var_os("TINYBUS_TEST_HOST_CALLBACK_MODULE").unwrap());
         let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
         #[cfg(unix)]
         let (_dir, artifact) = staged_module(&artifact, &hash);
         let broker = Broker::new();
         let modules = ModuleHost::new(broker.clone());
-        let binding = modules.prepare_host_callbacks(vec![crate::module::HostCallbackEndpoint {
-            path: "/callback".parse().unwrap(), interface: "org.example.Callback".parse().unwrap(), members: vec!["Observe".parse().unwrap()],
-        }]).await.unwrap();
+        let binding = modules
+            .prepare_host_callbacks(vec![crate::module::HostCallbackEndpoint {
+                path: "/callback".parse().unwrap(),
+                interface: "org.example.Callback".parse().unwrap(),
+                members: vec!["Observe".parse().unwrap()],
+            }])
+            .await
+            .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let guard = binding.guard();
-        binding.serve_at("/callback".parse().unwrap(), BoundNativeCallback { calls: calls.clone(), guard: guard.clone() }).await.unwrap();
+        binding
+            .serve_at(
+                "/callback".parse().unwrap(),
+                BoundNativeCallback {
+                    calls: calls.clone(),
+                    guard: guard.clone(),
+                },
+            )
+            .await
+            .unwrap();
         let config = serde_json::json!({"host": binding.unique_name(), "fail": failed});
-        let result = modules.load_file_with_host_callbacks(artifact, config.clone(), &binding).await;
+        let result = modules
+            .load_file_with_host_callbacks(artifact, config.clone(), &binding)
+            .await;
         assert_eq!(calls.load(Ordering::SeqCst), usize::from(!failed));
         if failed {
             assert!(result.is_err());
             assert!(modules.list().is_empty());
-            assert!(!guard.authorizes(&crate::CallContext::brokered(guard.module_peer().as_ref())));
+            assert!(!guard.authorizes(&crate::CallContext::brokered(
+                guard.module_peer().as_ref(),
+                true
+            )));
         } else {
             let info = result.unwrap();
             assert!(matches!(info.state, ModuleState::Ready));
-            assert_eq!(Some(binding.unique_name().clone()), broker.router.lock().unwrap().owner_of(binding.unique_name()));
-            assert!(modules.reinitialize(&info.name, serde_json::json!({"host": ":1.999", "fail": false})).await.is_err());
+            assert_eq!(
+                Some(binding.unique_name().clone()),
+                broker
+                    .router
+                    .lock()
+                    .unwrap()
+                    .owner_of(binding.unique_name())
+            );
+            assert!(
+                modules
+                    .reinitialize(
+                        &info.name,
+                        serde_json::json!({"host": ":1.999", "fail": false})
+                    )
+                    .await
+                    .is_err()
+            );
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             modules.reinitialize(&info.name, config).await.unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 2);
             modules.shutdown(Duration::from_secs(2)).await;
-            assert!(!guard.authorizes(&crate::CallContext::brokered(guard.module_peer().as_ref())));
+            assert!(!guard.authorizes(&crate::CallContext::brokered(
+                guard.module_peer().as_ref(),
+                true
+            )));
         }
         binding.close().await.unwrap();
     }
@@ -2652,12 +2730,33 @@ struct BoundNativeCallback {
 }
 #[async_trait::async_trait]
 impl crate::Interface for BoundNativeCallback {
-    fn name(&self) -> crate::InterfaceName { "org.example.Callback".parse().unwrap() }
-    fn members(&self) -> Vec<crate::MemberName> { vec!["Observe".parse().unwrap()] }
-    async fn call(&self, _: &crate::MemberName, _: serde_json::Value) -> crate::Result<serde_json::Value> { Err(Error::failed("unverified")) }
-    async fn call_with_context(&self, _: &crate::MemberName, _: serde_json::Value, context: &crate::CallContext) -> crate::Result<serde_json::Value> {
-        assert_eq!(context.authenticated_sender(), self.guard.module_peer().as_ref());
-        assert!(self.guard.authorizes(context), "peer must be pinned before eager callback");
+    fn name(&self) -> crate::InterfaceName {
+        "org.example.Callback".parse().unwrap()
+    }
+    fn members(&self) -> Vec<crate::MemberName> {
+        vec!["Observe".parse().unwrap()]
+    }
+    async fn call(
+        &self,
+        _: &crate::MemberName,
+        _: serde_json::Value,
+    ) -> crate::Result<serde_json::Value> {
+        Err(Error::failed("unverified"))
+    }
+    async fn call_with_context(
+        &self,
+        _: &crate::MemberName,
+        _: serde_json::Value,
+        context: &crate::CallContext,
+    ) -> crate::Result<serde_json::Value> {
+        assert_eq!(
+            context.authenticated_sender(),
+            self.guard.module_peer().as_ref()
+        );
+        assert!(
+            self.guard.authorizes(context),
+            "peer must be pinned before eager callback"
+        );
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(serde_json::json!(context.authenticated_sender().unwrap()))
     }

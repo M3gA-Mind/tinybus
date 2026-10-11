@@ -10,11 +10,16 @@ struct Config {
 }
 async fn setup(connection: Connection, config: Config) -> Result<()> {
     let result = async {
-        if config.fail { return Err(Error::failed("fixture initialization rejected")); }
-        let _: tinybus::BusName = connection.proxy(config.host.as_str(), "/callback", "org.example.Callback")?
-            .call_confidential("Observe", ()).await?;
+        if config.fail {
+            return Err(Error::failed("fixture initialization rejected"));
+        }
+        let _: tinybus::BusName = connection
+            .proxy(config.host.as_str(), "/callback", "org.example.Callback")?
+            .call_confidential("Observe", ())
+            .await?;
         connection.request_name("org.example.EagerCallback").await
-    }.await;
+    }
+    .await;
     result
 }
 

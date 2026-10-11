@@ -48,6 +48,7 @@ pub use crate::service::tree::ObjectTree;
 #[derive(Debug, Clone, Default)]
 pub struct CallContext {
     sender: Option<BusName>,
+    confidential: bool,
 }
 
 impl CallContext {
@@ -60,9 +61,16 @@ impl CallContext {
         self.sender.as_ref()
     }
 
-    pub(crate) fn brokered(sender: Option<&BusName>) -> Self {
+    /// Whether the authenticated incoming call requested confidential routing.
+    /// Unverified contexts never assert confidential admission.
+    pub fn is_confidential(&self) -> bool {
+        self.confidential
+    }
+
+    pub(crate) fn brokered(sender: Option<&BusName>, confidential: bool) -> Self {
         Self {
             sender: sender.filter(|name| name.is_unique()).cloned(),
+            confidential: confidential && sender.is_some_and(BusName::is_unique),
         }
     }
 }

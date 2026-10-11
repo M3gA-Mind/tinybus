@@ -208,7 +208,7 @@ async fn revoke_after_route_selection_blocks_dispatch_and_direct_unverified_disp
             .call_with_context(
                 &endpoint().members[0],
                 serde_json::json!([]),
-                &CallContext::brokered(state.module_peer().as_ref())
+                &CallContext::brokered(state.module_peer().as_ref(), true)
             )
             .await
             .is_err()
@@ -233,7 +233,7 @@ async fn revoke_during_await_preserves_running_charge_until_actual_completion() 
             guard: guard.clone(),
         },
     };
-    let context = CallContext::brokered(state.module_peer().as_ref());
+    let context = CallContext::brokered(state.module_peer().as_ref(), true);
     let task = tokio::spawn(async move {
         guarded
             .call_with_context(&endpoint().members[0], serde_json::json!([]), &context)
