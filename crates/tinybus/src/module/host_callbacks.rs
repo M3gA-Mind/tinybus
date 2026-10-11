@@ -298,7 +298,8 @@ impl ModuleHost {
         let (host, peer) = MemoryTransport::pair();
         self.inner.broker.attach(Arc::new(peer));
         let transport = Arc::new(host);
-        let connection = Connection::connect(transport.clone()).await?;
+        let connection = Connection::attach(transport.clone());
+        connection.handshake().await?;
         let destination = connection
             .unique_name()
             .ok_or_else(|| Error::failed("callback connection has no unique name"))?;
