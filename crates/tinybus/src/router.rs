@@ -24,6 +24,8 @@
 //! to discard a signal it never asked for is exactly that cost in miniature.
 
 use std::collections::HashMap;
+#[cfg(feature = "modules")]
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
