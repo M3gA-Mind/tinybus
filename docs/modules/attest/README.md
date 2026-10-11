@@ -5,12 +5,14 @@ delivered.
 
 ## Who receives a secret
 
-A **module loaded into the host's address space**, and nothing else.
+A **verified module loaded into the host's address space**, or an explicitly
+scoped local host callback created by `ModuleHost`. The callback exception binds
+one verified loaded sender to one SDK-created local connection and exact
+path/interface/member endpoints. It never produces an artifact attestation.
+See [scoped local host callbacks](#scoped-local-host-callbacks).
 
-That is the whole rule, and it is a deliberate narrowing rather than a
-limitation. A secret handed to a loaded module never crosses a transport, never
-reaches a separate process, and never touches a socket — so there is no peer to
-identify, no process credential to read, and no per-OS code to keep working.
+Neither recipient crosses a process boundary or a socket. Ordinary connections,
+remote peers and well-known host aliases cannot acquire this callback permission.
 
 Services in their own processes, CLI clients and monitors do not receive
 secrets. A confidential message addressed to one is refused.

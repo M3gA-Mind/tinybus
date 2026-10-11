@@ -129,12 +129,15 @@ impl Proxy {
     ///
     /// The call fails with [`crate::Error::NotAttested`] unless the broker has
     /// itself verified the destination's artifact against the operator's trust
-    /// store. That refusal is the feature: handing a private key to whoever
+    /// store, or this exact call matches an active SDK-created local host callback
+    /// capability for this verified loaded module sender. That refusal is the feature: handing a private key to whoever
     /// happened to claim the name first is the outcome this exists to prevent,
     /// and it is better to fail a deploy than to succeed at that.
     ///
     /// Use [`Proxy::attestation`] first if the caller wants to distinguish
     /// "not installed" from "not trusted" before it assembles the secret.
+    /// A scoped host callback deliberately has no artifact attestation; its
+    /// authority comes only from the local ModuleHost capability.
     pub async fn call_confidential<R: DeserializeOwned>(
         &self,
         member: &str,

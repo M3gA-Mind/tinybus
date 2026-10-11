@@ -84,8 +84,8 @@ pub struct Header {
     /// For [`MessageKind::Error`]: the stable dotted error name.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_name: Option<String>,
-    /// This body is a secret: deliver it to the attested destination or to
-    /// nobody.
+    /// This body is a secret: deliver it to the attested destination, an exact
+    /// active SDK-created local host callback capability, or nobody.
     ///
     /// Set by the sender and *not* overwritten on ingress, unlike `sender`. The
     /// asymmetry is deliberate and safe in this direction: the flag only ever
