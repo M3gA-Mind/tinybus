@@ -319,3 +319,75 @@ async fn endpoint_declarations_registration_and_broker_ownership_are_checked() {
     );
     binding.close().await.unwrap();
 }
+
+struct EmptyCallback;
+#[async_trait]
+impl Interface for EmptyCallback {
+    fn name(&self) -> InterfaceName {
+        endpoint().interface
+    }
+    fn members(&self) -> Vec<MemberName> {
+        vec![]
+    }
+    async fn call(&self, _: &MemberName, _: serde_json::Value) -> Result<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+}
+#[tokio::test]
+async fn registration_is_exact_single_use_and_failed_load_detaches_the_local_peer() {
+    let broker = Broker::new();
+    let host = ModuleHost::new(broker.clone());
+    let binding = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
+    assert!(
+        binding
+            .serve_at("/other".parse().unwrap(), EmptyCallback)
+            .await
+            .is_err()
+    );
+    assert!(
+        binding
+            .serve_at(endpoint().path, EmptyCallback)
+            .await
+            .is_err()
+    );
+    let (entered, _) = tokio::sync::mpsc::channel(1);
+    let callback = || BlockingCallback {
+        entered: entered.clone(),
+        release: Arc::new(tokio::sync::Semaphore::new(1)),
+        published: Arc::new(AtomicUsize::new(0)),
+        guard: binding.guard(),
+    };
+    binding.serve_at(endpoint().path, callback()).await.unwrap();
+    assert!(binding.serve_at(endpoint().path, callback()).await.is_err());
+    assert_eq!(
+        binding.unique_name(),
+        &broker
+            .router
+            .lock()
+            .unwrap()
+            .owner_of(binding.unique_name())
+            .unwrap()
+    );
+    assert!(
+        host.load_file_with_host_callbacks("missing-fixture", serde_json::json!({}), &binding)
+            .await
+            .is_err()
+    );
+    assert!(
+        broker
+            .router
+            .lock()
+            .unwrap()
+            .owner_of(binding.unique_name())
+            .is_none()
+    );
+    assert!(binding.serve_at(endpoint().path, callback()).await.is_err());
+    assert!(
+        host.load_file_with_host_callbacks("missing-fixture", serde_json::json!({}), &binding)
+            .await
+            .is_err()
+    );
+    let peer = binding.unique_name().clone();
+    drop(binding);
+    assert!(broker.router.lock().unwrap().owner_of(&peer).is_none());
+}

@@ -2572,7 +2572,7 @@ async fn a_verified_cdylib_can_deliver_a_confidential_host_callback() {
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
-        "confidential callback required; result: {result:?}"
+        "confidential callback required"
     );
     assert_eq!(
         result.unwrap(),
@@ -2714,7 +2714,7 @@ async fn eager_native_setup_callbacks_are_bound_before_ready_and_failures_rollba
             assert_eq!(calls.load(Ordering::SeqCst), 1);
             modules.reinitialize(&info.name, config).await.unwrap();
             assert_eq!(calls.load(Ordering::SeqCst), 2);
-            modules.shutdown(Duration::from_secs(2)).await;
+            drop(modules);
             assert!(!guard.authorizes(&crate::CallContext::brokered(
                 guard.module_peer().as_ref(),
                 true
