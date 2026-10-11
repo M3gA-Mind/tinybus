@@ -475,7 +475,7 @@ async fn rollback_after_attach_releases_the_actual_initialization_observer() {
     let binding = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
     let manifest = super::super::tests::manifest();
     let path = Path::new("observer-fixture.so");
-    let mut admitted = provisional_info(path, &manifest).unwrap();
+    let mut admitted = host.validate(path, &TbAbiDescriptor::current("clock", "0.1.0"), &manifest).unwrap();
     admitted.state = ModuleState::Resolved;
     let (transport, _) = ModuleTransport::new(admitted.name.clone(), vec![]);
     transport.pause_initialization();
