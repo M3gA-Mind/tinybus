@@ -220,17 +220,11 @@ impl Broker {
                 // connection, which chose to participate in the exchange.
                 let confidential_call =
                     message.header.confidential && message.header.kind == MessageKind::MethodCall;
-                let target = if confidential_call {
-                    self.router
-                        .lock()
-                        .expect("router lock")
-                        .resolve_attested(&destination)
-                } else {
-                    self.router
-                        .lock()
-                        .expect("router lock")
-                        .resolve(&destination)
-                };
+                let target = self.router.lock().expect("router lock").resolve_call(
+                    &destination,
+                    message.header.expected_responder.as_ref(),
+                    confidential_call,
+                );
                 #[cfg(feature = "modules")]
                 let target = target.map_err(|error| {
                     // A refused attestation is the more specific answer and
@@ -339,6 +333,34 @@ impl Broker {
         #[cfg(feature = "modules")]
         if let Some((result, module_states)) = self.module_method(member, body.clone()).await {
             return (result, Vec::new(), module_states);
+        }
+
+        // Negotiate conditional routing before building the call body. Keep
+        // module-state errors as specific as ordinary routing, and do not hold
+        // the router lock while consulting the module lifecycle owner.
+        if member.as_str() == "ResolveCallTarget" {
+            let result = (|| -> Result<Value> {
+                let (name,): (BusName,) = parse_args(member, body)?;
+                let owner = self.router.lock().expect("router lock").owner_of(&name);
+                match owner {
+                    Some(owner) => Ok(serde_json::to_value(owner)?),
+                    None => {
+                        #[cfg(feature = "modules")]
+                        if let Some(error) = self
+                            .modules
+                            .lock()
+                            .expect("module control lock")
+                            .as_ref()
+                            .and_then(Weak::upgrade)
+                            .and_then(|control| control.unavailable_for(&name))
+                        {
+                            return Err(error);
+                        }
+                        Err(Error::NameHasNoOwner(name))
+                    }
+                }
+            })();
+            return (result, Vec::new(), Vec::new());
         }
 
         let mut changes = Vec::new();
@@ -614,6 +636,7 @@ impl Broker {
                 kind: MessageKind::Signal,
                 serial: 0,
                 reply_serial: None,
+                expected_responder: None,
                 sender: Some(
                     BusName::new(crate::BUS_NAME).expect("the bus name constant is valid"),
                 ),
