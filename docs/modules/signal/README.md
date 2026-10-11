@@ -51,3 +51,14 @@ remained unverified. Sealing at ingress fixes those failures. Additional tests
 cover canceled receive, queued verified then raw unverified delivery, custom
 transport after Hello, unchanged legacy handler defaults, exact admitted local
 publisher refusal for an identical remote payload, and opaque identity cloning.
+
+## Local verification
+
+Strict locked all-target/all-feature Clippy, fmt, strict rustdoc, the slim
+no-default-feature workspace check and Rust 1.85 locked all-feature workspace
+check passed. Full workspace tests passed 543 all-feature and 530 default tests,
+including doctests. The canonical per-file coverage gate ran the actual five
+compiled module loader fixtures with ignored tests included and exited 0:
+94.61% overall lines, every included production source at least 90%, with
+`signal.rs` at 100%. The existing canonical coverage exclusions are unchanged.
+No protocol version, module ABI, dependency or host implementation changed.
