@@ -1,3 +1,27 @@
 [ci-cancel-aware] exec: cargo test -p tinybus --all-features reply_tests 
    Compiling tinybus v0.1.3 (/home/enamakel/work/openhuman/worktrees/cloud-storage-7419/vendor/tinybus/crates/tinybus)
    Compiling tinybus-module v0.1.3 (/home/enamakel/work/openhuman/worktrees/cloud-storage-7419/vendor/tinybus/crates/tinybus-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.84s
+     Running unittests src/lib.rs (target/debug/deps/tinybus-b3a640fb890222d1)
+
+running 11 tests
+test connection::reply_tests::conditional_owner_header_requires_a_unique_method_call_target ... ok
+test connection::reply_tests::reply_authority_rejects_other_peers_and_requires_private_success ... ok
+test connection::reply_tests::raw_direct_reply_compatibility_does_not_claim_broker_identity ... ok
+test connection::reply_tests::legacy_alias_calls_remain_routable_without_a_conditional_header ... ok
+test connection::reply_tests::unsupported_owner_guard_negotiation_fails_before_alias_delivery ... ok
+test connection::reply_tests::another_broker_peer_cannot_complete_a_waiter_with_a_forged_reply ... ok
+test connection::reply_tests::confidential_unique_reply_preserves_genuine_sanitized_error ... ok
+test connection::reply_tests::confidential_named_reply_binds_the_attested_owner ... ok
+test connection::reply_tests::unique_reply_preserves_genuine_error_after_rejecting_forged_errors ... ok
+test connection::reply_tests::captured_alias_owner_is_checked_atomically_before_dispatch ... ok
+test connection::reply_tests::named_reply_rejects_forged_success_and_errors_with_any_private_flags ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 473 filtered out; finished in 0.00s
+
+     Running unittests src/bin/tinybus.rs (target/debug/deps/tinybus-50b3c4f41422dede)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
