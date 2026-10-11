@@ -330,17 +330,20 @@ struct RuntimeState {
 }
 
 type Reinitialize = Box<dyn Fn(*const u8, usize) -> i32 + Send + Sync>;
-async fn dispose_failed_setup_callback(callback: Arc<StdMutex<Option<Reinitialize>>>) {
+async fn dispose_failed_setup_callback(
+    callback: Arc<StdMutex<Option<Reinitialize>>>,
+) -> Result<()> {
     // Reinitialization holds exclusion while driving setup with block_on.
     // Waiting for it must leave runtime workers free to advance that future
     // and its timer. Observe completion before publishing the failure.
-    let _ = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         callback
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
     })
-    .await;
+    .await
+    .map_err(|_| Error::failed("module failed-setup callback disposal panicked"))
 }
 type ReinitializeFactory = Box<
     dyn FnOnce(tokio::runtime::Handle, Arc<StdMutex<Option<Connection>>>) -> Reinitialize + Send,
@@ -663,7 +666,12 @@ where
             if !matches!(outcome, Ok(Ok(()))) {
                 // A terminal setup failure may never receive ABI shutdown.
                 // Dispose its callback under the same lifecycle exclusion.
-                dispose_failed_setup_callback(failed_setup_callback).await;
+                if dispose_failed_setup_callback(failed_setup_callback)
+                    .await
+                    .is_err()
+                {
+                    tracing::error!("tinybus module failed-setup callback disposal failed");
+                }
                 match outcome {
                     Ok(Err(error)) => tracing::error!(error = %error, "tinybus module failed"),
                     Err(_) => tracing::error!("tinybus module setup task failed"),

@@ -184,7 +184,7 @@ fn failed_setup_disposal_keeps_single_runtime_worker_available() {
     let dispose = callback.clone();
     runtime.spawn(async move {
         entered_tx.send(()).unwrap();
-        dispose_failed_setup_callback(dispose).await;
+        dispose_failed_setup_callback(dispose).await.unwrap();
         done_tx.send(()).unwrap();
     });
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();

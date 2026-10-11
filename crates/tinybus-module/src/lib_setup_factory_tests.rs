@@ -432,3 +432,107 @@ async fn panicking_initial_setup_releases_factory_capture_and_reports_fault() {
     .unwrap();
     assert_eq!(panicking_setup::DROPPED.load(Ordering::SeqCst) - before, 1);
 }
+
+mod worker_progress_setup {
+    use super::*;
+    pub(super) type Channels = (
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    );
+    pub(super) static CHANNELS: StdMutex<Option<Channels>> = StdMutex::new(None);
+    struct Capture {
+        started: std::sync::mpsc::Sender<()>,
+        release: StdMutex<std::sync::mpsc::Receiver<()>>,
+        notify: Arc<tokio::sync::Notify>,
+    }
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            self.started.send(()).unwrap();
+            self.notify.notify_one();
+            self.release.lock().unwrap().recv().unwrap();
+        }
+    }
+    fn factory() -> impl Fn(Connection, Config) -> SetupFuture + Send + Sync {
+        let (started, release, progress) = CHANNELS.lock().unwrap().take().unwrap();
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let capture = Capture {
+            started,
+            release: StdMutex::new(release),
+            notify: notify.clone(),
+        };
+        move |_, _| {
+            let _ = &capture;
+            let notify = notify.clone();
+            let progress = progress.clone();
+            Box::pin(async move {
+                tokio::spawn(async move {
+                    notify.notified().await;
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    progress.send(()).unwrap();
+                });
+                Err(tinybus::Error::failed("fixture setup refused"))
+            })
+        }
+    }
+    module_export_static! {
+        setup_factory = factory, config = Config, worker_threads = 1,
+        provides = ["ai.tinyhumans.tinybus.WorkerFactory"],
+        methods = [], signals = [], requires = [], optional = [], lazy = false,
+    }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn compiled_single_worker_disposal_advances_timer_before_reporting_fault() {
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    *worker_progress_setup::CHANNELS.lock().unwrap() = Some((started_tx, release_rx, progress_tx));
+    let bus = MemoryBus::new();
+    let broker = Broker::new();
+    broker.clone().spawn(bus);
+    let host = ModuleHost::new(broker);
+    host.attach_linked_with_config(
+        worker_progress_setup::linked_module().unwrap(),
+        serde_json::json!({"restricted":true}),
+    )
+    .unwrap();
+    tokio::task::spawn_blocking(move || started_rx.recv_timeout(std::time::Duration::from_secs(5)))
+        .await
+        .unwrap()
+        .unwrap();
+    let progressed = tokio::task::spawn_blocking(move || {
+        progress_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok()
+    })
+    .await
+    .unwrap();
+    let fault_before_completion = host
+        .list()
+        .iter()
+        .any(|m| matches!(m.state, tinybus::module::ModuleState::Faulted { .. }));
+    // Release disposal even on assertion failures.
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if host
+                .list()
+                .iter()
+                .any(|m| matches!(m.state, tinybus::module::ModuleState::Faulted { .. }))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        progressed,
+        "compiled module's sole timer worker must remain available"
+    );
+    assert!(
+        !fault_before_completion,
+        "Faulted must follow observed disposal completion"
+    );
+}
