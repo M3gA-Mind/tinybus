@@ -154,36 +154,46 @@ async fn captured_alias_owner_is_checked_atomically_before_dispatch() {
     let bus = MemoryBus::new();
     Broker::new().spawn(bus.clone());
     let original = Connection::connect(bus.connect().await.unwrap()).await.unwrap();
-    let replacement = Connection::connect(bus.connect().await.unwrap()).await.unwrap();
-    let requester = Connection::connect(bus.connect().await.unwrap()).await.unwrap();
+    let replacement = bus.connect().await.unwrap();
+    let requester = bus.connect().await.unwrap();
+    raw_control(&replacement, 1, "Hello", serde_json::json!([])).await;
+    raw_control(&requester, 1, "Hello", serde_json::json!([])).await;
     let alias = BusName::new("ai.tinyhumans.Fixture").unwrap();
     original.request_name(alias.clone()).await.unwrap();
-    let captured: BusName = serde_json::from_value(requester.call_bus(
-        "ResolveCallTarget", serde_json::json!([alias])).await.unwrap()).unwrap();
+    let captured_reply = raw_control(&requester, 2, "ResolveCallTarget", serde_json::json!([alias])).await;
+    let captured: BusName = serde_json::from_value(captured_reply.body).unwrap();
     original.release_name(alias.clone()).await.unwrap();
-    replacement.request_name(alias.clone()).await.unwrap();
+    raw_control(&replacement, 2, "RequestName", serde_json::json!([alias])).await;
     let mut call = fixture_call(alias.clone());
-    call.header.expected_responder = Some(captured);
-    // Send through the low-level port, bypassing the SDK's earlier check, to
-    // pin the broker's routing check independently of requester validation.
-    call.header.serial = 900;
-    let mut replies = requester.add_match(MatchRule::new().signals()).await.unwrap();
+    call.header.expected_responder = Some(captured.clone());
+    call.header.serial = 3;
     requester.send(call).await.unwrap();
-    requester.emit(ObjectPath::new("/fixture").unwrap(),
-        InterfaceName::new("ai.tinyhumans.Fixture").unwrap(),
-        MemberName::new("Barrier").unwrap(), ()).await.unwrap();
-    tokio::time::timeout(DEFAULT_TIMEOUT, replies.recv()).await.unwrap().unwrap();
-    // Exercise the SDK pre-send check as well; the replacement must never be
-    // invoked with a stale binding.
+    let refusal = requester.recv().await.unwrap().unwrap();
+    assert_eq!(refusal.header.reply_serial, Some(3));
+    assert_eq!(refusal.header.kind, MessageKind::Error);
+    assert_eq!(refusal.header.sender.as_ref().unwrap().as_str(), crate::BUS_NAME);
+    assert_eq!(refusal.header.error_name.as_deref(), Some(Error::NAME_HAS_NO_OWNER));
+    // An ordered broker control reply to the replacement is a barrier after
+    // the refused call: an incorrectly routed call would arrive before it.
+    let mut ping = fixture_call(BusName::new(crate::BUS_NAME).unwrap());
+    ping.header.path = Some(ObjectPath::new(crate::BUS_PATH).unwrap());
+    ping.header.interface = Some(InterfaceName::new(crate::BUS_INTERFACE).unwrap());
+    ping.header.member = Some(MemberName::new("Ping").unwrap());
+    ping.header.serial = 3;
+    replacement.send(ping).await.unwrap();
+    let first = replacement.recv().await.unwrap().unwrap();
+    assert_eq!(first.header.kind, MessageKind::MethodReturn);
+    assert_eq!(first.header.reply_serial, Some(3));
+    let sdk = Connection::connect(bus.connect().await.unwrap()).await.unwrap();
     let mut stale = fixture_call(alias.clone());
-    stale.header.expected_responder = Some(original.unique_name().unwrap());
-    assert!(matches!(requester.call_raw(stale, DEFAULT_TIMEOUT).await,
+    stale.header.expected_responder = Some(captured);
+    assert!(matches!(sdk.call_raw(stale, DEFAULT_TIMEOUT).await,
         Err(Error::NameHasNoOwner(name)) if name == alias));
 }
 
 #[tokio::test]
 async fn raw_direct_reply_compatibility_does_not_claim_broker_identity() {
-    let (a, b) = crate::transport::memory::pair(16);
+    let (a, b) = crate::transport::memory::MemoryTransport::pair();
     let requester = Connection::attach(Arc::new(a));
     let responder = Arc::new(b);
     let pending = tokio::spawn({ let requester = requester.clone(); async move {
