@@ -186,3 +186,43 @@ TINYBUS_TEST_MODULE="$PWD/target/debug/examples/libmodule_clock.so" \
 The artifact name above is Linux's (`libmodule_clock.so`); on macOS Cargo
 builds `libmodule_clock.dylib` instead, so point `TINYBUS_TEST_MODULE` at that
 file when running the same command there.
+
+
+## Scoped local host callbacks
+
+`ModuleHost::prepare_host_callbacks` creates its own local MemoryTransport
+connection. It accepts at most 32 exact path/interface declarations, each with
+one to 64 distinct members. `HostCallbackBinding::serve_at` wraps those methods
+in authenticated, confidential, live dispatch checks; it exposes no raw
+connection for bypassing that guard. An outgoing `proxy` uses this same private
+host peer, so initialization and callback reception share one fixed identity.
+
+`load_file_with_host_callbacks` requires an actual hash-verified local artifact
+and all endpoints served before admission. It reserves the exact loaded module
+peer and binds the exact sender, unique host destination, path, interface and
+member before releasing its initialization gate. The read-only `guard()` exposes
+`module_peer()` before eager setup callbacks run. The loader awaits actual
+READY/fault with a deadline; ABI initialization success alone is insufficient.
+Failures or a dropped load future revoke routes and detach reserved peers. A
+binding is single-use. Reinitialization requires its unchanged configuration.
+
+This intentional recipient exception is **not artifact attestation**. There is
+no remote enrollment method, self-attestation, wire trust flag, existing
+connection registration, alias inheritance or generic-load callback grant. The
+router admits at most 128 active scopes and continues to apply ordinary module
+artifact admission and expected-owner checks.
+
+`revoke()` is immediate and idempotent for new route and user-dispatch admission.
+Drop, peer detach and host-owner drop also revoke. A callback selected earlier
+must recheck liveness before user code. Code already running remains counted by
+`guard().running()` until its future completes or drops. `drained()` reports
+that count only; caller timeouts and connection close do not imply that provider
+writes have ceased. Detached provider tasks require their own completion fence.
+Domain callbacks must check `guard().authorizes(context)` after awaits and before
+publication and preserve uncertainty about writes already attempted. No buffer
+copy wiping or whole-boundary zeroization guarantee is made.
+
+`module_host_callback` is an actual cdylib fixture: hash-verified bytes perform
+an eager confidential callback during setup before READY. The native-loader CI
+job runs it on Linux, macOS and Windows. `module_context` separately proves
+confidential runtime callbacks and refusal of ordinary, forged and revoked calls.

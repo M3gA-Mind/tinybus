@@ -144,7 +144,7 @@ impl Broker {
 
     /// Record that a loaded module's artifact matched the module allowlist.
     ///
-    /// This is the *only* way a peer becomes eligible to receive a confidential
+    /// This is how a module peer becomes eligible to receive a confidential
     /// message: the artifact was hashed against `modules.toml` before `dlopen`,
     /// and nothing reached across a transport to establish it.
     #[cfg(feature = "modules")]

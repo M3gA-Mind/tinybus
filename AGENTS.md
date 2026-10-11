@@ -104,12 +104,18 @@ discussion in the pull request:
   control story in full.
 - **Every call has a deadline.** It cannot be disabled. A call with no deadline
   reintroduces the hang that motivated the project.
-- **A confidential message goes to a loaded, hash-verified module or to
-  nobody.** Only a module whose artifact the host hashed against a digest an
+- **A confidential call goes to a loaded, hash-verified module, an explicitly
+  scoped SDK-created local host callback, or nobody.** Only a module whose artifact the host hashed against a digest an
   operator asserted — a `modules.toml` beside the file, or one compiled into the
   host and checked against the release manifest before extraction — may receive
-  one; a peer reached across a transport never can,
-  by design rather than by omission. The message is never fanned out to a
+  one. The sole host exception is `ModuleHost::prepare_host_callbacks` plus
+  `load_file_with_host_callbacks`: a private SDK-created MemoryTransport
+  connection, exact verified module unique sender, exact host unique destination,
+  path, interface and member, all bound before initialization. This capability
+  is not artifact attestation; aliases, other instances, ordinary connections and
+  custom/remote transports never inherit it. Revocation and detach prevent new
+  route and guarded user-dispatch admission, not cessation of already running
+  provider work. Generic module loads grant no host callback authority. The message is never fanned out to a
   subscriber, never printed by `monitor`, and never carried by a signal. This is
   admission control, not isolation — a loaded module is already inside the trust
   boundary and could read host memory directly; what the rule buys is that the
