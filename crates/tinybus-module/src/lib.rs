@@ -363,13 +363,15 @@ unsafe extern "C" fn shutdown(ctx: *mut c_void, deadline_ms: u64) -> i32 {
             return TB_BAD_ARGUMENT;
         }
         let state = unsafe { &*(ctx.cast::<RuntimeState>()) };
-        // Hold the callback lifecycle lock while stopping the runtime. An
-        // in-flight reinitializer finishes first; late calls see a tombstone.
+        // An in-flight reinitializer finishes before disposal. Once the slot
+        // is empty, late calls see a tombstone. Release the lock before joining
+        // runtime tasks, whose failed-setup cleanup also uses this slot.
         let mut callback = state
             .reinitialize
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         callback.take();
+        drop(callback);
         state.inbound.lock().expect("module inbound lock").take();
         match state.runtime.lock().expect("module runtime lock").take() {
             Some(runtime) => {
