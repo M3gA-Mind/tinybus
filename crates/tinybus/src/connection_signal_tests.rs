@@ -199,3 +199,116 @@ async fn custom_transport_and_successful_hello_cannot_borrow_broker_signal_proof
         Some(&receiver.local_publisher_identity())
     );
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn cancelling_receive_and_later_raw_injection_cannot_relabel_queued_broker_delivery() {
+    let bus = MemoryBus::new();
+    let broker = crate::broker::Broker::new();
+    broker.spawn(bus.clone());
+    let (peer, broker_end) = MemoryTransport::pair();
+    let broker_end = Arc::new(broker_end);
+    broker.attach(broker_end.clone());
+    let receiver = Connection::connect(Box::new(peer)).await.unwrap();
+    let mut deliveries = receiver.signal_deliveries();
+    let mut legacy = receiver.signals();
+    receiver
+        .add_match(
+            MatchRule::new()
+                .signals()
+                .interface(InterfaceName::new("ai.tinyhumans.Events").unwrap()),
+        )
+        .await
+        .unwrap();
+    {
+        let mut pending = std::pin::pin!(deliveries.recv());
+        std::future::poll_fn(|cx| {
+            assert!(pending.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        })
+        .await;
+    }
+    let publisher = connect(&bus).await;
+    publisher.send(signal("verified")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), legacy.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let mut forged = signal("unverified");
+    forged.header.sender = publisher.unique_name();
+    broker_end.send(forged).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), legacy.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let verified = next_delivery(&mut deliveries).await;
+    let unverified = next_delivery(&mut deliveries).await;
+    assert_eq!(verified.context().origin(), SignalOrigin::Brokered);
+    assert_eq!(
+        verified.context().authenticated_sender(),
+        publisher.unique_name().as_ref()
+    );
+    assert_eq!(unverified.context().origin(), SignalOrigin::Unverified);
+    assert!(unverified.context().authenticated_sender().is_none());
+    let mut editable = verified.message().clone();
+    editable.header.sender = None;
+    assert_eq!(
+        verified.context().authenticated_sender(),
+        publisher.unique_name().as_ref()
+    );
+    assert_eq!(verified.message().header.sender, publisher.unique_name());
+}
+
+struct AdmittedLocal {
+    publisher: crate::LocalPublisherIdentity,
+    accepted: mpsc::UnboundedSender<String>,
+    refused: mpsc::UnboundedSender<()>,
+}
+#[async_trait]
+impl EventHandler<ClaimedEvent> for AdmittedLocal {
+    fn name(&self) -> &str {
+        "admitted-local"
+    }
+    async fn handle(&self, _: &ClaimedEvent) {
+        panic!("missing context");
+    }
+    async fn handle_with_context(&self, event: &ClaimedEvent, context: &SignalContext) {
+        if context.local_publisher() == Some(&self.publisher) {
+            self.accepted.send(event.tenant.clone()).unwrap();
+        } else {
+            self.refused.send(()).unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn an_admitted_local_handler_refuses_identical_remote_payload_and_only_accepts_bound_publisher()
+ {
+    let bus = MemoryBus::new();
+    crate::broker::Broker::new().spawn(bus.clone());
+    let local = connect(&bus).await;
+    let remote = connect(&bus).await;
+    let events = EventBus::<ClaimedEvent>::attach(local.clone(), event_config())
+        .await
+        .unwrap();
+    let (accepted, mut accepted_rx) = mpsc::unbounded_channel();
+    let (refused, mut refused_rx) = mpsc::unbounded_channel();
+    let _subscription = events.subscribe(Arc::new(AdmittedLocal {
+        publisher: local.local_publisher_identity(),
+        accepted,
+        refused,
+    }));
+    remote.send(signal("same-claimed-tenant")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), refused_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(accepted_rx.try_recv().is_err());
+    local.deliver_local(signal("same-claimed-tenant"));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(2), accepted_rx.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        "same-claimed-tenant"
+    );
+}
