@@ -1,4 +1,5 @@
 use super::*;
+use crate::Message;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]

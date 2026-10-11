@@ -4,6 +4,7 @@ use crate::{
     events::{Event, EventBus, EventBusConfig, EventHandler},
     transport::memory::{MemoryBus, MemoryTransport},
 };
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
