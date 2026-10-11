@@ -31,11 +31,20 @@ struct Lifetime {
 pub(crate) struct CallbackState {
     pub(crate) destination: BusName,
     endpoints: Vec<HostCallbackEndpoint>,
+    module_transport: Mutex<Option<std::sync::Weak<ModuleTransport>>>,
     lifetime: Mutex<Lifetime>,
     drained: Notify,
 }
 
 impl CallbackState {
+    fn module_live(&self) -> bool {
+        self.module_transport
+            .lock()
+            .expect("callback module lock")
+            .as_ref()
+            .is_none_or(|module| module.upgrade().is_some_and(|module| !module.is_faulted()))
+    }
+
     pub(crate) fn module_peer(&self) -> Option<BusName> {
         self.lifetime
             .lock()
@@ -57,6 +66,7 @@ impl CallbackState {
     pub(crate) fn matches(&self, header: &Header) -> bool {
         let state = self.lifetime.lock().expect("callback lifetime lock");
         state.active
+            && self.module_live()
             && header.confidential
             && header.sender.as_ref() == state.module.as_ref()
             && state.module.is_some()
@@ -89,6 +99,7 @@ impl HostCallbackGuard {
     pub fn authorizes(&self, context: &CallContext) -> bool {
         let state = self.0.lifetime.lock().expect("callback lifetime lock");
         state.active
+            && self.0.module_live()
             && context.is_confidential()
             && state.module.is_some()
             && context.authenticated_sender() == state.module.as_ref()
@@ -267,7 +278,8 @@ impl<I: Interface> Interface for GuardedInterface<I> {
         // check by carrying an earlier route admission through an await.
         let _running = {
             let mut state = self.state.lifetime.lock().expect("callback lifetime lock");
-            if !context.is_confidential()
+            if !self.state.module_live()
+                || !context.is_confidential()
                 || !state.active
                 || state.module.is_none()
                 || context.authenticated_sender() != state.module.as_ref()
@@ -333,6 +345,7 @@ impl ModuleHost {
             state: Arc::new(CallbackState {
                 destination,
                 endpoints,
+                module_transport: Mutex::new(None),
                 lifetime: Mutex::new(Lifetime {
                     active: false,
                     used: false,
@@ -453,6 +466,11 @@ impl ModuleHost {
                 if state.revoked || state.module.is_some() {
                     return Err(Error::failed("callback binding was concurrently used"));
                 }
+                *binding
+                    .state
+                    .module_transport
+                    .lock()
+                    .expect("callback module lock") = Some(Arc::downgrade(&transport));
                 state.module = Some(module.unique_name.clone());
                 state.active = true;
             }

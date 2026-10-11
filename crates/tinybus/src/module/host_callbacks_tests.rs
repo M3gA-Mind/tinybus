@@ -14,6 +14,7 @@ fn state(source: BusName, destination: BusName) -> Arc<CallbackState> {
     Arc::new(CallbackState {
         destination,
         endpoints: vec![endpoint()],
+        module_transport: Mutex::new(None),
         lifetime: Mutex::new(Lifetime {
             active: true,
             used: true,
@@ -413,4 +414,21 @@ async fn registration_is_exact_single_use_and_failed_load_detaches_the_local_pee
     let peer = binding.unique_name().clone();
     drop(binding);
     assert!(broker.router.lock().unwrap().owner_of(&peer).is_none());
+}
+
+#[tokio::test]
+async fn a_module_fault_revokes_dispatch_authority_before_peer_detach() {
+    let (router, state, _, _) = kernel_fixture();
+    let (transport, host) = ModuleTransport::new("fault-fixture".into(), Vec::new());
+    *state.module_transport.lock().unwrap() = Some(Arc::downgrade(&transport));
+    assert!(resolves(&router, &call(&state)).is_ok());
+    unsafe {
+        (host.fault)(host.host_ctx, std::ptr::null(), 0);
+    }
+    assert!(!state.matches(&call(&state).header));
+    assert!(
+        !HostCallbackGuard(state.clone())
+            .authorizes(&CallContext::brokered(state.module_peer().as_ref(), true))
+    );
+    assert!(resolves(&router, &call(&state)).is_err());
 }
