@@ -2761,3 +2761,112 @@ impl crate::Interface for BoundNativeCallback {
         Ok(serde_json::json!(context.authenticated_sender().unwrap()))
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TINYBUS_TEST_CONTEXT_MODULE to point at the built cdylib"]
+async fn a_native_callback_timeout_and_revoke_do_not_claim_worker_completion() {
+    let artifact = PathBuf::from(std::env::var_os("TINYBUS_TEST_CONTEXT_MODULE").unwrap());
+    let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
+    #[cfg(unix)]
+    let (_dir, artifact) = staged_module(&artifact, &hash);
+    let modules = ModuleHost::new(Broker::new());
+    let binding = modules
+        .prepare_host_callbacks(vec![crate::module::HostCallbackEndpoint {
+            path: "/callback".parse().unwrap(),
+            interface: "org.example.Callback".parse().unwrap(),
+            members: vec!["Observe".parse().unwrap()],
+        }])
+        .await
+        .unwrap();
+    let guard = binding.guard();
+    let (entered, mut receiver) = tokio::sync::mpsc::channel(1);
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let published = Arc::new(AtomicUsize::new(0));
+    binding
+        .serve_at(
+            "/callback".parse().unwrap(),
+            NativeBlockingCallback {
+                guard: guard.clone(),
+                entered,
+                release: release.clone(),
+                published: published.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    modules
+        .load_file_with_host_callbacks(artifact, serde_json::json!({}), &binding)
+        .await
+        .unwrap();
+    let module = guard.module_peer().unwrap();
+    let proxy = binding
+        .proxy(module.as_str(), "/context", "org.example.Context")
+        .unwrap()
+        .with_timeout(Duration::from_millis(100));
+    let request = tokio::spawn(async move {
+        proxy
+            .call_confidential::<serde_json::Value>("ConfidentialCallback", ())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(request.await.unwrap(), Err(Error::Timeout { .. })));
+    assert_eq!(
+        guard.running(),
+        1,
+        "caller timeout does not complete the host worker"
+    );
+    binding.revoke();
+    assert_eq!(
+        guard.running(),
+        1,
+        "revoke retains running admission charge"
+    );
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(2), guard.drained())
+        .await
+        .unwrap();
+    assert_eq!(guard.running(), 0);
+    assert_eq!(published.load(Ordering::SeqCst), 0);
+    modules.shutdown(Duration::from_secs(2)).await;
+}
+
+struct NativeBlockingCallback {
+    guard: crate::module::HostCallbackGuard,
+    entered: tokio::sync::mpsc::Sender<()>,
+    release: Arc<tokio::sync::Semaphore>,
+    published: Arc<AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl crate::Interface for NativeBlockingCallback {
+    fn name(&self) -> crate::InterfaceName {
+        "org.example.Callback".parse().unwrap()
+    }
+    fn members(&self) -> Vec<crate::MemberName> {
+        vec!["Observe".parse().unwrap()]
+    }
+    async fn call(
+        &self,
+        _: &crate::MemberName,
+        _: serde_json::Value,
+    ) -> crate::Result<serde_json::Value> {
+        Err(Error::failed("unverified"))
+    }
+    async fn call_with_context(
+        &self,
+        _: &crate::MemberName,
+        _: serde_json::Value,
+        context: &crate::CallContext,
+    ) -> crate::Result<serde_json::Value> {
+        assert!(self.guard.authorizes(context));
+        self.entered.send(()).await.unwrap();
+        let _permit = self.release.acquire().await.unwrap();
+        if !self.guard.authorizes(context) {
+            return Err(Error::failed("revoked before publication"));
+        }
+        self.published.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!(context.authenticated_sender().unwrap()))
+    }
+}
