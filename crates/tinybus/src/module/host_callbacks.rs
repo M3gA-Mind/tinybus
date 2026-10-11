@@ -594,24 +594,34 @@ impl ModuleHost {
                 .retain(|module| !Arc::ptr_eq(&module.transport, &transport));
             return Err(Error::module_refused(path, "module initialization failed"));
         }
+        let loaded = self.inner.loaded.lock().expect("module list lock");
+        let info = loaded
+            .iter()
+            .find(|module| Arc::ptr_eq(&module.transport, &transport))
+            .ok_or_else(|| {
+                Error::module_refused(path, "module was removed before load completion")
+            })?
+            .snapshot();
         let lifetime = binding
             .state
             .lifetime
             .lock()
             .expect("callback lifetime lock");
-        if lifetime.revoked || !lifetime.active || !transport.is_ready() {
+        // Snapshot first, then validate liveness at the commit point. A fault
+        // racing this point may be a subsequent lifecycle event, but must never
+        // turn the returned successful snapshot into Faulted or Stopped.
+        if lifetime.revoked
+            || !lifetime.active
+            || !transport.is_ready()
+            || !matches!(info.state, ModuleState::Ready)
+        {
             return Err(Error::module_refused(
                 path,
                 "module became unavailable before load completion",
             ));
         }
-        let loaded = self.inner.loaded.lock().expect("module list lock");
         rollback.committed = true;
-        Ok(loaded
-            .iter()
-            .find(|module| Arc::ptr_eq(&module.transport, &transport))
-            .expect("module remains loaded")
-            .snapshot())
+        Ok(info)
     }
 }
 

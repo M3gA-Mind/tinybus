@@ -475,20 +475,41 @@ async fn rollback_after_attach_releases_the_actual_initialization_observer() {
     let binding = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
     let manifest = super::super::tests::manifest();
     let path = Path::new("observer-fixture.so");
-    let mut admitted = host.validate(path, &TbAbiDescriptor::current("clock", "0.1.0"), &manifest).unwrap();
+    let mut admitted = host
+        .validate(path, &TbAbiDescriptor::current("clock", "0.1.0"), &manifest)
+        .unwrap();
     admitted.state = ModuleState::Resolved;
     let (transport, _) = ModuleTransport::new(admitted.name.clone(), vec![]);
     transport.pause_initialization();
     let weak = Arc::downgrade(&transport);
-    host.attach_transport(path, admitted, manifest, transport.clone(), Activation {
-        lazy_init: true, lazy_load: false, descriptor_info: None, pinned_sha256: None,
-    }).unwrap();
+    host.attach_transport(
+        path,
+        admitted,
+        manifest,
+        transport.clone(),
+        Activation {
+            lazy_init: true,
+            lazy_load: false,
+            descriptor_info: None,
+            pinned_sha256: None,
+        },
+    )
+    .unwrap();
     tokio::task::yield_now().await;
-    drop(LoadRollback { binding: &binding, host: &host, transport: Some(transport.clone()), committed: false });
+    drop(LoadRollback {
+        binding: &binding,
+        host: &host,
+        transport: Some(transport.clone()),
+        committed: false,
+    });
     assert!(!transport.init_started());
     assert!(host.list().is_empty());
     drop(transport);
     tokio::time::timeout(Duration::from_millis(100), async {
-        while weak.upgrade().is_some() { tokio::task::yield_now().await; }
-    }).await.unwrap();
+        while weak.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }
