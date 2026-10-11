@@ -156,3 +156,7 @@ mod unix_example {
 fn main() -> tinybus::Result<()> {
     unix_example::run()
 }
+
+#[cfg(all(test, not(unix)))]
+#[path = "voice_service_platform_tests.rs"]
+mod tests;
