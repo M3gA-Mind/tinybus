@@ -125,6 +125,7 @@ impl HostCallbackGuard {
 /// connection, custom transport, well-known alias, or remote recipient. Drop
 /// revokes immediately; explicit close also closes the owned local connection.
 pub struct HostCallbackBinding {
+    owner: std::sync::Weak<ModuleHostInner>,
     broker: Broker,
     connection: Connection,
     state: Arc<CallbackState>,
@@ -325,6 +326,7 @@ impl ModuleHost {
             .ok_or_else(|| Error::failed("callback connection has no unique name"))?;
         rollback.committed = true;
         Ok(HostCallbackBinding {
+            owner: Arc::downgrade(&self.inner),
             broker: self.inner.broker.clone(),
             connection,
             transport,
@@ -357,8 +359,15 @@ impl ModuleHost {
         config: serde_json::Value,
         binding: &HostCallbackBinding,
     ) -> Result<ModuleInfo> {
-        if !Arc::ptr_eq(&self.inner.broker.router, &binding.broker.router) {
-            return Err(Error::failed("callback binding belongs to another broker"));
+        if !Arc::ptr_eq(&self.inner.broker.router, &binding.broker.router)
+            || !binding
+                .owner
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, &self.inner))
+        {
+            return Err(Error::failed(
+                "callback binding belongs to another host owner",
+            ));
         }
         {
             let mut state = binding

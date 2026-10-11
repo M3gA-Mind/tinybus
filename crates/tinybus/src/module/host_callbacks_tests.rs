@@ -319,6 +319,13 @@ async fn endpoint_declarations_registration_and_broker_ownership_are_checked() {
             .await
             .is_err()
     );
+    let other_owner = ModuleHost::new(host.inner.broker.clone());
+    assert!(
+        other_owner
+            .load_file_with_host_callbacks("unused", serde_json::json!({}), &binding)
+            .await
+            .is_err()
+    );
     let other = ModuleHost::new(Broker::new());
     assert!(
         other
