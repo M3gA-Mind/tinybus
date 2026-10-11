@@ -50,6 +50,7 @@ omitted field and a `null` field identically.
 | `serial` | u64, ≥ 1, per-sender monotonic | always |
 | `reply_serial` | u64 | `method_return`, `error` |
 | `sender` | bus name | stamped by the broker on everything it forwards |
+| `expected_responder` | unique bus name | optional, conditional method-call owner |
 | `destination` | bus name | `method_call`, `method_return`, `error` |
 | `path` | object path | `method_call`, `signal` |
 | `interface` | interface name | `method_call`, `signal` |
@@ -65,6 +66,32 @@ the error name, which travels in `error_name`.
 
 A peer **may** set `sender`; the broker overwrites it unconditionally. Nothing
 downstream may trust a `sender` that did not come from the broker.
+
+Replies must match both the pending serial and its captured unique responder.
+Only errors stamped by the broker itself may substitute for that responder.
+Control calls accept the broker's reserved sender or its legacy unstamped
+control replies; forwarded peer replies always have a unique sender. A
+confidential call requires a confidential successful reply; sanitized errors
+remain unflagged.
+
+For named calls, the SDK first invokes `ResolveCallTarget`, then sets
+`expected_responder` to the returned unique owner. The broker compares this
+guard with the current owner while selecting the recipient and checking
+confidential admission under one routing lock. A changed owner produces
+`NameHasNoOwner` without dispatch. Ownership can change after selection:
+the already selected peer remains the only accepted responder.
+
+Old clients omit the optional field and continue routing on a new broker.
+New clients refuse named calls when an old broker lacks `ResolveCallTarget`;
+they retain the typed `UnknownMethod` error rather than silently sending an
+unguarded call. Unique calls need no alias negotiation.
+
+These identity guarantees require the actual broker to overwrite ingress
+senders and protect its transport. A raw `Connection::attach` pair without
+the broker handshake retains unverified direct-call compatibility. Payload
+headers on a raw link are not authenticated, and this API does not establish
+remote peer identity or turn a custom transport into a trusted broker.
+
 
 ### `confidential`
 
@@ -155,6 +182,7 @@ interface `ai.tinyhumans.tinybus.Bus`.
 | `GetManifest` | `[name]` | that peer's manifest, or `null` |
 | `ListPeers` | `[]` | unique names, owned names, and peer manifests |
 | `GetNameOwner` | `[name]` | the owner's unique name, or `null` |
+| `ResolveCallTarget` | `[name]` | unique owner, or `NameHasNoOwner`; negotiates conditional routing |
 | `GetAttestation` | `[name]` | what the host verified about that owner, or `null` |
 | `AddMatch` | `[rule]` | `null` |
 | `RemoveMatch` | `[rule]` | `null` |

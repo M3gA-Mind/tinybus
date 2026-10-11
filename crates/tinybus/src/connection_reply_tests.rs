@@ -232,10 +232,10 @@ async fn confidential_unique_reply_preserves_genuine_sanitized_error() {
     reject_forged_replies(false, true, true).await;
 }
 
-#[tokio::test]
-async fn captured_alias_owner_is_checked_atomically_before_dispatch() {
+async fn alias_takeover_is_refused(confidential: bool) {
     let bus = MemoryBus::new();
-    Broker::new().spawn(bus.clone());
+    let broker = Broker::new();
+    broker.clone().spawn(bus.clone());
     let original = Connection::connect(bus.connect().await.unwrap())
         .await
         .unwrap();
@@ -245,6 +245,16 @@ async fn captured_alias_owner_is_checked_atomically_before_dispatch() {
     raw_control(requester.as_ref(), 1, "Hello", serde_json::json!([])).await;
     let alias = BusName::new("ai.tinyhumans.Fixture").unwrap();
     original.request_name(alias.clone()).await.unwrap();
+    #[cfg(feature = "modules")]
+    if confidential {
+        broker.attest_module(
+            &original.unique_name().unwrap(),
+            crate::attest::Attestation {
+                name: alias.clone(),
+                sha256: "a".repeat(64),
+            },
+        );
+    }
     let captured_reply = raw_control(
         requester.as_ref(),
         2,
@@ -263,6 +273,7 @@ async fn captured_alias_owner_is_checked_atomically_before_dispatch() {
     .await;
     let mut call = fixture_call(alias.clone());
     call.header.expected_responder = Some(captured.clone());
+    call.header.confidential = confidential;
     call.header.serial = 3;
     requester.send(call).await.unwrap();
     let refusal = requester.recv().await.unwrap().unwrap();
@@ -444,4 +455,55 @@ fn conditional_owner_header_requires_a_unique_method_call_target() {
     reply.header.serial = 2;
     reply.header.expected_responder = call.header.expected_responder;
     assert!(reply.validate().is_err());
+}
+
+#[tokio::test]
+async fn captured_alias_owner_is_checked_atomically_before_dispatch() {
+    alias_takeover_is_refused(false).await;
+}
+
+#[cfg(feature = "modules")]
+#[tokio::test]
+async fn confidential_alias_takeover_is_refused_before_dispatch() {
+    alias_takeover_is_refused(true).await;
+}
+
+#[tokio::test]
+async fn genuine_broker_routing_and_control_errors_retain_native_wire_names() {
+    let bus = MemoryBus::new();
+    Broker::new().spawn(bus.clone());
+    let requester = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let missing = BusName::new(":1.9999").unwrap();
+    let error = requester
+        .call_raw(fixture_call(missing.clone()), DEFAULT_TIMEOUT)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::MethodFailed { ref name, .. }
+        if name == Error::NameHasNoOwner(missing).wire_name()));
+    let mut private = fixture_call(BusName::new(crate::BUS_NAME).unwrap());
+    private.header.confidential = true;
+    let error = requester
+        .call_raw(private, DEFAULT_TIMEOUT)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::MethodFailed { ref name, .. }
+        if name == Error::not_attested(BusName::new(crate::BUS_NAME).unwrap(), "fixture").wire_name()));
+}
+
+#[test]
+fn absent_conditional_header_round_trips_legacy_wire_frames() {
+    let mut call = fixture_call(BusName::new("ai.tinyhumans.Fixture").unwrap());
+    call.header.serial = 1;
+    let encoded = serde_json::to_value(&call).unwrap();
+    assert!(encoded["header"].get("expected_responder").is_none());
+    let decoded: Message = serde_json::from_value(encoded).unwrap();
+    assert!(decoded.header.expected_responder.is_none());
+    call.header.expected_responder = Some(BusName::new(":1.2").unwrap());
+    let decoded: Message = serde_json::from_value(serde_json::to_value(call).unwrap()).unwrap();
+    assert_eq!(
+        decoded.header.expected_responder.as_ref().unwrap().as_str(),
+        ":1.2"
+    );
 }
