@@ -332,3 +332,103 @@ async fn failed_initial_setup_releases_factory_capture_when_host_stops_instance(
         "failed instance tombstone must release callback capture"
     );
 }
+
+mod released_setup {
+    use super::*;
+    pub(super) static DROPPED: AtomicUsize = AtomicUsize::new(0);
+    struct Capture;
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            DROPPED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn factory() -> impl Fn(Connection, Config) -> SetupFuture + Send + Sync {
+        let capture = Capture;
+        move |connection, config| {
+            let _ = &capture;
+            Box::pin(legacy_setup(connection, config))
+        }
+    }
+    module_export_static! {
+        setup_factory = factory, config = Config, worker_threads = 1,
+        provides = ["ai.tinyhumans.tinybus.Factory"],
+        methods = ["Mode"], signals = [], requires = [], optional = [], lazy = false,
+    }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn compiled_successful_shutdown_releases_factory_capture() {
+    let bus = MemoryBus::new();
+    let broker = Broker::new();
+    broker.clone().spawn(bus.clone());
+    let host = ModuleHost::new(broker);
+    let before = released_setup::DROPPED.load(Ordering::SeqCst);
+    host.attach_linked_with_config(
+        released_setup::linked_module().unwrap(),
+        serde_json::json!({"restricted":true}),
+    )
+    .unwrap();
+    let caller = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let proxy = caller
+        .proxy(
+            "ai.tinyhumans.tinybus.Factory",
+            "/factory",
+            "ai.tinyhumans.tinybus.Factory",
+        )
+        .unwrap();
+    assert!(proxy.call::<bool>("Mode", ()).await.unwrap());
+    assert_eq!(released_setup::DROPPED.load(Ordering::SeqCst), before);
+    host.shutdown(std::time::Duration::from_secs(1)).await;
+    assert_eq!(released_setup::DROPPED.load(Ordering::SeqCst) - before, 1);
+}
+mod panicking_setup {
+    use super::*;
+    pub(super) static DROPPED: AtomicUsize = AtomicUsize::new(0);
+    struct Capture;
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            DROPPED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn factory() -> impl Fn(Connection, Config) -> SetupFuture + Send + Sync {
+        let capture = Capture;
+        move |_, _| {
+            let _ = &capture;
+            Box::pin(async { panic!("harmless initial setup fixture") })
+        }
+    }
+    module_export_static! {
+        setup_factory = factory, config = Config, worker_threads = 1,
+        provides = ["ai.tinyhumans.tinybus.PanickingFactory"],
+        methods = [], signals = [], requires = [], optional = [], lazy = false,
+    }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn panicking_initial_setup_releases_factory_capture_and_reports_fault() {
+    let bus = MemoryBus::new();
+    let broker = Broker::new();
+    broker.clone().spawn(bus);
+    let host = ModuleHost::new(broker);
+    let before = panicking_setup::DROPPED.load(Ordering::SeqCst);
+    host.attach_linked_with_config(
+        panicking_setup::linked_module().unwrap(),
+        serde_json::json!({"restricted":true}),
+    )
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if host
+                .list()
+                .iter()
+                .any(|m| matches!(m.state, tinybus::module::ModuleState::Faulted { .. }))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(panicking_setup::DROPPED.load(Ordering::SeqCst) - before, 1);
+}
