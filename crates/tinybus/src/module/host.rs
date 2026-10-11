@@ -1061,6 +1061,7 @@ impl ModuleHost {
         {
             Ok(change) => change,
             Err(_) => {
+                self.inner.broker.router.lock().expect("router lock").detach_unique(&unique);
                 let _ = transport.stop_sync(Duration::from_millis(0));
                 let error = Error::module_refused(path, "module bus name is already owned");
                 self.record_manifest_rejection(&error, manifest, RefusalClass::Unresolved);

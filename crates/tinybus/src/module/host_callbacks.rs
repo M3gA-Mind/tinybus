@@ -25,6 +25,7 @@ struct Lifetime {
     module: Option<BusName>,
     running: usize,
     served: Vec<(ObjectPath, InterfaceName)>,
+    registering: Vec<(ObjectPath, InterfaceName)>,
 }
 
 pub(crate) struct CallbackState {
@@ -176,12 +177,13 @@ impl HostCallbackBinding {
         }
         {
             let mut state = self.state.lifetime.lock().expect("callback lifetime lock");
-            if state.used || state.revoked || state.served.contains(&(path.clone(), name.clone())) {
+            if state.used || state.revoked || state.served.contains(&(path.clone(), name.clone()))
+                || state.registering.contains(&(path.clone(), name.clone())) {
                 return Err(Error::failed(
                     "callback registration is immutable or duplicated",
                 ));
             }
-            state.served.push((path.clone(), name.clone()));
+            state.registering.push((path.clone(), name.clone()));
         }
         let result = self
             .connection
@@ -194,13 +196,10 @@ impl HostCallbackBinding {
                 },
             )
             .await;
-        if result.is_err() {
-            self.state
-                .lifetime
-                .lock()
-                .expect("callback lifetime lock")
-                .served
-                .retain(|entry| entry != &(path.clone(), name.clone()));
+        {
+            let mut state = self.state.lifetime.lock().expect("callback lifetime lock");
+            state.registering.retain(|entry| entry != &(path.clone(), name.clone()));
+            if result.is_ok() { state.served.push((path, name)); }
         }
         result
     }
@@ -317,6 +316,7 @@ impl ModuleHost {
                     module: None,
                     running: 0,
                     served: Vec::new(),
+                    registering: Vec::new(),
                 }),
                 drained: Notify::new(),
             }),
@@ -387,6 +387,7 @@ impl ModuleHost {
             let (transport, host) = ModuleTransport::new(admitted.name.clone(), bytes);
             transport.defer_initialize(artifact.init, host);
             let name = admitted.name.clone();
+            rollback.transport = Some(transport.clone());
             self.attach_transport(
                 path,
                 admitted,
@@ -495,3 +496,7 @@ impl Drop for ModuleHostInner {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "host_callbacks_tests.rs"]
+mod tests;
