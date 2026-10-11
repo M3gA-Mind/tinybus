@@ -330,6 +330,12 @@ struct RuntimeState {
 }
 
 type Reinitialize = Box<dyn Fn(*const u8, usize) -> i32 + Send + Sync>;
+async fn dispose_failed_setup_callback(callback: Arc<StdMutex<Option<Reinitialize>>>) {
+    callback
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+}
 type ReinitializeFactory = Box<
     dyn FnOnce(tokio::runtime::Handle, Arc<StdMutex<Option<Connection>>>) -> Reinitialize + Send,
 >;
@@ -651,10 +657,7 @@ where
             if !matches!(outcome, Ok(Ok(()))) {
                 // A terminal setup failure may never receive ABI shutdown.
                 // Dispose its callback under the same lifecycle exclusion.
-                failed_setup_callback
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
+                dispose_failed_setup_callback(failed_setup_callback).await;
                 match outcome {
                     Ok(Err(error)) => tracing::error!(error = %error, "tinybus module failed"),
                     Err(_) => tracing::error!("tinybus module setup task failed"),

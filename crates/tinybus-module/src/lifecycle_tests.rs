@@ -168,3 +168,39 @@ fn shutdown_disposes_callback_even_after_reinitializer_panics() {
     assert_eq!(unsafe { shutdown(pointer, 1000) }, TB_CLOSED);
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn failed_setup_disposal_keeps_single_runtime_worker_available() {
+    let callback: Arc<StdMutex<Option<Reinitialize>>> =
+        Arc::new(StdMutex::new(Some(Box::new(|_, _| TB_OK))));
+    let held = callback.lock().unwrap();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let dispose = callback.clone();
+    runtime.spawn(async move {
+        entered_tx.send(()).unwrap();
+        dispose_failed_setup_callback(dispose).await;
+        done_tx.send(()).unwrap();
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+    runtime.spawn(async move {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        progress_tx.send(()).unwrap();
+    });
+    let progressed = progress_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+    // Always release exclusion before asserting, including the RED path.
+    drop(held);
+    done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(callback.lock().unwrap().is_none());
+    runtime.shutdown_timeout(Duration::from_secs(1));
+    assert!(
+        progressed,
+        "callback disposal must not occupy the sole timer worker"
+    );
+}
