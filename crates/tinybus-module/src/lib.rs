@@ -615,7 +615,7 @@ where
         let failed_setup_callback = reinitializer.clone();
         let setup_task = runtime.spawn(async move {
             let connection = module_connection(transport);
-            let outcome = match connection.handshake().await.map(|()| connection) {
+            match connection.handshake().await.map(|()| connection) {
                 Ok(connection) => {
                     connection.__set_panic_handler(std::sync::Arc::new(move || {
                         let location = panic_location
@@ -644,8 +644,7 @@ where
                     }
                 }
                 Err(error) => Err(error),
-            };
-            outcome
+            }
         });
         runtime.spawn(async move {
             let outcome = setup_task.await;
