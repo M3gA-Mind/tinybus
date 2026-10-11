@@ -1,4 +1,5 @@
 use super::*;
+use crate::Message;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -80,9 +81,11 @@ async fn malformed_and_lagged_messages_do_not_end_the_dispatch_loop() {
         serde_json::json!([TestEvent]),
     );
     let (seen_tx, mut seen_rx) = tokio::sync::mpsc::channel(1);
-    sender.send(malformed).unwrap();
-    sender.send(valid.clone()).unwrap();
-    sender.send(valid).unwrap();
+    sender.send(SignalDelivery::unverified(malformed)).unwrap();
+    sender
+        .send(SignalDelivery::unverified(valid.clone()))
+        .unwrap();
+    sender.send(SignalDelivery::unverified(valid)).unwrap();
     let handler = FnSubscriber {
         name: "subscriber::test".to_string(),
         handler: move |_| {
