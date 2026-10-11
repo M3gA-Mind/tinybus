@@ -762,10 +762,91 @@ where
     F: Fn(Connection, C) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
+    unsafe {
+        start_reconfigurable_module_factory_mode(
+            host,
+            out,
+            worker_threads,
+            detach_on_panic,
+            || setup,
+            linked,
+        )
+    }
+}
+
+/// Initialize one configured instance with fresh captured setup state.
+#[doc(hidden)]
+pub unsafe fn start_reconfigurable_module_with_factory<C, F, Fut>(
+    host: *const TbHostVtable,
+    out: *mut TbModuleVtable,
+    worker_threads: usize,
+    detach_on_panic: bool,
+    factory: impl FnOnce() -> F,
+) -> i32
+where
+    C: serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(Connection, C) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    unsafe {
+        start_reconfigurable_module_factory_mode(
+            host,
+            out,
+            worker_threads,
+            detach_on_panic,
+            factory,
+            false,
+        )
+    }
+}
+
+/// Initialize one linked configured instance with fresh captured setup state.
+#[doc(hidden)]
+pub unsafe fn start_linked_reconfigurable_module_with_factory<C, F, Fut>(
+    host: *const TbHostVtable,
+    out: *mut TbModuleVtable,
+    worker_threads: usize,
+    detach_on_panic: bool,
+    factory: impl FnOnce() -> F,
+) -> i32
+where
+    C: serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(Connection, C) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    unsafe {
+        start_reconfigurable_module_factory_mode(
+            host,
+            out,
+            worker_threads,
+            detach_on_panic,
+            factory,
+            true,
+        )
+    }
+}
+
+unsafe fn start_reconfigurable_module_factory_mode<C, F, Fut>(
+    host: *const TbHostVtable,
+    out: *mut TbModuleVtable,
+    worker_threads: usize,
+    detach_on_panic: bool,
+    factory: impl FnOnce() -> F,
+    linked: bool,
+) -> i32
+where
+    C: serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(Connection, C) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
     let parsed = catch_unwind(AssertUnwindSafe(|| unsafe { parse_config::<C>(host) }));
     let config = match parsed {
         Ok(Ok(config)) => config,
         Ok(Err(code)) => return code,
+        Err(_) => return TB_PANICKED,
+    };
+    let setup = match catch_unwind(AssertUnwindSafe(factory)) {
+        Ok(setup) => setup,
         Err(_) => return TB_PANICKED,
     };
     let initial_setup = setup.clone();
@@ -819,6 +900,15 @@ where
 /// ```ignore
 /// tinybus_module::module_export! { setup = setup, worker_threads = 1 }
 /// ```
+///
+/// Configured modules may use `setup_factory = factory` in place of `setup`.
+/// After valid configuration is parsed, the safe no-argument factory runs once
+/// per ABI initialization and returns a
+/// cloneable `Fn(Connection, Config) -> Future<Output = Result<()>>`. Its captured
+/// state is reused for that instance's reinitializations, allowing admission to
+/// remain bound without process-global state. Separate instances receive fresh
+/// state. A factory panic returns `TB_PANICKED` without unwinding into the host.
+/// Existing `setup = function` callbacks retain their behavior.
 #[macro_export]
 macro_rules! module_export {
     (@linked) => {
@@ -957,6 +1047,19 @@ macro_rules! module_export {
         }
     };
     (
+        setup_factory = $factory:path,
+        config = $config:ty,
+        $($rest:tt)*
+    ) => {
+        $crate::module_export! {
+            @configured export = {#[unsafe(no_mangle)]},
+            start = $crate::start_reconfigurable_module_with_factory,
+            setup = $factory,
+            config = $config,
+            $($rest)*
+        }
+    };
+    (
         setup = $setup:path,
         config = $config:ty,
         $($rest:tt)*
@@ -981,8 +1084,19 @@ macro_rules! module_export {
 
 /// Generate Rust-addressable entry points for linking several modules into a
 /// single executable. The entry points have no shared C linker symbol names.
+/// Both configured `setup` and per-instance `setup_factory` forms are supported.
 #[macro_export]
 macro_rules! module_export_static {
+    (setup_factory = $factory:path, config = $config:ty, $($rest:tt)*) => {
+        $crate::module_export! {
+            @configured export = {},
+            start = $crate::start_linked_reconfigurable_module_with_factory,
+            setup = $factory,
+            config = $config,
+            $($rest)*
+        }
+        $crate::module_export! { @linked }
+    };
     (setup = $setup:path, config = $config:ty, $($rest:tt)*) => {
         $crate::module_export! {
             @configured export = {},
@@ -1026,3 +1140,7 @@ mod tests;
 #[cfg(test)]
 #[path = "static_link_tests.rs"]
 mod static_link_tests;
+
+#[cfg(test)]
+#[path = "setup_factory_tests.rs"]
+mod setup_factory_test;
