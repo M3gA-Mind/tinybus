@@ -738,7 +738,7 @@ impl Interface for CallbackConnection {
     }
     async fn call(&self, _member: &MemberName, _args: Value) -> Result<Value> {
         Ok(serde_json::json!(
-            self.connection.unique_name().map(ToString::to_string)
+            self.connection.unique_name().map(|name| name.to_string())
         ))
     }
 }
@@ -764,7 +764,7 @@ async fn callback_connection_does_not_keep_its_served_object_and_bus_name_alive(
         .proxy("ai.test.Callback", "/test/Callback", "ai.test.Callback")?
         .call("Owner", ())
         .await?;
-    assert_eq!(owner, service.unique_name().map(ToString::to_string));
+    assert_eq!(owner, service.unique_name().map(|name| name.to_string()));
     drop(service);
     tokio::time::timeout(Duration::from_secs(1), async {
         loop {
