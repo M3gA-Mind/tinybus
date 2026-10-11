@@ -164,7 +164,10 @@ impl PendingReply {
             // identity. A proven broker delivery must not use this escape.
             !brokered
         };
-        identity_matches && (reply.header.kind == MessageKind::Error || !self.confidential || reply.header.confidential)
+        identity_matches
+            && (reply.header.kind == MessageKind::Error
+                || !self.confidential
+                || reply.header.confidential)
     }
 }
 
@@ -739,11 +742,23 @@ impl Connection {
         Ok(self.call_raw_message(message, timeout).await?.body)
     }
 
-    async fn call_bus_with_timeout(&self, member: &str, body: Value, timeout: Duration) -> Result<Value> {
-        self.call_raw(Message::method_call(
-            BusName::new(crate::BUS_NAME)?, ObjectPath::new(crate::BUS_PATH)?,
-            InterfaceName::new(crate::BUS_INTERFACE)?, MemberName::new(member)?, body,
-        ), timeout).await
+    async fn call_bus_with_timeout(
+        &self,
+        member: &str,
+        body: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        self.call_raw(
+            Message::method_call(
+                BusName::new(crate::BUS_NAME)?,
+                ObjectPath::new(crate::BUS_PATH)?,
+                InterfaceName::new(crate::BUS_INTERFACE)?,
+                MemberName::new(member)?,
+                body,
+            ),
+            timeout,
+        )
+        .await
     }
 
     async fn call_raw_message(&self, mut message: Message, timeout: Duration) -> Result<Message> {
@@ -773,20 +788,32 @@ impl Connection {
         let member = message.member_or_unknown();
         let started = tokio::time::Instant::now();
         let destination = message.header.destination.clone();
-        let bus_control = destination.as_ref().is_some_and(|name| name.as_str() == crate::BUS_NAME);
+        let bus_control = destination
+            .as_ref()
+            .is_some_and(|name| name.as_str() == crate::BUS_NAME);
         let expected = if bus_control {
             None
         } else if let Some(destination) = destination {
             if destination.is_unique() {
                 Some(destination)
             } else if self.unique_name().is_some() {
-                let owner: BusName = serde_json::from_value(Box::pin(self.call_bus_with_timeout(
-                    "ResolveCallTarget", serde_json::json!([destination]), timeout,
-                )).await?)?;
+                let owner: BusName = serde_json::from_value(
+                    Box::pin(self.call_bus_with_timeout(
+                        "ResolveCallTarget",
+                        serde_json::json!([destination]),
+                        timeout,
+                    ))
+                    .await?,
+                )?;
                 if !owner.is_unique() {
                     return Err(Error::protocol("broker returned a non-unique call target"));
                 }
-                if message.header.expected_responder.as_ref().is_some_and(|expected| expected != &owner) {
+                if message
+                    .header
+                    .expected_responder
+                    .as_ref()
+                    .is_some_and(|expected| expected != &owner)
+                {
                     return Err(Error::NameHasNoOwner(destination));
                 }
                 message.header.expected_responder = Some(owner.clone());
@@ -794,12 +821,20 @@ impl Connection {
             } else {
                 None
             }
-        } else { None };
+        } else {
+            None
+        };
 
         let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().await.insert(serial, PendingReply {
-            sender: tx, expected, bus_control, confidential: message.header.confidential,
-        });
+        self.inner.pending.lock().await.insert(
+            serial,
+            PendingReply {
+                sender: tx,
+                expected,
+                bus_control,
+                confidential: message.header.confidential,
+            },
+        );
 
         if let Err(e) = self.enqueue(message).await {
             self.inner.pending.lock().await.remove(&serial);
@@ -1267,8 +1302,13 @@ async fn dispatch_loop(inner: Arc<Inner>) {
                 // An unmatched reply is a timed-out call arriving late. Normal,
                 // and nothing to do but drop it.
                 let mut pending = inner.pending.lock().await;
-                if pending.get(&serial).is_some_and(|waiter| waiter.accepts(&message, brokered)) {
-                    if let Some(waiter) = pending.remove(&serial) { let _ = waiter.sender.send(message); }
+                if pending
+                    .get(&serial)
+                    .is_some_and(|waiter| waiter.accepts(&message, brokered))
+                {
+                    if let Some(waiter) = pending.remove(&serial) {
+                        let _ = waiter.sender.send(message);
+                    }
                 }
             }
             MessageKind::Signal => {

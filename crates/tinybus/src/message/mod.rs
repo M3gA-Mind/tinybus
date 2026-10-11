@@ -338,7 +338,9 @@ impl Message {
         if let Some(expected) = &self.header.expected_responder
             && (self.header.kind != MessageKind::MethodCall || !expected.is_unique())
         {
-            return Err(Error::protocol("expected responder must be unique and only accompany a call"));
+            return Err(Error::protocol(
+                "expected responder must be unique and only accompany a call",
+            ));
         }
         // Checked before the per-kind rules, and checked on ingress rather than
         // at delivery: a confidential signal has no destination, so there is no

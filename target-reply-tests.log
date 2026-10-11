@@ -1,15 +1,3 @@
 [ci-cancel-aware] exec: cargo test -p tinybus --all-features reply_tests 
    Compiling tinybus v0.1.3 (/home/enamakel/work/openhuman/worktrees/cloud-storage-7419/vendor/tinybus/crates/tinybus)
-error[E0599]: no variant, associated function, or constant named `NAME_HAS_NO_OWNER` found for enum `error::Error` in the current scope
-   --> crates/tinybus/src/connection_reply_tests.rs:175:66
-    |
-175 |     assert_eq!(refusal.header.error_name.as_deref(), Some(Error::NAME_HAS_NO_OWNER));
-    |                                                                  ^^^^^^^^^^^^^^^^^ variant, associated function, or constant not found in `error::Error`
-    |
-   ::: crates/tinybus/src/error.rs:22:1
-    |
- 22 | pub enum Error {
-    | -------------- variant, associated function, or constant `NAME_HAS_NO_OWNER` not found for this enum
-
-For more information about this error, try `rustc --explain E0599`.
-error: could not compile `tinybus` (lib test) due to 1 previous error
+   Compiling tinybus-module v0.1.3 (/home/enamakel/work/openhuman/worktrees/cloud-storage-7419/vendor/tinybus/crates/tinybus-module)

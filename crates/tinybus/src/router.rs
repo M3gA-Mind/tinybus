@@ -494,7 +494,11 @@ impl Router {
         if expected.is_some_and(|expected| self.owner_of(destination).as_ref() != Some(expected)) {
             return Err(Error::NameHasNoOwner(destination.clone()));
         }
-        if confidential { self.resolve_attested(destination) } else { self.resolve(destination) }
+        if confidential {
+            self.resolve_attested(destination)
+        } else {
+            self.resolve(destination)
+        }
     }
 
     /// The outbox of whoever owns `destination`.

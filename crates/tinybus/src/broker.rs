@@ -384,7 +384,9 @@ impl Broker {
                 // older broker fails loudly rather than ignoring the guard.
                 "ResolveCallTarget" => {
                     let (name,): (BusName,) = parse_args(member, body)?;
-                    let owner = router.owner_of(&name).ok_or_else(|| Error::NameHasNoOwner(name))?;
+                    let owner = router
+                        .owner_of(&name)
+                        .ok_or_else(|| Error::NameHasNoOwner(name))?;
                     Ok(serde_json::to_value(owner)?)
                 }
                 "GetNameOwner" => {
