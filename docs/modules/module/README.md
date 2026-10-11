@@ -213,3 +213,20 @@ corresponding `NameOwnerChanged` announcement.
 
 See [abi.md](abi.md) for the binary contract and
 [the protocol](../../protocol.md) for the bus control members.
+
+### Per-instance setup state
+
+Configured exports can use `setup_factory = factory` instead of `setup = setup`.
+The safe, no-argument factory returns a cloneable setup callback with the same
+`Fn(Connection, Config) -> Future<Output = Result<()>>` signature. TinyBus calls
+it once after parsing valid initial configuration, then retains its captured
+state for that instance's initial setup and every reinitialization. Separate
+ABI instances get fresh state; no global registry is needed.
+
+This permits a module to capture an immutable admission or mode in an Arc and
+reject later configuration that would change it before replacing its served
+object. The module owns that admission logic. Existing callback serialization,
+configuration validation, deadlines and error codes remain authoritative.
+Factory panics return the native initialization panic code. The factory form
+is available in module_export, module_export_static and
+module_export_optional_static; legacy setup callbacks remain supported.
