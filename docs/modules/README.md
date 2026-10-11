@@ -19,7 +19,7 @@ behaviours other modules rely on.
 | `service` | [service/README.md](service/README.md) |
 | `stream` | [stream/README.md](stream/README.md) |
 | `secret` | [secret/README.md](secret/README.md) |
-| `events` | source rustdoc (bounded domain-event fan-out) |
+| `events` | source rustdoc (bounded domain-event fan-out); [immutable signal provenance](signal/README.md) |
 | `global` | source rustdoc (one-time process-wide bus) |
 | `native` | source rustdoc (typed in-process request registry) |
 | `version` | source rustdoc (interface compatibility records) |
