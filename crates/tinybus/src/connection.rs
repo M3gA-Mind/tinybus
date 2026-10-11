@@ -189,6 +189,8 @@ struct Inner {
     /// the sender on a locally looped-back signal without an await.
     unique_name: std::sync::RwLock<Option<BusName>>,
     signals: broadcast::Sender<Message>,
+    signal_deliveries: broadcast::Sender<crate::SignalDelivery>,
+    local_publisher: crate::LocalPublisherIdentity,
     panic_handler: std::sync::RwLock<Option<Arc<dyn Fn() -> Error + Send + Sync>>>,
     /// Bulk streams being received. On the connection rather than in the object
     /// tree because a chunk has to be checked against the header's stamped
@@ -370,6 +372,7 @@ impl Connection {
         native_provenance: Option<Arc<AtomicBool>>,
     ) -> Self {
         let (signals, _) = broadcast::channel(SIGNAL_BUFFER);
+        let (signal_deliveries, _) = broadcast::channel(SIGNAL_BUFFER);
         let (outbox, outbound) = mpsc::channel(OUTBOX_CAPACITY);
         let inner = Arc::new(Inner {
             transport,
@@ -383,6 +386,8 @@ impl Connection {
             objects: RwLock::new(ObjectTree::new()),
             unique_name: std::sync::RwLock::new(None),
             signals,
+            signal_deliveries,
+            local_publisher: crate::LocalPublisherIdentity::new(),
             panic_handler: std::sync::RwLock::new(None),
             streams: StreamRegistry::new(),
         });
@@ -423,6 +428,13 @@ impl Connection {
         message.header.sender = self.unique_name();
         // Fails only when nothing on this connection is subscribed, which is
         // the normal case for a write-only publisher.
+        let _ = self
+            .inner
+            .signal_deliveries
+            .send(crate::SignalDelivery::local(
+                message.clone(),
+                self.inner.local_publisher.clone(),
+            ));
         let _ = self.inner.signals.send(message);
     }
 
@@ -724,6 +736,22 @@ impl Connection {
     /// A receiver for every signal already subscribed to on this connection.
     pub fn signals(&self) -> broadcast::Receiver<Message> {
         self.inner.signals.subscribe()
+    }
+
+    /// Subscribe to queued signal deliveries with immutable SDK provenance.
+    ///
+    /// Install broker match rules separately with add_match; subscribe before
+    /// installing the rule to avoid a delivery gap.
+    pub fn signal_deliveries(&self) -> broadcast::Receiver<crate::SignalDelivery> {
+        self.inner.signal_deliveries.subscribe()
+    }
+
+    /// Opaque local publisher identity, stable across this connection's clones.
+    ///
+    /// Admit it separately before using it to bind application work. It neither
+    /// authenticates remote headers nor grants tenant authority.
+    pub fn local_publisher_identity(&self) -> crate::LocalPublisherIdentity {
+        self.inner.local_publisher.clone()
     }
 
     /// Broadcast a signal. Returns as soon as the broker has it; there is no
@@ -1389,6 +1417,9 @@ async fn dispatch_loop(inner: Arc<Inner>) {
             MessageKind::Signal => {
                 // `send` fails only when nobody is subscribed, which is the
                 // common case for a service that emits but never listens.
+                let _ = inner
+                    .signal_deliveries
+                    .send(crate::SignalDelivery::received(message.clone(), brokered));
                 let _ = inner.signals.send(message);
             }
             MessageKind::MethodCall => {
@@ -1569,3 +1600,7 @@ mod tests;
 #[cfg(test)]
 #[path = "connection_reply_tests.rs"]
 mod reply_tests;
+
+#[cfg(test)]
+#[path = "connection_signal_tests.rs"]
+mod signal_tests;

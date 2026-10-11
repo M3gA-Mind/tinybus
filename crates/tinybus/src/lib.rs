@@ -146,3 +146,6 @@ pub const DEFAULT_SOCKET_ENV: &str = "TINYBUS_ADDRESS";
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+mod signal;
+pub use signal::{LocalPublisherIdentity, SignalContext, SignalDelivery, SignalOrigin};
