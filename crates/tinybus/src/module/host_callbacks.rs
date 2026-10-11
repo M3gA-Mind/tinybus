@@ -149,6 +149,15 @@ impl HostCallbackBinding {
         &self.state.destination
     }
     /// Construct an outgoing proxy using this private host connection.
+    ///
+    /// The outgoing handle cannot expose the owned callback connection:
+    /// ```compile_fail
+    /// # async fn example(binding: &tinybus::module::HostCallbackBinding) -> tinybus::Result<()> {
+    /// let outgoing = binding.proxy("org.example.Module", "/module", "org.example.Module")?;
+    /// let _: &tinybus::Connection = outgoing.connection();
+    /// # Ok(())
+    /// # }
+    /// ```
     /// The proxy exposes no raw connection or service registration escape.
     pub fn proxy(&self, destination: &str, path: &str, interface: &str) -> Result<crate::Proxy> {
         self.connection.proxy(destination, path, interface)

@@ -524,3 +524,42 @@ async fn a_new_host_keeps_the_frozen_prefix_readable_by_old_modules() {
     );
     transport.initialize(module).unwrap();
 }
+
+#[tokio::test]
+async fn rejected_initialization_releases_observer_without_claiming_initializing() {
+    let (transport, _) = ModuleTransport::new("rejected".into(), vec![]);
+    transport.pause_initialization();
+    let weak = Arc::downgrade(&transport);
+    let observed = transport.clone();
+    let observer = tokio::spawn(async move { observed.wait_initializing().await });
+    tokio::task::yield_now().await;
+    transport.release_initialization(false);
+    assert!(transport.ensure_initialized().await.is_err());
+    assert!(!transport.init_started());
+    drop(transport);
+    tokio::time::timeout(Duration::from_millis(100), observer).await.unwrap().unwrap();
+    assert!(weak.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn stop_before_initialization_terminates_all_waiters() {
+    let (transport, _) = ModuleTransport::new("stopped".into(), vec![]);
+    transport.pause_initialization();
+    transport.stop_sync(Duration::ZERO);
+    tokio::time::timeout(Duration::from_millis(100), transport.ensure_initialized()).await.unwrap().unwrap_err();
+    tokio::time::timeout(Duration::from_millis(100), transport.wait_initializing()).await.unwrap();
+    tokio::time::timeout(Duration::from_millis(100), transport.wait_ready()).await.unwrap();
+    assert!(!transport.init_started());
+    assert!(!transport.is_ready());
+}
+
+#[tokio::test]
+async fn ready_followed_by_fault_is_not_successful_readiness() {
+    let (transport, host) = ModuleTransport::new("ready-fault".into(), vec![]);
+    unsafe { (host.ready)(host.host_ctx); }
+    assert!(transport.is_ready());
+    unsafe { (host.fault)(host.host_ctx, std::ptr::null(), 0); }
+    transport.wait_ready().await;
+    assert!(transport.is_faulted());
+    assert!(!transport.is_ready());
+}
