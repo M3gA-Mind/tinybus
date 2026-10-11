@@ -428,7 +428,10 @@ impl Connection {
         message.header.sender = self.unique_name();
         // Fails only when nothing on this connection is subscribed, which is
         // the normal case for a write-only publisher.
-        let _ = self.inner.signal_deliveries.send(crate::SignalDelivery::unverified(message.clone()));
+        let _ = self
+            .inner
+            .signal_deliveries
+            .send(crate::SignalDelivery::unverified(message.clone()));
         let _ = self.inner.signals.send(message);
     }
 
@@ -1411,7 +1414,9 @@ async fn dispatch_loop(inner: Arc<Inner>) {
             MessageKind::Signal => {
                 // `send` fails only when nobody is subscribed, which is the
                 // common case for a service that emits but never listens.
-                let _ = inner.signal_deliveries.send(crate::SignalDelivery::unverified(message.clone()));
+                let _ = inner
+                    .signal_deliveries
+                    .send(crate::SignalDelivery::unverified(message.clone()));
                 let _ = inner.signals.send(message);
             }
             MessageKind::MethodCall => {
@@ -1592,3 +1597,7 @@ mod tests;
 #[cfg(test)]
 #[path = "connection_reply_tests.rs"]
 mod reply_tests;
+
+#[cfg(test)]
+#[path = "connection_signal_tests.rs"]
+mod signal_tests;

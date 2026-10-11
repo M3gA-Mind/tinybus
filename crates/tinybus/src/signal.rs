@@ -3,8 +3,12 @@
 //! This is delivery identity, never tenant authority. A host must separately
 //! admit publishers and bind their work to captured application authorization.
 
-use std::{fmt, hash::{Hash, Hasher}, sync::Arc};
 use crate::{BusName, message::Message};
+use std::{
+    fmt,
+    hash::{Hash, Hasher},
+    sync::Arc,
+};
 
 /// Opaque identity of one local connection, stable across its clones.
 ///
@@ -15,14 +19,20 @@ use crate::{BusName, message::Message};
 pub struct LocalPublisherIdentity(Arc<()>);
 
 impl LocalPublisherIdentity {
-    pub(crate) fn new() -> Self { Self(Arc::new(())) }
+    pub(crate) fn new() -> Self {
+        Self(Arc::new(()))
+    }
 }
 impl PartialEq for LocalPublisherIdentity {
-    fn eq(&self, other: &Self) -> bool { Arc::ptr_eq(&self.0, &other.0) }
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
 }
 impl Eq for LocalPublisherIdentity {}
 impl Hash for LocalPublisherIdentity {
-    fn hash<H: Hasher>(&self, state: &mut H) { Arc::as_ptr(&self.0).hash(state); }
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        Arc::as_ptr(&self.0).hash(state);
+    }
 }
 impl fmt::Debug for LocalPublisherIdentity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -62,13 +72,19 @@ pub struct SignalContext {
 }
 impl SignalContext {
     /// The SDK-captured delivery path. This is not permission to act.
-    pub fn origin(&self) -> SignalOrigin { self.origin }
+    pub fn origin(&self) -> SignalOrigin {
+        self.origin
+    }
     /// A broker-stamped unique peer name only for proven broker delivery.
     ///
     /// Local publication does not authenticate Hello or a mutable sender header.
-    pub fn authenticated_sender(&self) -> Option<&BusName> { self.sender.as_ref() }
+    pub fn authenticated_sender(&self) -> Option<&BusName> {
+        self.sender.as_ref()
+    }
     /// The exact local publisher identity, only for in-process local delivery.
-    pub fn local_publisher(&self) -> Option<&LocalPublisherIdentity> { self.local_publisher.as_ref() }
+    pub fn local_publisher(&self) -> Option<&LocalPublisherIdentity> {
+        self.local_publisher.as_ref()
+    }
 }
 
 /// A message and its immutable SDK-captured provenance in one queued delivery.
@@ -82,12 +98,19 @@ pub struct SignalDelivery {
 }
 impl SignalDelivery {
     pub(crate) fn unverified(message: Message) -> Self {
-        Self { message, context: SignalContext::default() }
+        Self {
+            message,
+            context: SignalContext::default(),
+        }
     }
     /// Protocol data, including untrusted body and header values.
-    pub fn message(&self) -> &Message { &self.message }
+    pub fn message(&self) -> &Message {
+        &self.message
+    }
     /// Immutable provenance captured before queueing.
-    pub fn context(&self) -> &SignalContext { &self.context }
+    pub fn context(&self) -> &SignalContext {
+        &self.context
+    }
 }
 
 #[cfg(test)]
