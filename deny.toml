@@ -4,9 +4,7 @@ all-features = true
 [advisories]
 
 [licenses]
-# Licenses accepted for this crate and its dependencies. Keep GPL-3.0-only for
-# the template crate itself; the remaining entries cover compatible dependency
-# licenses commonly encountered by Rust projects.
+# Licenses accepted for this MIT workspace and its third-party dependencies.
 allow = [
     # Public CA root data and permissive dependency code licenses.
     "CDLA-Permissive-2.0",
@@ -19,7 +17,6 @@ allow = [
     # dedication — strictly more permissive than the rest of this list, and it
     # imposes no obligation on a GPL-3.0-only crate.
     "CC0-1.0",
-    "GPL-3.0-only",
     "ISC",
     "MIT",
     "MPL-2.0",

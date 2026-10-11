@@ -8,8 +8,7 @@ on:
         required: true
   push:
     tags: ['v*']
-permissions:
-  contents: write
+permissions: {}
 concurrency:
   group: release-${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
   cancel-in-progress: false
@@ -34,7 +33,9 @@ jobs:
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
   sdk-release:
     needs: resolve
-    uses: tinyhumansai/.github/.github/workflows/sdk-release.yml@5ad0e00d8af6e89fc516015ccb13ab114b947be6
+    permissions:
+      contents: write
+    uses: tinyhumansai/.github/.github/workflows/sdk-release.yml@3e87ade76b622844985d0c665a3b075313e4545c
     with:
       tag: ${{ needs.resolve.outputs.tag }}
       version: ${{ needs.resolve.outputs.version }}
