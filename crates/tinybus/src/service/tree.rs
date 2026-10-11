@@ -64,7 +64,7 @@ impl ObjectTree {
 
     /// Look up one interface, distinguishing "no such object" from
     /// "object exists, wrong contract".
-    pub fn lookup(
+    pub(crate) fn lookup(
         &self,
         path: &ObjectPath,
         interface: &InterfaceName,
@@ -105,20 +105,35 @@ impl ObjectTree {
         confidential: bool,
     ) -> Result<Value> {
         let target = self.lookup(path, interface)?;
-        if !target.members().contains(member) {
-            return Err(Error::UnknownMethod {
-                interface: interface.clone(),
-                member: member.clone(),
-            });
-        }
-        if target.requires_confidential(member) && !confidential {
-            return Err(Error::ConfidentialityRequired {
-                interface: interface.clone(),
-                member: member.clone(),
-            });
-        }
-        target.call(member, args).await
+        dispatch_resolved(target, interface, member, args, confidential).await
     }
+}
+
+/// Dispatch a target retained from the object tree after releasing its lock.
+///
+/// Keeping the selected `Arc` alive is enough to preserve the call target while
+/// allowing the interface to mutate the connection's object tree during its
+/// asynchronous method implementation.
+pub(crate) async fn dispatch_resolved(
+    target: Arc<dyn Interface>,
+    interface: &InterfaceName,
+    member: &MemberName,
+    args: Value,
+    confidential: bool,
+) -> Result<Value> {
+    if !target.members().contains(member) {
+        return Err(Error::UnknownMethod {
+            interface: interface.clone(),
+            member: member.clone(),
+        });
+    }
+    if target.requires_confidential(member) && !confidential {
+        return Err(Error::ConfidentialityRequired {
+            interface: interface.clone(),
+            member: member.clone(),
+        });
+    }
+    target.call(member, args).await
 }
 
 #[cfg(test)]

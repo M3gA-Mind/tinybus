@@ -1297,9 +1297,14 @@ async fn dispatch(inner: &Inner, header: &Header, body: Value) -> Result<Value> 
     else {
         return Err(Error::protocol("method call is missing an address"));
     };
-    let objects = inner.objects.read().await;
-    objects
-        .dispatch_with_confidential(path, interface, member, body, header.confidential)
+    // Hold the tree lock only long enough to retain the selected interface.
+    // A method can serve or remove objects on this same connection; awaiting
+    // user code while holding the read guard would deadlock that write.
+    let target = {
+        let objects = inner.objects.read().await;
+        objects.lookup(path, interface)?
+    };
+    crate::service::tree::dispatch_resolved(target, interface, member, body, header.confidential)
         .await
 }
 

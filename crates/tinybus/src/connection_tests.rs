@@ -77,6 +77,88 @@ async fn brokered_pair() -> (Connection, Connection) {
     (client, service)
 }
 
+struct MutatesObjectTree {
+    service: Connection,
+    extra_path: ObjectPath,
+}
+
+#[async_trait]
+impl Interface for MutatesObjectTree {
+    fn name(&self) -> InterfaceName {
+        InterfaceName::new("ai.tinyhumans.Test").unwrap()
+    }
+
+    fn members(&self) -> Vec<MemberName> {
+        vec![
+            MemberName::new("Serve").unwrap(),
+            MemberName::new("Unserve").unwrap(),
+        ]
+    }
+
+    async fn call(&self, member: &MemberName, _args: Value) -> Result<Value> {
+        match member.as_str() {
+            "Serve" => {
+                self.service.serve_at(self.extra_path.clone(), Echo).await?;
+                Ok(Value::Bool(true))
+            }
+            "Unserve" => Ok(Value::Bool(self.service.unserve(&self.extra_path).await)),
+            _ => unreachable!("members() lists only the supported operations"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_service_can_export_and_remove_objects_during_a_method_call() {
+    let transport = MemoryBus::new();
+    Broker::new().spawn(transport.clone());
+    let service = Connection::connect(transport.connect().await.unwrap())
+        .await
+        .unwrap();
+    service.request_name("ai.tinyhumans.Test").await.unwrap();
+    let client = Connection::connect(transport.connect().await.unwrap())
+        .await
+        .unwrap();
+    let extra_path = ObjectPath::new("/ai/tinyhumans/TestExtra").unwrap();
+    service
+        .serve_at(
+            path(),
+            MutatesObjectTree {
+                service: service.clone(),
+                extra_path: extra_path.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    let proxy = client
+        .proxy("ai.tinyhumans.Test", path().as_str(), "ai.tinyhumans.Test")
+        .unwrap()
+        .with_timeout(Duration::from_millis(250));
+
+    assert!(proxy.call::<bool>("Serve", ()).await.unwrap());
+    let extra = client
+        .proxy(
+            "ai.tinyhumans.Test",
+            extra_path.as_str(),
+            "ai.tinyhumans.Test",
+        )
+        .unwrap();
+    assert_eq!(
+        extra.call::<Value>("Echo", ("served",)).await.unwrap(),
+        serde_json::json!(["served"])
+    );
+
+    assert!(proxy.call::<bool>("Unserve", ()).await.unwrap());
+    let removed_call = extra.call::<Value>("Echo", ("removed",)).await;
+    assert!(
+        matches!(
+            removed_call,
+            Err(Error::MethodFailed { ref name, .. })
+                if name == "ai.tinyhumans.tinybus.Error.UnknownObject"
+        ),
+        "expected removal to reject the object, got {removed_call:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_call_reaches_the_service_and_the_reply_comes_back() {
     let (client, _service) = pair().await;
