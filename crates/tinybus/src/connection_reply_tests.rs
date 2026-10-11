@@ -316,10 +316,7 @@ async fn raw_direct_reply_compatibility_does_not_claim_broker_identity() {
         let requester = requester.clone();
         async move {
             requester
-                .call_raw(
-                    fixture_call(BusName::new("ai.tinyhumans.Fixture").unwrap()),
-                    DEFAULT_TIMEOUT,
-                )
+                .call_raw(fixture_call(BusName::new(":1.2").unwrap()), DEFAULT_TIMEOUT)
                 .await
         }
     });
@@ -340,6 +337,7 @@ fn reply_authority_rejects_other_peers_and_requires_private_success() {
         expected: Some(expected.clone()),
         bus_control: false,
         confidential: true,
+        unverified_direct: false,
     };
     let mut call = fixture_call(expected.clone());
     call.header.serial = 8;
@@ -369,6 +367,7 @@ fn reply_authority_rejects_other_peers_and_requires_private_success() {
         expected: None,
         bus_control: true,
         confidential: false,
+        unverified_direct: false,
     };
     let mut reply = Message::method_return(&call.header, Value::Null);
     reply.header.sender = Some(expected);

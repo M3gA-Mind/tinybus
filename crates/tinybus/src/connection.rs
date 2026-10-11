@@ -147,6 +147,7 @@ struct PendingReply {
     expected: Option<BusName>,
     bus_control: bool,
     confidential: bool,
+    unverified_direct: bool,
 }
 
 impl PendingReply {
@@ -158,7 +159,9 @@ impl PendingReply {
             // real broker can never send an unstamped frame.
             sender.is_none() || broker_sender
         } else if let Some(expected) = &self.expected {
-            sender == Some(expected) || (reply.header.kind == MessageKind::Error && broker_sender)
+            sender == Some(expected)
+                || (reply.header.kind == MessageKind::Error && broker_sender)
+                || (self.unverified_direct && !brokered && sender.is_none())
         } else {
             // Raw direct transport compatibility has no authenticated peer
             // identity. A proven broker delivery must not use this escape.
@@ -833,6 +836,7 @@ impl Connection {
                 expected,
                 bus_control,
                 confidential: message.header.confidential,
+                unverified_direct: self.unique_name().is_none(),
             },
         );
 
