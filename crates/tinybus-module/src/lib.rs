@@ -331,10 +331,16 @@ struct RuntimeState {
 
 type Reinitialize = Box<dyn Fn(*const u8, usize) -> i32 + Send + Sync>;
 async fn dispose_failed_setup_callback(callback: Arc<StdMutex<Option<Reinitialize>>>) {
-    callback
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
+    // Reinitialization holds exclusion while driving setup with block_on.
+    // Waiting for it must leave runtime workers free to advance that future
+    // and its timer. Observe completion before publishing the failure.
+    let _ = tokio::task::spawn_blocking(move || {
+        callback
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+    })
+    .await;
 }
 type ReinitializeFactory = Box<
     dyn FnOnce(tokio::runtime::Handle, Arc<StdMutex<Option<Connection>>>) -> Reinitialize + Send,
@@ -1209,9 +1215,9 @@ mod tests;
 mod static_link_tests;
 
 #[cfg(test)]
-#[path = "setup_factory_tests.rs"]
+#[path = "lib_setup_factory_tests.rs"]
 mod setup_factory_test;
 
 #[cfg(test)]
-#[path = "lifecycle_tests.rs"]
+#[path = "lib_lifecycle_tests.rs"]
 mod lifecycle_test;
