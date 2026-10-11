@@ -758,7 +758,7 @@ async fn callback_connection_does_not_keep_its_served_object_and_bus_name_alive(
         .serve_at(
             ObjectPath::new("/test/Callback")?,
             CallbackConnection {
-                connection: service.clone(),
+                connection: service.downgrade(),
                 dropped: dropped.clone(),
             },
         )

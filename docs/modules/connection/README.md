@@ -36,6 +36,23 @@ Without it, an exiting service would keep its well-known name until its process
 died, and `NameOwnerChanged` — the whole reason the kernel can react to a death
 — would not fire.
 
+## Callback ownership
+
+A served object that needs to call another service stores
+a non-owning callback reference from `Connection::downgrade()`. Upgrade the
+`WeakConnection` for the duration of each callback. Storing a strong clone in
+an object served by that same connection creates a cycle: connection → object
+→ connection. Its external owner can then drop without releasing the object
+or well-known name.
+
+Weak references never keep the link open. `upgrade()` returns `None` after
+the last strong owner drops, even while dispatch tasks still retain internal
+state. A successful upgrade owns a normal connection for that work's duration;
+it preserves the existing transport, routing, timeout and admission behavior.
+It does not recreate a dropped lifetime guard. An explicitly closed connection
+that still has an owner can be upgraded; calls return its normal closed-link
+errors.
+
 ## Argument normalisation
 
 `to_body` wraps a scalar into the positional array the protocol specifies, so
