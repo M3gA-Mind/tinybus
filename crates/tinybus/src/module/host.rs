@@ -1385,9 +1385,6 @@ impl ModuleControl for ModuleHostInner {
                 .find(|module| module.info.name == name)
                 .ok_or_else(|| Error::failed("module is not loaded"))?;
             let old = module.snapshot().state;
-            if module.callback_config.as_ref().is_some_and(|initial| initial != &config) {
-                return Err(Error::failed("scoped callback configuration is immutable"));
-            }
             if module.lifecycle_busy {
                 return Err(Error::failed(
                     "module lifecycle operation is already running",
@@ -1436,6 +1433,13 @@ impl ModuleControl for ModuleHostInner {
                 .find(|module| module.info.name == name)
                 .ok_or_else(|| Error::failed("module is not loaded"))?;
             let state = module.snapshot().state;
+            if module
+                .callback_config
+                .as_ref()
+                .is_some_and(|initial| initial != &config)
+            {
+                return Err(Error::failed("scoped callback configuration is immutable"));
+            }
             if module.lifecycle_busy {
                 return Err(Error::failed(
                     "module lifecycle operation is already running",

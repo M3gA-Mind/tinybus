@@ -12,7 +12,11 @@ impl Interface for ContextService {
         "org.example.Context".parse().unwrap()
     }
     fn members(&self) -> Vec<MemberName> {
-        vec!["Inspect".parse().unwrap(), "Callback".parse().unwrap(), "ConfidentialCallback".parse().unwrap()]
+        vec![
+            "Inspect".parse().unwrap(),
+            "Callback".parse().unwrap(),
+            "ConfidentialCallback".parse().unwrap(),
+        ]
     }
     async fn call(&self, _: &MemberName, _: Value) -> Result<Value> {
         Err(Error::failed("authenticated incoming context required"))
@@ -32,7 +36,9 @@ impl Interface for ContextService {
         match member.as_str() {
             "Inspect" => Ok(serde_json::json!(sender)),
             "Callback" | "ConfidentialCallback" => {
-                let proxy = self.0.proxy(sender.as_str(), "/callback", "org.example.Callback")?;
+                let proxy = self
+                    .0
+                    .proxy(sender.as_str(), "/callback", "org.example.Callback")?;
                 let reply: String = if member.as_str() == "ConfidentialCallback" {
                     proxy.call_confidential("Observe", ()).await?
                 } else {

@@ -2532,7 +2532,6 @@ async fn fixed_unique_module_calls_are_refused_in_terminal_states_before_detach(
     broker_task.abort();
 }
 
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires TINYBUS_TEST_CONTEXT_MODULE to point at the built cdylib"]
 async fn a_verified_cdylib_can_deliver_a_confidential_host_callback() {
@@ -2544,28 +2543,66 @@ async fn a_verified_cdylib_can_deliver_a_confidential_host_callback() {
     let broker = Broker::new();
     let task = broker.spawn(bus.clone());
     let modules = ModuleHost::new(broker);
-    modules.load_file(artifact).unwrap();
-    let client = Connection::connect(bus.connect().await.unwrap()).await.unwrap();
+    let binding = modules
+        .prepare_host_callbacks(vec![crate::module::HostCallbackEndpoint {
+            path: "/callback".parse().unwrap(),
+            interface: "org.example.Callback".parse().unwrap(),
+            members: vec!["Observe".parse().unwrap()],
+        }])
+        .await
+        .unwrap();
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    client.serve_at("/callback".parse().unwrap(), CountingNativeCallback(calls.clone())).await.unwrap();
-    let module = client.name_owner("org.example.Context").await.unwrap().unwrap();
-    let result = client.proxy(module.as_str(), "/context", "org.example.Context").unwrap()
-        .call_confidential::<(crate::BusName, crate::BusName)>("ConfidentialCallback", ()).await;
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "confidential callback required; result: {result:?}");
-    assert_eq!(result.unwrap(), (client.unique_name().unwrap(), module));
+    binding
+        .serve_at(
+            "/callback".parse().unwrap(),
+            CountingNativeCallback(calls.clone()),
+        )
+        .await
+        .unwrap();
+    modules
+        .load_file_with_host_callbacks(artifact, serde_json::json!({}), &binding)
+        .await
+        .unwrap();
+    let module = binding.guard().module_peer().unwrap();
+    let result = binding
+        .proxy(module.as_str(), "/context", "org.example.Context")
+        .unwrap()
+        .call_confidential::<(crate::BusName, crate::BusName)>("ConfidentialCallback", ())
+        .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "confidential callback required; result: {result:?}"
+    );
+    assert_eq!(result.unwrap(), (binding.unique_name().clone(), module));
     task.abort();
 }
 
 struct CountingNativeCallback(Arc<std::sync::atomic::AtomicUsize>);
 #[async_trait::async_trait]
 impl crate::Interface for CountingNativeCallback {
-    fn name(&self) -> crate::InterfaceName { "org.example.Callback".parse().unwrap() }
-    fn members(&self) -> Vec<crate::MemberName> { vec!["Observe".parse().unwrap()] }
-    async fn call(&self, _: &crate::MemberName, _: serde_json::Value) -> crate::Result<serde_json::Value> {
+    fn name(&self) -> crate::InterfaceName {
+        "org.example.Callback".parse().unwrap()
+    }
+    fn members(&self) -> Vec<crate::MemberName> {
+        vec!["Observe".parse().unwrap()]
+    }
+    async fn call(
+        &self,
+        _: &crate::MemberName,
+        _: serde_json::Value,
+    ) -> crate::Result<serde_json::Value> {
         Err(Error::failed("missing contextual dispatch"))
     }
-    async fn call_with_context(&self, _: &crate::MemberName, _: serde_json::Value, context: &crate::CallContext) -> crate::Result<serde_json::Value> {
-        let sender = context.authenticated_sender().ok_or_else(|| Error::failed("unverified callback"))?;
+    async fn call_with_context(
+        &self,
+        _: &crate::MemberName,
+        _: serde_json::Value,
+        context: &crate::CallContext,
+    ) -> crate::Result<serde_json::Value> {
+        let sender = context
+            .authenticated_sender()
+            .ok_or_else(|| Error::failed("unverified callback"))?;
         self.0.fetch_add(1, Ordering::SeqCst);
         Ok(serde_json::json!(sender))
     }
