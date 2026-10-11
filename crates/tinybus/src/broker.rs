@@ -220,17 +220,11 @@ impl Broker {
                 // connection, which chose to participate in the exchange.
                 let confidential_call =
                     message.header.confidential && message.header.kind == MessageKind::MethodCall;
-                let target = if confidential_call {
-                    self.router
-                        .lock()
-                        .expect("router lock")
-                        .resolve_attested(&destination)
-                } else {
-                    self.router
-                        .lock()
-                        .expect("router lock")
-                        .resolve(&destination)
-                };
+                let target = self.router.lock().expect("router lock").resolve_call(
+                    &destination,
+                    message.header.expected_responder.as_ref(),
+                    confidential_call,
+                );
                 #[cfg(feature = "modules")]
                 let target = target.map_err(|error| {
                     // A refused attestation is the more specific answer and
@@ -385,6 +379,13 @@ impl Broker {
                 "GetAttestation" => {
                     let (name,): (BusName,) = parse_args(member, body)?;
                     Ok(serde_json::to_value(router.attestation_of(&name))?)
+                }
+                // This method also negotiates conditional owner routing. An
+                // older broker fails loudly rather than ignoring the guard.
+                "ResolveCallTarget" => {
+                    let (name,): (BusName,) = parse_args(member, body)?;
+                    let owner = router.owner_of(&name).ok_or_else(|| Error::NameHasNoOwner(name))?;
+                    Ok(serde_json::to_value(owner)?)
                 }
                 "GetNameOwner" => {
                     let (name,): (BusName,) = parse_args(member, body)?;
@@ -614,6 +615,7 @@ impl Broker {
                 kind: MessageKind::Signal,
                 serial: 0,
                 reply_serial: None,
+                expected_responder: None,
                 sender: Some(
                     BusName::new(crate::BUS_NAME).expect("the bus name constant is valid"),
                 ),

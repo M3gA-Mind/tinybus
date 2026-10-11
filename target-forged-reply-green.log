@@ -1,0 +1,12 @@
+[ci-cancel-aware] exec: cargo test -p tinybus another_broker_peer_cannot_complete 
+    Blocking waiting for file lock on package cache
+   Compiling tinybus v0.1.3 (/home/enamakel/work/openhuman/worktrees/cloud-storage-7419/vendor/tinybus/crates/tinybus)
+   Compiling tinybus-module v0.1.3 (/home/enamakel/work/openhuman/worktrees/cloud-storage-7419/vendor/tinybus/crates/tinybus-module)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.40s
+     Running unittests src/lib.rs (target/debug/deps/tinybus-49c252397df0a704)
+
+running 1 test
+test connection::reply_tests::another_broker_peer_cannot_complete_a_waiter_with_a_forged_reply ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 282 filtered out; finished in 0.00s
+
