@@ -326,7 +326,7 @@ struct RuntimeState {
     inbound: StdMutex<Option<mpsc::Sender<IncomingFrame>>>,
     host: HostCalls,
     runtime: StdMutex<Option<tokio::runtime::Runtime>>,
-    reinitialize: StdMutex<Option<Reinitialize>>,
+    reinitialize: Arc<StdMutex<Option<Reinitialize>>>,
 }
 
 type Reinitialize = Box<dyn Fn(*const u8, usize) -> i32 + Send + Sync>;
@@ -606,7 +606,12 @@ where
         let connection_slot = Arc::new(StdMutex::new(None));
         let task_connection_slot = connection_slot.clone();
 
-        runtime.spawn(async move {
+        let reinitializer =
+            reinitialize_factory.map(|factory| factory(runtime.handle().clone(), connection_slot));
+        let supports_reinitialize = reinitializer.is_some();
+        let reinitializer = Arc::new(StdMutex::new(reinitializer));
+        let failed_setup_callback = reinitializer.clone();
+        let setup_task = runtime.spawn(async move {
             let connection = module_connection(transport);
             let outcome = match connection.handshake().await.map(|()| connection) {
                 Ok(connection) => {
@@ -638,21 +643,31 @@ where
                 }
                 Err(error) => Err(error),
             };
-            if let Err(error) = outcome {
-                tracing::error!(error = %error, "tinybus module failed");
+            outcome
+        });
+        runtime.spawn(async move {
+            let outcome = setup_task.await;
+            if !matches!(outcome, Ok(Ok(()))) {
+                // A terminal setup failure may never receive ABI shutdown.
+                // Dispose its callback under the same lifecycle exclusion.
+                failed_setup_callback
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                match outcome {
+                    Ok(Err(error)) => tracing::error!(error = %error, "tinybus module failed"),
+                    Err(_) => tracing::error!("tinybus module setup task failed"),
+                    Ok(Ok(())) => unreachable!(),
+                }
                 host.fault();
             }
         });
-
-        let reinitializer =
-            reinitialize_factory.map(|factory| factory(runtime.handle().clone(), connection_slot));
-        let supports_reinitialize = reinitializer.is_some();
 
         let state = Box::new(RuntimeState {
             host,
             inbound: StdMutex::new(Some(inbound_tx)),
             runtime: StdMutex::new(Some(runtime)),
-            reinitialize: StdMutex::new(reinitializer),
+            reinitialize: reinitializer,
         });
         let state = Box::into_raw(state).cast::<c_void>();
         unsafe { write_module_vtable(out, out_capacity, state, supports_reinitialize) };

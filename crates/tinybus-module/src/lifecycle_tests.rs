@@ -40,10 +40,10 @@ fn shutdown_releases_captured_callback_while_retaining_closed_tombstone() {
         inbound: StdMutex::new(None),
         host: HostCalls(host()),
         runtime: StdMutex::new(Some(runtime)),
-        reinitialize: StdMutex::new(Some(Box::new(move |_, _| {
+        reinitialize: Arc::new(StdMutex::new(Some(Box::new(move |_, _| {
             let _ = &token;
             TB_OK
-        }))),
+        })))),
     };
     let pointer = std::ptr::from_mut(&mut state).cast();
     assert_eq!(unsafe { shutdown(pointer, 1000) }, TB_OK);
@@ -112,7 +112,7 @@ fn shutdown_excludes_active_reinitializer_before_disposing_capture() {
         inbound: StdMutex::new(None),
         host: HostCalls(host()),
         runtime: StdMutex::new(Some(tokio::runtime::Runtime::new().unwrap())),
-        reinitialize: StdMutex::new(Some(Box::new(move |_, _| {
+        reinitialize: Arc::new(StdMutex::new(Some(Box::new(move |_, _| {
             let _ = &token;
             entered.send(()).unwrap();
             released
@@ -121,7 +121,7 @@ fn shutdown_excludes_active_reinitializer_before_disposing_capture() {
                 .recv_timeout(Duration::from_secs(5))
                 .unwrap();
             TB_OK
-        }))),
+        })))),
     });
     let active = Arc::clone(&state);
     let reinitializer = std::thread::spawn(move || unsafe {
@@ -155,10 +155,10 @@ fn shutdown_disposes_callback_even_after_reinitializer_panics() {
         inbound: StdMutex::new(None),
         host: HostCalls(host()),
         runtime: StdMutex::new(None),
-        reinitialize: StdMutex::new(Some(Box::new(move |_, _| {
+        reinitialize: Arc::new(StdMutex::new(Some(Box::new(move |_, _| {
             let _ = &token;
             panic!("fixture callback failed")
-        }))),
+        })))),
     };
     let pointer = std::ptr::from_mut(&mut state).cast();
     assert_eq!(
