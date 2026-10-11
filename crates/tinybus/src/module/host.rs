@@ -1117,6 +1117,9 @@ impl ModuleHost {
         tokio::spawn(async move {
             if lazy_init {
                 ready_transport.wait_initializing().await;
+                if !ready_transport.init_started() || ready_transport.is_faulted() {
+                    return;
+                }
                 broker
                     .announce_module_state(serde_json::json!([
                         module_name.clone(),

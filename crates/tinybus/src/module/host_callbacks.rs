@@ -143,6 +143,80 @@ pub struct HostCallbackBinding {
     transport: Arc<MemoryTransport>,
 }
 
+/// Outgoing operations on the binding's private connection.
+///
+/// This handle deliberately has no connection accessor, dereference,
+/// conversion, or service registration surface. Clones retain only this API.
+#[derive(Clone, Debug)]
+pub struct HostCallbackProxy(crate::Proxy);
+
+impl HostCallbackProxy {
+    /// Override the deadline for outgoing calls.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.0 = self.0.with_timeout(timeout);
+        self
+    }
+    /// The destination addressed by this handle.
+    pub fn destination(&self) -> &BusName {
+        self.0.destination()
+    }
+    /// The addressed object path.
+    pub fn path(&self) -> &ObjectPath {
+        self.0.path()
+    }
+    /// The addressed interface.
+    pub fn interface(&self) -> &InterfaceName {
+        self.0.interface()
+    }
+    /// Call a method and deserialize its ordinary reply.
+    pub async fn call<R: serde::de::DeserializeOwned>(
+        &self,
+        member: &str,
+        args: impl serde::Serialize,
+    ) -> Result<R> {
+        self.0.call(member, args).await
+    }
+    /// Call a method receiving a bounded streaming reply.
+    pub async fn call_streaming<R: serde::de::DeserializeOwned>(
+        &self,
+        member: &str,
+        args: impl serde::Serialize,
+    ) -> Result<R> {
+        self.0.call_streaming(member, args).await
+    }
+    /// Call an attested recipient with a confidential body.
+    pub async fn call_confidential<R: serde::de::DeserializeOwned>(
+        &self,
+        member: &str,
+        args: impl serde::Serialize,
+    ) -> Result<R> {
+        self.0.call_confidential(member, args).await
+    }
+    /// Call a broker module-control method with a redacted body.
+    pub async fn call_sensitive<R: serde::de::DeserializeOwned>(
+        &self,
+        member: &str,
+        args: impl serde::Serialize,
+    ) -> Result<R> {
+        self.0.call_sensitive(member, args).await
+    }
+    /// Read the broker's artifact attestation for the destination.
+    pub async fn attestation(&self) -> Result<Option<crate::attest::Attestation>> {
+        self.0.attestation().await
+    }
+    /// Whether the destination currently has an owner.
+    pub async fn is_available(&self) -> Result<bool> {
+        self.0.is_available().await
+    }
+    /// Subscribe to signals for the addressed object and interface.
+    pub async fn receive_signal(
+        &self,
+        member: &str,
+    ) -> Result<tokio::sync::broadcast::Receiver<crate::message::Message>> {
+        self.0.receive_signal(member).await
+    }
+}
+
 impl HostCallbackBinding {
     /// The exact SDK-created host destination for module configuration.
     pub fn unique_name(&self) -> &BusName {
@@ -159,8 +233,15 @@ impl HostCallbackBinding {
     /// # }
     /// ```
     /// The proxy exposes no raw connection or service registration escape.
-    pub fn proxy(&self, destination: &str, path: &str, interface: &str) -> Result<crate::Proxy> {
-        self.connection.proxy(destination, path, interface)
+    pub fn proxy(
+        &self,
+        destination: &str,
+        path: &str,
+        interface: &str,
+    ) -> Result<HostCallbackProxy> {
+        self.connection
+            .proxy(destination, path, interface)
+            .map(HostCallbackProxy)
     }
     /// Read-only capability state for domain authorization and completion accounting.
     pub fn guard(&self) -> HostCallbackGuard {
@@ -513,8 +594,19 @@ impl ModuleHost {
                 .retain(|module| !Arc::ptr_eq(&module.transport, &transport));
             return Err(Error::module_refused(path, "module initialization failed"));
         }
-        rollback.committed = true;
+        let lifetime = binding
+            .state
+            .lifetime
+            .lock()
+            .expect("callback lifetime lock");
+        if lifetime.revoked || !lifetime.active || !transport.is_ready() {
+            return Err(Error::module_refused(
+                path,
+                "module became unavailable before load completion",
+            ));
+        }
         let loaded = self.inner.loaded.lock().expect("module list lock");
+        rollback.committed = true;
         Ok(loaded
             .iter()
             .find(|module| Arc::ptr_eq(&module.transport, &transport))

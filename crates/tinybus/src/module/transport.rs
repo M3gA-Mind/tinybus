@@ -203,6 +203,18 @@ impl ModuleTransport {
             .lock()
             .expect("initialization gate lock") = Some(allowed);
         self.initialization_gate_changed.notify_waiters();
+        if !allowed {
+            self.terminate_waiters();
+        }
+    }
+
+    // Terminal state is distinct from initialization: never fabricate READY or
+    // init_started to release observers during admission rollback or shutdown.
+    fn terminate_waiters(&self) {
+        self.context.faulted.store(true, Ordering::Release);
+        self.context.init_notify.notify_waiters();
+        self.context.ready_notify.notify_waiters();
+        self.initialization_gate_changed.notify_waiters();
     }
 
     pub(crate) async fn ensure_initialized(&self) -> Result<()> {
@@ -212,6 +224,9 @@ impl ModuleTransport {
                 .initialization_gate
                 .lock()
                 .expect("initialization gate lock");
+            if self.is_faulted() {
+                return Err(Error::ConnectionClosed);
+            }
             match allowed {
                 Some(true) => break,
                 Some(false) => return Err(Error::transport("module callback admission failed")),
@@ -276,7 +291,7 @@ impl ModuleTransport {
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        self.context.ready.load(Ordering::Acquire)
+        self.context.ready.load(Ordering::Acquire) && !self.is_faulted()
     }
 
     pub(crate) fn clear_config(&self) {
@@ -358,7 +373,7 @@ impl ModuleTransport {
     pub(crate) async fn wait_initializing(&self) {
         loop {
             let notified = self.context.init_notify.notified();
-            if self.init_started() {
+            if self.init_started() || self.is_faulted() {
                 return;
             }
             notified.await;
@@ -502,6 +517,7 @@ impl ModuleTransport {
     }
 
     pub(crate) fn stop_sync(&self, deadline: Duration) -> i32 {
+        self.terminate_waiters();
         let code = self.shutdown_sync(deadline);
         self.context
             .inbound
