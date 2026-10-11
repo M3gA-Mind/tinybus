@@ -717,7 +717,7 @@ async fn unserve_stops_new_admission_but_preserves_an_already_admitted_call() {
 
 /// A served object needs its connection to issue callbacks, but must not own it.
 struct CallbackConnection {
-    connection: Connection,
+    connection: WeakConnection,
     dropped: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -738,7 +738,11 @@ impl Interface for CallbackConnection {
     }
     async fn call(&self, _member: &MemberName, _args: Value) -> Result<Value> {
         Ok(serde_json::json!(
-            self.connection.unique_name().map(|name| name.to_string())
+            self.connection
+                .upgrade()
+                .ok_or(Error::ConnectionClosed)?
+                .unique_name()
+                .map(|name| name.to_string())
         ))
     }
 }
@@ -782,5 +786,26 @@ async fn callback_connection_does_not_keep_its_served_object_and_bus_name_alive(
     })
     .await
     .map_err(|_| Error::failed("callback connection retained its object/name"))??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn weak_references_cannot_resurrect_dispatch_state_after_the_last_owner_drops() -> Result<()>
+{
+    let bus = MemoryBus::new();
+    Broker::new().spawn(bus.clone());
+    let connection = Connection::connect(bus.connect().await?).await?;
+    let weak = connection.downgrade();
+    let weak_clone = weak.clone();
+    let upgraded = weak.upgrade().ok_or(Error::ConnectionClosed)?;
+    assert_eq!(upgraded.unique_name(), connection.unique_name());
+    drop(connection);
+    assert!(weak_clone.upgrade().is_some());
+    drop(upgraded);
+    // The dispatch task still has its own Arc<Inner> until it sees closure.
+    // That is not permission to recreate the lifetime guard.
+    assert!(weak.upgrade().is_none());
+    assert!(weak_clone.upgrade().is_none());
+    assert!(format!("{weak:?}").contains("has_strong_owner: false"));
     Ok(())
 }
