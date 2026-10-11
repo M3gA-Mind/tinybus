@@ -506,3 +506,55 @@ fn absent_conditional_header_round_trips_legacy_wire_frames() {
         ":1.2"
     );
 }
+
+async fn negotiated_owner_reply(owner: &str) -> Result<Value> {
+    let owner = owner.to_owned();
+    let (a, b) = crate::transport::memory::MemoryTransport::pair();
+    let server = tokio::spawn(async move {
+        let hello = b.recv().await.unwrap().unwrap();
+        let mut reply = Message::method_return(&hello.header, serde_json::json!(":1.1"));
+        reply.header.serial = 1;
+        b.send(reply).await.unwrap();
+        let lookup = b.recv().await.unwrap().unwrap();
+        let mut reply = Message::method_return(&lookup.header, serde_json::json!(owner));
+        reply.header.serial = 2;
+        b.send(reply).await.unwrap();
+        if owner.starts_with(':') {
+            let call = b.recv().await.unwrap().unwrap();
+            assert!(call.header.serial > lookup.header.serial);
+            assert_eq!(
+                call.header.expected_responder.as_ref().unwrap().as_str(),
+                owner
+            );
+            let mut reply = Message::method_return(&call.header, serde_json::json!("bound"));
+            reply.header.sender = Some(BusName::new(owner).unwrap());
+            reply.header.serial = 3;
+            b.send(reply).await.unwrap();
+        }
+    });
+    let requester = Connection::connect(Box::new(a)).await.unwrap();
+    let result = requester
+        .call_raw(
+            fixture_call(BusName::new("ai.tinyhumans.Fixture").unwrap()),
+            DEFAULT_TIMEOUT,
+        )
+        .await;
+    server.await.unwrap();
+    result
+}
+
+#[tokio::test]
+async fn guarded_call_serial_follows_its_owner_negotiation() {
+    assert_eq!(
+        negotiated_owner_reply(":1.2").await.unwrap(),
+        serde_json::json!("bound")
+    );
+}
+
+#[tokio::test]
+async fn owner_negotiation_rejects_non_unique_responder_before_delivery() {
+    assert!(matches!(
+        negotiated_owner_reply("ai.tinyhumans.Fixture").await,
+        Err(Error::Protocol(_))
+    ));
+}

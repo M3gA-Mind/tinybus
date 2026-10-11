@@ -765,8 +765,9 @@ impl Connection {
     }
 
     async fn call_raw_message(&self, mut message: Message, timeout: Duration) -> Result<Message> {
-        let serial = self.inner.serial.fetch_add(1, Ordering::Relaxed);
-        message.header.serial = serial;
+        // Validate without consuming the outbound serial: alias negotiation
+        // must precede the call on the wire and in the serial sequence.
+        message.header.serial = 1;
         message.validate()?;
         if message.header.confidential && message.header.stream_reply {
             return Err(Error::protocol(
@@ -828,6 +829,8 @@ impl Connection {
             None
         };
 
+        let serial = self.inner.serial.fetch_add(1, Ordering::Relaxed);
+        message.header.serial = serial;
         let (tx, rx) = oneshot::channel();
         self.inner.pending.lock().await.insert(
             serial,
