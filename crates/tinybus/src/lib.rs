@@ -92,7 +92,7 @@ pub mod version;
 pub mod __private;
 
 pub use crate::attest::Attestation;
-pub use crate::connection::Connection;
+pub use crate::connection::{Connection, WeakConnection};
 pub use crate::error::{Error, Result};
 pub use crate::events::{
     Event, EventBus, EventBusConfig, EventHandler, EventReceiver, SubscriptionHandle, TryRecvError,
@@ -105,7 +105,7 @@ pub use crate::ports::{Listener, Transport};
 pub use crate::proxy::Proxy;
 pub use crate::router::MatchRule;
 pub use crate::secret::{Secret, harden_process};
-pub use crate::service::Interface;
+pub use crate::service::{CallContext, Interface};
 pub use crate::stream::{
     MAX_CHUNK_LEN, StreamDescriptor, StreamLimits, StreamReader, StreamRef, StreamWriter,
 };
@@ -146,3 +146,6 @@ pub const DEFAULT_SOCKET_ENV: &str = "TINYBUS_ADDRESS";
 #[cfg(test)]
 #[path = "lib_tests.rs"]
 mod tests;
+
+mod signal;
+pub use signal::{LocalPublisherIdentity, SignalContext, SignalDelivery, SignalOrigin};

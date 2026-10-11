@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::error::{Error, Result};
 use crate::name::{InterfaceName, MemberName, ObjectPath};
-use crate::service::Interface;
+use crate::service::{CallContext, Interface};
 
 /// Everything one connection exports.
 #[derive(Default)]
@@ -64,7 +64,7 @@ impl ObjectTree {
 
     /// Look up one interface, distinguishing "no such object" from
     /// "object exists, wrong contract".
-    pub(crate) fn lookup(
+    pub fn lookup(
         &self,
         path: &ObjectPath,
         interface: &InterfaceName,
@@ -82,7 +82,7 @@ impl ObjectTree {
             })
     }
 
-    /// Resolve and invoke in one step.
+    /// Resolve and invoke an ordinary call with an unverified default context.
     pub async fn dispatch(
         &self,
         path: &ObjectPath,
@@ -96,6 +96,9 @@ impl ObjectTree {
 
     /// Resolve and invoke one call while enforcing the delivery's
     /// confidentiality flag before argument decoding reaches user code.
+    ///
+    /// Uses an unverified default context even when `confidential` is true;
+    /// the flag does not authenticate a caller.
     pub async fn dispatch_with_confidential(
         &self,
         path: &ObjectPath,
@@ -104,36 +107,58 @@ impl ObjectTree {
         args: Value,
         confidential: bool,
     ) -> Result<Value> {
-        let target = self.lookup(path, interface)?;
-        dispatch_resolved(target, interface, member, args, confidential).await
+        self.dispatch_with_context(
+            path,
+            interface,
+            member,
+            args,
+            confidential,
+            &CallContext::default(),
+        )
+        .await
     }
-}
 
-/// Dispatch a target retained from the object tree after releasing its lock.
-///
-/// Keeping the selected `Arc` alive is enough to preserve the call target while
-/// allowing the interface to mutate the connection's object tree during its
-/// asynchronous method implementation.
-pub(crate) async fn dispatch_resolved(
-    target: Arc<dyn Interface>,
-    interface: &InterfaceName,
-    member: &MemberName,
-    args: Value,
-    confidential: bool,
-) -> Result<Value> {
-    if !target.members().contains(member) {
-        return Err(Error::UnknownMethod {
-            interface: interface.clone(),
-            member: member.clone(),
-        });
+    /// Resolve and invoke with out-of-band incoming context and delivery flags.
+    ///
+    /// Checks the member and its confidentiality requirement before calling
+    /// [`Interface::call_with_context`]. Passes `context` through unchanged;
+    /// this method does not derive caller identity from `args` or the flag.
+    pub async fn dispatch_with_context(
+        &self,
+        path: &ObjectPath,
+        interface: &InterfaceName,
+        member: &MemberName,
+        args: Value,
+        confidential: bool,
+        context: &CallContext,
+    ) -> Result<Value> {
+        let target = self.lookup(path, interface)?;
+        Self::invoke(target, interface, member, args, confidential, context).await
     }
-    if target.requires_confidential(member) && !confidential {
-        return Err(Error::ConfidentialityRequired {
-            interface: interface.clone(),
-            member: member.clone(),
-        });
+
+    /// Invoke a resolved snapshot without holding the connection's tree lock.
+    pub(crate) async fn invoke(
+        target: Arc<dyn Interface>,
+        interface: &InterfaceName,
+        member: &MemberName,
+        args: Value,
+        confidential: bool,
+        context: &CallContext,
+    ) -> Result<Value> {
+        if !target.members().contains(member) {
+            return Err(Error::UnknownMethod {
+                interface: interface.clone(),
+                member: member.clone(),
+            });
+        }
+        if target.requires_confidential(member) && !confidential {
+            return Err(Error::ConfidentialityRequired {
+                interface: interface.clone(),
+                member: member.clone(),
+            });
+        }
+        target.call_with_context(member, args, context).await
     }
-    target.call(member, args).await
 }
 
 #[cfg(test)]

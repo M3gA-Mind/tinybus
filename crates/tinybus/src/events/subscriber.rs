@@ -20,7 +20,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 
 use crate::events::{Event, EventBusConfig};
-use crate::message::Message;
+use crate::{SignalContext, SignalDelivery};
 
 /// A typed event handler. Implement this to react to events.
 #[async_trait]
@@ -36,6 +36,15 @@ pub trait EventHandler<E: Event>: Send + Sync + 'static {
 
     /// Handle one event. Must not block the runtime.
     async fn handle(&self, event: &E);
+
+    /// Handle an event with immutable delivery provenance.
+    ///
+    /// Legacy handlers keep their existing behavior. Authority-dependent handlers
+    /// must override this and refuse unverified/unadmitted publishers; context
+    /// authenticates a delivery path, never a tenant or event payload.
+    async fn handle_with_context(&self, event: &E, _context: &SignalContext) {
+        self.handle(event).await;
+    }
 }
 
 /// A running subscriber. Dropping it aborts the subscriber's task.
@@ -119,7 +128,7 @@ where
 
 /// Spawn the dispatch loop for one handler.
 pub(crate) fn spawn<E: Event>(
-    mut signals: broadcast::Receiver<Message>,
+    mut signals: broadcast::Receiver<SignalDelivery>,
     config: EventBusConfig,
     handler: Arc<dyn EventHandler<E>>,
 ) -> SubscriptionHandle {
@@ -158,12 +167,13 @@ pub(crate) fn spawn<E: Event>(
                 }
             };
 
-            let Some(event) = crate::events::decode::<E>(&config, &message) else {
+            let Some(event) = crate::events::decode::<E>(&config, message.message()) else {
                 continue;
             };
 
-            if let Some(allowed) = &domains
-                && !allowed.iter().any(|d| d == event.domain())
+            if domains
+                .as_ref()
+                .is_some_and(|allowed| !allowed.iter().any(|d| d == event.domain()))
             {
                 continue;
             }
@@ -172,7 +182,7 @@ pub(crate) fn spawn<E: Event>(
             // task allocation and scheduling hop per event; `poll_fn` keeps the
             // future pinned, while `catch_unwind` covers panics from any poll.
             let outcome = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                handler.handle(&event)
+                handler.handle_with_context(&event, message.context())
             })) {
                 Ok(future) => catch_handler_panic(future).await,
                 Err(payload) => Err(payload),

@@ -27,7 +27,7 @@ use std::future::Future;
 use std::io::{self, Write};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -141,23 +141,60 @@ pub const SIGNAL_BUFFER: usize = 256;
 /// growth in the process doing the publishing.
 pub const OUTBOX_CAPACITY: usize = 1024;
 
+/// Reply identity is captured before sending, never inferred from its body.
+struct PendingReply {
+    sender: oneshot::Sender<Message>,
+    expected: Option<BusName>,
+    bus_control: bool,
+    confidential: bool,
+    unverified_direct: bool,
+}
+
+impl PendingReply {
+    fn accepts(&self, reply: &Message, brokered: bool) -> bool {
+        let sender = reply.header.sender.as_ref();
+        let broker_sender = sender.is_some_and(|sender| sender.as_str() == crate::BUS_NAME);
+        let identity_matches = if self.bus_control {
+            // Legacy broker control replies are unstamped; peers routed by a
+            // real broker can never send an unstamped frame.
+            sender.is_none() || broker_sender
+        } else if let Some(expected) = &self.expected {
+            sender == Some(expected)
+                || (reply.header.kind == MessageKind::Error && broker_sender)
+                || (self.unverified_direct && !brokered && sender.is_none())
+        } else {
+            // Raw direct transport compatibility has no authenticated peer
+            // identity. A proven broker delivery must not use this escape.
+            !brokered
+        };
+        identity_matches
+            && (reply.header.kind == MessageKind::Error
+                || !self.confidential
+                || reply.header.confidential)
+    }
+}
+
 struct Inner {
     transport: Arc<dyn Transport>,
+    brokered_native: bool,
+    native_provenance: Option<Arc<AtomicBool>>,
     /// Everything outbound goes through here and out via the writer task.
     /// Serialising writes through one task is also what lets `send` be called
     /// concurrently without interleaving two frames on the wire.
     outbox: mpsc::Sender<Message>,
     serial: AtomicU64,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Message>>>,
+    pending: Mutex<HashMap<u64, PendingReply>>,
     objects: RwLock<ObjectTree>,
     /// A *std* lock, not a tokio one, so a synchronous publisher can stamp
     /// the sender on a locally looped-back signal without an await.
     unique_name: std::sync::RwLock<Option<BusName>>,
     signals: broadcast::Sender<Message>,
+    signal_deliveries: broadcast::Sender<crate::SignalDelivery>,
+    local_publisher: crate::LocalPublisherIdentity,
     panic_handler: std::sync::RwLock<Option<Arc<dyn Fn() -> Error + Send + Sync>>>,
     /// Bulk streams being received. On the connection rather than in the object
     /// tree because a chunk has to be checked against the header's stamped
-    /// `sender`, and [`Interface`] deliberately never sees a header.
+    /// `sender`; interfaces receive only the verified subset in CallContext.
     streams: StreamRegistry,
 }
 
@@ -197,7 +234,58 @@ pub struct Connection {
     _close: Arc<CloseOnDrop>,
 }
 
+/// A non-owning connection reference for services issuing callbacks.
+///
+/// A served object must not retain its own strong connection: the connection
+/// owns that object tree, so doing so creates a cycle that keeps the service,
+/// transport and well-known name alive. Upgrade only for the duration of an
+/// actual callback. The reference never keeps the connection open or revives
+/// it after its last strong owner goes away.
+#[derive(Clone)]
+pub struct WeakConnection {
+    inner: std::sync::Weak<Inner>,
+    close: std::sync::Weak<CloseOnDrop>,
+}
+
+impl std::fmt::Debug for WeakConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakConnection")
+            .field("has_strong_owner", &(self.close.strong_count() != 0))
+            .finish_non_exhaustive()
+    }
+}
+
+impl WeakConnection {
+    /// Borrow an owning handle while another strong connection still exists.
+    ///
+    /// Dispatch tasks can retain internal state after the last public handle
+    /// drops. Upgrading the lifetime guard first prevents that state from
+    /// resurrecting a service whose transport is already being closed.
+    /// A still-owned but explicitly closed connection can be upgraded; calls
+    /// on it return the same closed-transport errors as its owning handles.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<Connection> {
+        let close = self.close.upgrade()?;
+        Some(Connection {
+            inner: self.inner.upgrade()?,
+            _close: close,
+        })
+    }
+}
+
 impl Connection {
+    /// Retain callback access without owning this connection's lifetime.
+    ///
+    /// Store this reference in objects served by the same connection to avoid
+    /// a connection/object ownership cycle. Upgrade it only while issuing work.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakConnection {
+        WeakConnection {
+            inner: Arc::downgrade(&self.inner),
+            close: Arc::downgrade(&self._close),
+        }
+    }
+
     /// Attach to the bus over `transport` and complete the `Hello` handshake.
     ///
     /// Returns once the broker has assigned a unique name, so
@@ -239,11 +327,57 @@ impl Connection {
     /// Used by the broker for its own side of a peer link, and by tests that
     /// drive the protocol by hand. Ordinary callers want
     /// [`Connection::connect`].
+    ///
+    /// This safe constructor grants no native routing authority. Concrete
+    /// memory links authenticate only deliveries sealed by the broker writer;
+    /// a public `Transport::send`, wrapper, or successful Hello cannot forge it.
     pub fn attach(transport: Arc<dyn Transport>) -> Self {
+        Self::attach_inner(transport, false, None)
+    }
+
+    /// Attach the module SDK's broker-proven C transport bridge.
+    ///
+    /// # Safety
+    /// The caller must guarantee every received frame comes exclusively from
+    /// a real TinyBus broker which overwrites sender on ingress. A successful
+    /// Hello, artifact attestation, or arbitrary C callback is insufficient.
+    /// This boundary is an unsafe trusted-host contract, not cryptographic
+    /// authentication against a malicious native host.
+    #[doc(hidden)]
+    pub unsafe fn __attach_brokered_module(transport: Arc<dyn Transport>) -> Self {
+        Self::attach_inner(transport, true, None)
+    }
+
+    /// Attach the SDK bridge with a separately captured proof for each frame.
+    ///
+    /// # Safety
+    /// The transport must have exactly one reader: this connection's dispatch
+    /// loop. Before returning each received frame it must publish that frame's
+    /// immutable delivery proof into `provenance`; nobody else may write the
+    /// slot. True must mean the trusted host asserted exclusive real broker
+    /// delivery when that frame entered the SDK queue, never later admission.
+    /// Header identity remains protocol data unless that proof is true.
+    /// This is a trusted native host contract, not cryptographic authentication.
+    #[doc(hidden)]
+    pub unsafe fn __attach_module_with_provenance(
+        transport: Arc<dyn Transport>,
+        provenance: Arc<AtomicBool>,
+    ) -> Self {
+        Self::attach_inner(transport, false, Some(provenance))
+    }
+
+    fn attach_inner(
+        transport: Arc<dyn Transport>,
+        brokered_native: bool,
+        native_provenance: Option<Arc<AtomicBool>>,
+    ) -> Self {
         let (signals, _) = broadcast::channel(SIGNAL_BUFFER);
+        let (signal_deliveries, _) = broadcast::channel(SIGNAL_BUFFER);
         let (outbox, outbound) = mpsc::channel(OUTBOX_CAPACITY);
         let inner = Arc::new(Inner {
             transport,
+            brokered_native,
+            native_provenance,
             outbox,
             // Serials start at 1: zero is the "unassigned" value a freshly
             // built `Message` carries, so it must never be a live serial.
@@ -252,6 +386,8 @@ impl Connection {
             objects: RwLock::new(ObjectTree::new()),
             unique_name: std::sync::RwLock::new(None),
             signals,
+            signal_deliveries,
+            local_publisher: crate::LocalPublisherIdentity::new(),
             panic_handler: std::sync::RwLock::new(None),
             streams: StreamRegistry::new(),
         });
@@ -292,6 +428,13 @@ impl Connection {
         message.header.sender = self.unique_name();
         // Fails only when nothing on this connection is subscribed, which is
         // the normal case for a write-only publisher.
+        let _ = self
+            .inner
+            .signal_deliveries
+            .send(crate::SignalDelivery::local(
+                message.clone(),
+                self.inner.local_publisher.clone(),
+            ));
         let _ = self.inner.signals.send(message);
     }
 
@@ -342,6 +485,11 @@ impl Connection {
     }
 
     /// What the broker has verified about whoever owns `name`.
+    ///
+    /// Accepts either an exact well-known name or a fixed unique peer. For an
+    /// admitted unique peer, the record retains the artifact's original manifest
+    /// name and digest across alias release; extra aliases remain unattested.
+    /// A name handover gives the successor no record, and detach removes it.
     ///
     /// The check a sender makes before it commits to handing over a secret.
     /// `None` means the bus will refuse a confidential message to that name —
@@ -590,6 +738,22 @@ impl Connection {
         self.inner.signals.subscribe()
     }
 
+    /// Subscribe to queued signal deliveries with immutable SDK provenance.
+    ///
+    /// Install broker match rules separately with add_match; subscribe before
+    /// installing the rule to avoid a delivery gap.
+    pub fn signal_deliveries(&self) -> broadcast::Receiver<crate::SignalDelivery> {
+        self.inner.signal_deliveries.subscribe()
+    }
+
+    /// Opaque local publisher identity, stable across this connection's clones.
+    ///
+    /// Admit it separately before using it to bind application work. It neither
+    /// authenticates remote headers nor grants tenant authority.
+    pub fn local_publisher_identity(&self) -> crate::LocalPublisherIdentity {
+        self.inner.local_publisher.clone()
+    }
+
     /// Broadcast a signal. Returns as soon as the broker has it; there is no
     /// delivery confirmation, by design — a signal nobody subscribed to is not
     /// a failure.
@@ -660,9 +824,29 @@ impl Connection {
         Ok(self.call_raw_message(message, timeout).await?.body)
     }
 
+    async fn call_bus_with_timeout(
+        &self,
+        member: &str,
+        body: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        self.call_raw(
+            Message::method_call(
+                BusName::new(crate::BUS_NAME)?,
+                ObjectPath::new(crate::BUS_PATH)?,
+                InterfaceName::new(crate::BUS_INTERFACE)?,
+                MemberName::new(member)?,
+                body,
+            ),
+            timeout,
+        )
+        .await
+    }
+
     async fn call_raw_message(&self, mut message: Message, timeout: Duration) -> Result<Message> {
-        let serial = self.inner.serial.fetch_add(1, Ordering::Relaxed);
-        message.header.serial = serial;
+        // Validate without consuming the outbound serial: alias negotiation
+        // must precede the call on the wire and in the serial sequence.
+        message.header.serial = 1;
         message.validate()?;
         if message.header.confidential && message.header.stream_reply {
             return Err(Error::protocol(
@@ -685,16 +869,65 @@ impl Connection {
             ));
         }
         let member = message.member_or_unknown();
+        let started = tokio::time::Instant::now();
+        let destination = message.header.destination.clone();
+        let bus_control = destination
+            .as_ref()
+            .is_some_and(|name| name.as_str() == crate::BUS_NAME);
+        let expected = if bus_control {
+            None
+        } else if let Some(destination) = destination {
+            if destination.is_unique() {
+                Some(destination)
+            } else if self.unique_name().is_some() {
+                let owner: BusName = serde_json::from_value(
+                    Box::pin(self.call_bus_with_timeout(
+                        "ResolveCallTarget",
+                        serde_json::json!([destination]),
+                        timeout,
+                    ))
+                    .await?,
+                )?;
+                if !owner.is_unique() {
+                    return Err(Error::protocol("broker returned a non-unique call target"));
+                }
+                if message
+                    .header
+                    .expected_responder
+                    .as_ref()
+                    .is_some_and(|expected| expected != &owner)
+                {
+                    return Err(Error::NameHasNoOwner(destination));
+                }
+                message.header.expected_responder = Some(owner.clone());
+                Some(owner)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
+        let serial = self.inner.serial.fetch_add(1, Ordering::Relaxed);
+        message.header.serial = serial;
         let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().await.insert(serial, tx);
+        self.inner.pending.lock().await.insert(
+            serial,
+            PendingReply {
+                sender: tx,
+                expected,
+                bus_control,
+                confidential: message.header.confidential,
+                unverified_direct: self.unique_name().is_none(),
+            },
+        );
 
         if let Err(e) = self.enqueue(message).await {
             self.inner.pending.lock().await.remove(&serial);
             return Err(e);
         }
 
-        match tokio::time::timeout(timeout, rx).await {
+        match tokio::time::timeout(timeout.saturating_sub(started.elapsed()), rx).await {
             Ok(Ok(reply)) => match reply.header.kind {
                 MessageKind::Error => Err(reply.into_error()),
                 _ => Ok(reply),
@@ -832,18 +1065,22 @@ impl Connection {
         descriptor: StreamDescriptor,
         timeout: Duration,
     ) -> Result<StreamWriter> {
-        let id: String = serde_json::from_value(
-            self.call_stream_member(
+        let reply = self
+            .call_stream_member_message(
                 destination,
                 "Open",
                 serde_json::json!([descriptor]),
                 timeout,
             )
-            .await?,
-        )?;
+            .await?;
+        let id: String = serde_json::from_value(reply.body)?;
+        // The stream belongs to this responder for its whole lifetime, even
+        // if the well-known name moves before the next chunk. Direct raw
+        // transports with no stamped sender retain their original address.
+        let destination = reply.header.sender.unwrap_or_else(|| destination.clone());
         Ok(StreamWriter::new(
             self.clone(),
-            destination.clone(),
+            destination,
             id,
             descriptor,
             timeout,
@@ -1021,6 +1258,19 @@ impl Connection {
         args: Value,
         timeout: Duration,
     ) -> Result<Value> {
+        Ok(self
+            .call_stream_member_message(destination, member, args, timeout)
+            .await?
+            .body)
+    }
+
+    async fn call_stream_member_message(
+        &self,
+        destination: &BusName,
+        member: &str,
+        args: Value,
+        timeout: Duration,
+    ) -> Result<Message> {
         let message = Message::method_call(
             destination.clone(),
             ObjectPath::new(STREAM_PATH)?,
@@ -1028,7 +1278,7 @@ impl Connection {
             MemberName::new(member)?,
             args,
         );
-        self.call_raw(message, timeout).await
+        self.call_raw_message(message, timeout).await
     }
 
     /// Call a method on the broker's own interface.
@@ -1119,8 +1369,26 @@ async fn writer_loop(transport: Arc<dyn Transport>, mut outbound: mpsc::Receiver
 /// The single reader task. Owns `recv`; never awaits user code inline.
 async fn dispatch_loop(inner: Arc<Inner>) {
     loop {
-        let message = match inner.transport.recv().await {
-            Ok(Some(message)) => message,
+        let delivery = if let Some(memory) = crate::transport::downcast::<
+            crate::transport::memory::MemoryTransport,
+        >(inner.transport.as_ref())
+        {
+            memory.recv_with_provenance().await
+        } else {
+            inner.transport.recv().await.map(|message| {
+                message.map(|message| {
+                    // The exclusive reader samples the proof immediately after
+                    // recv, before any await or next recv can replace its slot.
+                    let brokered = inner
+                        .native_provenance
+                        .as_ref()
+                        .map_or(inner.brokered_native, |proof| proof.load(Ordering::Acquire));
+                    (message, brokered)
+                })
+            })
+        };
+        let (message, brokered) = match delivery {
+            Ok(Some(delivery)) => delivery,
             Ok(None) => break,
             Err(e) => {
                 tracing::debug!(error = %e, "connection read failed; closing");
@@ -1136,19 +1404,28 @@ async fn dispatch_loop(inner: Arc<Inner>) {
                 };
                 // An unmatched reply is a timed-out call arriving late. Normal,
                 // and nothing to do but drop it.
-                if let Some(waiter) = inner.pending.lock().await.remove(&serial) {
-                    let _ = waiter.send(message);
+                let mut pending = inner.pending.lock().await;
+                if pending
+                    .get(&serial)
+                    .is_some_and(|waiter| waiter.accepts(&message, brokered))
+                {
+                    if let Some(waiter) = pending.remove(&serial) {
+                        let _ = waiter.sender.send(message);
+                    }
                 }
             }
             MessageKind::Signal => {
                 // `send` fails only when nobody is subscribed, which is the
                 // common case for a service that emits but never listens.
+                let _ = inner
+                    .signal_deliveries
+                    .send(crate::SignalDelivery::received(message.clone(), brokered));
                 let _ = inner.signals.send(message);
             }
             MessageKind::MethodCall => {
                 // Spawned, so a long-running method does not block replies to
                 // calls this connection has outstanding.
-                tokio::spawn(handle_call(inner.clone(), message));
+                tokio::spawn(handle_call(inner.clone(), message, brokered));
             }
         }
     }
@@ -1159,7 +1436,7 @@ async fn dispatch_loop(inner: Arc<Inner>) {
 }
 
 /// Run one inbound method call and send its reply.
-async fn handle_call(inner: Arc<Inner>, message: Message) {
+async fn handle_call(inner: Arc<Inner>, message: Message, brokered: bool) {
     let header = message.header.clone();
     let panic_handler = inner
         .panic_handler
@@ -1171,12 +1448,12 @@ async fn handle_call(inner: Arc<Inner>, message: Message) {
             "a confidential call cannot request a streamed reply",
         ))
     } else if let Some(panic_handler) = panic_handler {
-        match CatchUnwind::new(dispatch(&inner, &header, message.body)).await {
+        match CatchUnwind::new(dispatch(&inner, &header, message.body, brokered)).await {
             Ok(result) => result,
             Err(()) => Err(panic_handler()),
         }
     } else {
-        dispatch(&inner, &header, message.body).await
+        dispatch(&inner, &header, message.body, brokered).await
     };
 
     let result = match result {
@@ -1282,7 +1559,7 @@ impl<F: Future> Future for CatchUnwind<F> {
     }
 }
 
-async fn dispatch(inner: &Inner, header: &Header, body: Value) -> Result<Value> {
+async fn dispatch(inner: &Inner, header: &Header, body: Value, brokered: bool) -> Result<Value> {
     // Streams are answered before the object tree is consulted, and without the
     // service having exported anything: bulk transfer is bus plumbing, and a
     // service that forgot to export it would be a service you cannot send a
@@ -1297,17 +1574,36 @@ async fn dispatch(inner: &Inner, header: &Header, body: Value) -> Result<Value> 
     else {
         return Err(Error::protocol("method call is missing an address"));
     };
-    // Hold the tree lock only long enough to retain the selected interface.
-    // A method can serve or remove objects on this same connection; awaiting
-    // user code while holding the read guard would deadlock that write.
+    let context = if brokered {
+        crate::CallContext::brokered(header.sender.as_ref())
+    } else {
+        crate::CallContext::default()
+    };
+    // Snapshot admission under the lock, then release it before user code:
+    // callbacks can register/unserve interfaces while another call is parked.
     let target = {
         let objects = inner.objects.read().await;
         objects.lookup(path, interface)?
     };
-    crate::service::tree::dispatch_resolved(target, interface, member, body, header.confidential)
-        .await
+    ObjectTree::invoke(
+        target,
+        interface,
+        member,
+        body,
+        header.confidential,
+        &context,
+    )
+    .await
 }
 
 #[cfg(test)]
 #[path = "connection_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "connection_reply_tests.rs"]
+mod reply_tests;
+
+#[cfg(test)]
+#[path = "connection_signal_tests.rs"]
+mod signal_tests;

@@ -369,6 +369,10 @@ impl ModuleHost {
     }
 
     /// Load one newly installed module.
+    ///
+    /// A verified operator allowlist admits confidential delivery to the exact
+    /// manifest name and this module's fixed unique peer. It does not attest
+    /// extra aliases or grant caller authority. See [`crate::attest`].
     pub fn load_file(&self, path: impl AsRef<Path>) -> Result<ModuleInfo> {
         self.load_file_with_config(path, serde_json::json!({}))
     }
@@ -482,6 +486,9 @@ impl ModuleHost {
     /// This is the testable seam beneath `dlopen`: callers must ensure `init`
     /// and every pointer reachable through it remain valid for the process
     /// lifetime, exactly as the real loader does by leaking its handle.
+    /// No digest is supplied by this API: any recipient attestation comes from
+    /// an allowlist beside `file`, not from the descriptor or callback itself.
+    /// Broker attachment establishes delivery provenance separately.
     ///
     /// # Safety
     ///
@@ -528,7 +535,9 @@ impl ModuleHost {
     ///
     /// The executable's digest identifies the admitted code in the ordinary
     /// attestation response. This is host trust, not a digest of a separate
-    /// library or a claim made by the module itself.
+    /// library or a claim made by the module itself. The record applies to the
+    /// manifest name and fixed unique peer, not additional aliases; recipient
+    /// admission alone does not grant incoming callers permission.
     ///
     /// # Errors
     /// Returns an error if the host executable cannot be hashed or the module
@@ -1582,7 +1591,13 @@ impl ModuleControl for ModuleHostInner {
         let loaded = self.loaded.lock().expect("module list lock");
         let loaded_info = loaded
             .iter()
-            .find(|module| &module.info.manifest.bus_name == bus_name)
+            .find(|module| {
+                if bus_name.is_unique() {
+                    &module.unique_name == bus_name
+                } else {
+                    &module.info.manifest.bus_name == bus_name
+                }
+            })
             .map(LoadedModule::snapshot);
         drop(loaded);
         let info = loaded_info.or_else(|| {

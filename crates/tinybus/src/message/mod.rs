@@ -59,10 +59,16 @@ pub struct Header {
     pub reply_serial: Option<u64>,
     /// Stamped by the broker, never trusted from the peer.
     ///
-    /// A service authorising a call reads this field; if peers could set it,
-    /// every authorisation decision on the bus would be forgeable.
+    /// Caller authorization uses `CallContext::authenticated_sender`, which
+    /// also verifies delivery provenance. Direct transports can supply arbitrary
+    /// headers, so this wire field alone is not authenticated authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender: Option<BusName>,
+    /// Conditional call routing: deliver only while this unique peer owns the
+    /// destination. Optional on the wire; guarded clients require the broker's
+    /// `ResolveCallTarget` method before relying on this restriction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_responder: Option<BusName>,
     /// Who the message is for. `None` on signals, which are broadcast.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<BusName>,
@@ -140,6 +146,7 @@ impl Message {
                 serial: 0,
                 reply_serial: None,
                 sender: None,
+                expected_responder: None,
                 destination: Some(destination),
                 path: Some(path),
                 interface: Some(interface),
@@ -209,6 +216,7 @@ impl Message {
                 serial: 0,
                 reply_serial: Some(call.serial),
                 sender: None,
+                expected_responder: None,
                 // Replies are addressed back at the *unique* name the broker
                 // stamped, not at whatever well-known name the caller happens
                 // to own — the caller may have released it mid-call.
@@ -240,6 +248,7 @@ impl Message {
                 serial: 0,
                 reply_serial: Some(call.serial),
                 sender: None,
+                expected_responder: None,
                 destination: call.sender.clone(),
                 path: None,
                 interface: None,
@@ -271,6 +280,7 @@ impl Message {
                 serial: 0,
                 reply_serial: None,
                 sender: None,
+                expected_responder: None,
                 destination: None,
                 path: Some(path),
                 interface: Some(interface),
@@ -323,6 +333,18 @@ impl Message {
         if self.header.stream_reply && self.header.kind != MessageKind::MethodCall {
             return Err(Error::protocol(
                 "only a method call can request a streamed reply",
+            ));
+        }
+        if self
+            .header
+            .expected_responder
+            .as_ref()
+            .is_some_and(|expected| {
+                self.header.kind != MessageKind::MethodCall || !expected.is_unique()
+            })
+        {
+            return Err(Error::protocol(
+                "expected responder must be unique and only accompany a call",
             ));
         }
         // Checked before the per-kind rules, and checked on ingress rather than
