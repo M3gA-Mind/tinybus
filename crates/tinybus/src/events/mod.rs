@@ -215,7 +215,7 @@ impl<E: Event> EventBus<E> {
     /// Synchronous, for the same reason `publish` is: subscribers are
     /// registered during startup, from code that is not always async.
     pub fn subscribe(&self, handler: Arc<dyn EventHandler<E>>) -> SubscriptionHandle {
-        subscriber::spawn(self.connection.signals(), self.config.clone(), handler)
+        subscriber::spawn(self.connection.signal_deliveries(), self.config.clone(), handler)
     }
 
     /// Subscribe with a closure instead of an [`EventHandler`] implementation.
