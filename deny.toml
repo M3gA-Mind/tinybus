@@ -4,7 +4,7 @@ all-features = true
 [advisories]
 
 [licenses]
-# Licenses accepted for this MIT workspace and its third-party dependencies.
+# GPL applies to the owned TinyBus crates; third-party dependencies stay permissive.
 allow = [
     # Public CA root data and permissive dependency code licenses.
     "CDLA-Permissive-2.0",
@@ -13,9 +13,6 @@ allow = [
     "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    # constant_time_eq 0.1.5, via ppt-rs -> zip 0.6.6. A public-domain
-    # dedication — strictly more permissive than the rest of this list, and it
-    # imposes no obligation on a GPL-3.0-only crate.
     "CC0-1.0",
     "ISC",
     "MIT",
@@ -24,6 +21,11 @@ allow = [
     "Zlib",
 ]
 confidence-threshold = 0.9
+exceptions = [
+    { name = "tinybus", allow = ["GPL-3.0-only"] },
+    { name = "tinybus-macros", allow = ["GPL-3.0-only"] },
+    { name = "tinybus-module", allow = ["GPL-3.0-only"] },
+]
 
 [bans]
 # Duplicate versions bloat build times; review them rather than ignoring them.
