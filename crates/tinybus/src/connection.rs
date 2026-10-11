@@ -141,6 +141,39 @@ pub const SIGNAL_BUFFER: usize = 256;
 /// growth in the process doing the publishing.
 pub const OUTBOX_CAPACITY: usize = 1024;
 
+/// Reply identity is captured before sending, never inferred from its body.
+struct PendingReply {
+    sender: oneshot::Sender<Message>,
+    expected: Option<BusName>,
+    bus_control: bool,
+    confidential: bool,
+    unverified_direct: bool,
+}
+
+impl PendingReply {
+    fn accepts(&self, reply: &Message, brokered: bool) -> bool {
+        let sender = reply.header.sender.as_ref();
+        let broker_sender = sender.is_some_and(|sender| sender.as_str() == crate::BUS_NAME);
+        let identity_matches = if self.bus_control {
+            // Legacy broker control replies are unstamped; peers routed by a
+            // real broker can never send an unstamped frame.
+            sender.is_none() || broker_sender
+        } else if let Some(expected) = &self.expected {
+            sender == Some(expected)
+                || (reply.header.kind == MessageKind::Error && broker_sender)
+                || (self.unverified_direct && !brokered && sender.is_none())
+        } else {
+            // Raw direct transport compatibility has no authenticated peer
+            // identity. A proven broker delivery must not use this escape.
+            !brokered
+        };
+        identity_matches
+            && (reply.header.kind == MessageKind::Error
+                || !self.confidential
+                || reply.header.confidential)
+    }
+}
+
 struct Inner {
     transport: Arc<dyn Transport>,
     brokered_native: bool,
@@ -150,7 +183,7 @@ struct Inner {
     /// concurrently without interleaving two frames on the wire.
     outbox: mpsc::Sender<Message>,
     serial: AtomicU64,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Message>>>,
+    pending: Mutex<HashMap<u64, PendingReply>>,
     objects: RwLock<ObjectTree>,
     /// A *std* lock, not a tokio one, so a synchronous publisher can stamp
     /// the sender on a locally looped-back signal without an await.
@@ -712,9 +745,29 @@ impl Connection {
         Ok(self.call_raw_message(message, timeout).await?.body)
     }
 
+    async fn call_bus_with_timeout(
+        &self,
+        member: &str,
+        body: Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        self.call_raw(
+            Message::method_call(
+                BusName::new(crate::BUS_NAME)?,
+                ObjectPath::new(crate::BUS_PATH)?,
+                InterfaceName::new(crate::BUS_INTERFACE)?,
+                MemberName::new(member)?,
+                body,
+            ),
+            timeout,
+        )
+        .await
+    }
+
     async fn call_raw_message(&self, mut message: Message, timeout: Duration) -> Result<Message> {
-        let serial = self.inner.serial.fetch_add(1, Ordering::Relaxed);
-        message.header.serial = serial;
+        // Validate without consuming the outbound serial: alias negotiation
+        // must precede the call on the wire and in the serial sequence.
+        message.header.serial = 1;
         message.validate()?;
         if message.header.confidential && message.header.stream_reply {
             return Err(Error::protocol(
@@ -737,16 +790,65 @@ impl Connection {
             ));
         }
         let member = message.member_or_unknown();
+        let started = tokio::time::Instant::now();
+        let destination = message.header.destination.clone();
+        let bus_control = destination
+            .as_ref()
+            .is_some_and(|name| name.as_str() == crate::BUS_NAME);
+        let expected = if bus_control {
+            None
+        } else if let Some(destination) = destination {
+            if destination.is_unique() {
+                Some(destination)
+            } else if self.unique_name().is_some() {
+                let owner: BusName = serde_json::from_value(
+                    Box::pin(self.call_bus_with_timeout(
+                        "ResolveCallTarget",
+                        serde_json::json!([destination]),
+                        timeout,
+                    ))
+                    .await?,
+                )?;
+                if !owner.is_unique() {
+                    return Err(Error::protocol("broker returned a non-unique call target"));
+                }
+                if message
+                    .header
+                    .expected_responder
+                    .as_ref()
+                    .is_some_and(|expected| expected != &owner)
+                {
+                    return Err(Error::NameHasNoOwner(destination));
+                }
+                message.header.expected_responder = Some(owner.clone());
+                Some(owner)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
+        let serial = self.inner.serial.fetch_add(1, Ordering::Relaxed);
+        message.header.serial = serial;
         let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().await.insert(serial, tx);
+        self.inner.pending.lock().await.insert(
+            serial,
+            PendingReply {
+                sender: tx,
+                expected,
+                bus_control,
+                confidential: message.header.confidential,
+                unverified_direct: self.unique_name().is_none(),
+            },
+        );
 
         if let Err(e) = self.enqueue(message).await {
             self.inner.pending.lock().await.remove(&serial);
             return Err(e);
         }
 
-        match tokio::time::timeout(timeout, rx).await {
+        match tokio::time::timeout(timeout.saturating_sub(started.elapsed()), rx).await {
             Ok(Ok(reply)) => match reply.header.kind {
                 MessageKind::Error => Err(reply.into_error()),
                 _ => Ok(reply),
@@ -884,18 +986,22 @@ impl Connection {
         descriptor: StreamDescriptor,
         timeout: Duration,
     ) -> Result<StreamWriter> {
-        let id: String = serde_json::from_value(
-            self.call_stream_member(
+        let reply = self
+            .call_stream_member_message(
                 destination,
                 "Open",
                 serde_json::json!([descriptor]),
                 timeout,
             )
-            .await?,
-        )?;
+            .await?;
+        let id: String = serde_json::from_value(reply.body)?;
+        // The stream belongs to this responder for its whole lifetime, even
+        // if the well-known name moves before the next chunk. Direct raw
+        // transports with no stamped sender retain their original address.
+        let destination = reply.header.sender.unwrap_or_else(|| destination.clone());
         Ok(StreamWriter::new(
             self.clone(),
-            destination.clone(),
+            destination,
             id,
             descriptor,
             timeout,
@@ -1073,6 +1179,19 @@ impl Connection {
         args: Value,
         timeout: Duration,
     ) -> Result<Value> {
+        Ok(self
+            .call_stream_member_message(destination, member, args, timeout)
+            .await?
+            .body)
+    }
+
+    async fn call_stream_member_message(
+        &self,
+        destination: &BusName,
+        member: &str,
+        args: Value,
+        timeout: Duration,
+    ) -> Result<Message> {
         let message = Message::method_call(
             destination.clone(),
             ObjectPath::new(STREAM_PATH)?,
@@ -1080,7 +1199,7 @@ impl Connection {
             MemberName::new(member)?,
             args,
         );
-        self.call_raw(message, timeout).await
+        self.call_raw_message(message, timeout).await
     }
 
     /// Call a method on the broker's own interface.
@@ -1206,8 +1325,14 @@ async fn dispatch_loop(inner: Arc<Inner>) {
                 };
                 // An unmatched reply is a timed-out call arriving late. Normal,
                 // and nothing to do but drop it.
-                if let Some(waiter) = inner.pending.lock().await.remove(&serial) {
-                    let _ = waiter.send(message);
+                let mut pending = inner.pending.lock().await;
+                if pending
+                    .get(&serial)
+                    .is_some_and(|waiter| waiter.accepts(&message, brokered))
+                {
+                    if let Some(waiter) = pending.remove(&serial) {
+                        let _ = waiter.sender.send(message);
+                    }
                 }
             }
             MessageKind::Signal => {
@@ -1389,3 +1514,7 @@ async fn dispatch(inner: &Inner, header: &Header, body: Value, brokered: bool) -
 #[cfg(test)]
 #[path = "connection_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "connection_reply_tests.rs"]
+mod reply_tests;

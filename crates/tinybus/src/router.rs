@@ -483,6 +483,24 @@ impl Router {
         Ok(peer.outbox.clone())
     }
 
+    /// Compare a captured unique owner and select the destination under one
+    /// routing lock, preserving recipient attestation for confidential calls.
+    pub(crate) fn resolve_call(
+        &self,
+        destination: &BusName,
+        expected: Option<&BusName>,
+        confidential: bool,
+    ) -> Result<mpsc::Sender<Message>> {
+        if expected.is_some_and(|expected| self.owner_of(destination).as_ref() != Some(expected)) {
+            return Err(Error::NameHasNoOwner(destination.clone()));
+        }
+        if confidential {
+            self.resolve_attested(destination)
+        } else {
+            self.resolve(destination)
+        }
+    }
+
     /// The outbox of whoever owns `destination`.
     pub fn resolve(&self, destination: &BusName) -> Result<mpsc::Sender<Message>> {
         let id = self
