@@ -714,3 +714,73 @@ async fn unserve_stops_new_admission_but_preserves_an_already_admitted_call() {
     release.notify_one();
     assert_eq!(active.await.unwrap().unwrap(), serde_json::json!([1]));
 }
+
+/// A served object needs its connection to issue callbacks, but must not own it.
+struct CallbackConnection {
+    connection: Connection,
+    dropped: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Drop for CallbackConnection {
+    fn drop(&mut self) {
+        self.dropped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl Interface for CallbackConnection {
+    fn name(&self) -> InterfaceName {
+        InterfaceName::new("ai.test.Callback").unwrap()
+    }
+    fn members(&self) -> Vec<MemberName> {
+        vec![MemberName::new("Owner").unwrap()]
+    }
+    async fn call(&self, _member: &MemberName, _args: Value) -> Result<Value> {
+        Ok(serde_json::json!(
+            self.connection.unique_name().map(ToString::to_string)
+        ))
+    }
+}
+
+#[tokio::test]
+async fn callback_connection_does_not_keep_its_served_object_and_bus_name_alive() -> Result<()> {
+    let bus = MemoryBus::new();
+    Broker::new().spawn(bus.clone());
+    let service = Connection::connect(bus.connect().await?).await?;
+    let client = Connection::connect(bus.connect().await?).await?;
+    let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    service
+        .serve_at(
+            ObjectPath::new("/test/Callback")?,
+            CallbackConnection {
+                connection: service.clone(),
+                dropped: dropped.clone(),
+            },
+        )
+        .await?;
+    service.request_name("ai.test.Callback").await?;
+    let owner: Option<String> = client
+        .proxy("ai.test.Callback", "/test/Callback", "ai.test.Callback")?
+        .call("Owner", ())
+        .await?;
+    assert_eq!(owner, service.unique_name().map(ToString::to_string));
+    drop(service);
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if dropped.load(std::sync::atomic::Ordering::SeqCst)
+                && !client
+                    .list_names()
+                    .await?
+                    .iter()
+                    .any(|name| name.as_str() == "ai.test.Callback")
+            {
+                return Result::Ok(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| Error::failed("callback connection retained its object/name"))??;
+    Ok(())
+}
