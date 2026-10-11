@@ -96,6 +96,7 @@ struct LoadedModule {
     transition_from: Option<ModuleState>,
     descriptor_info: Option<DescriptorInfo>,
     lifecycle_busy: bool,
+    callback_config: Option<serde_json::Value>,
 }
 
 enum PendingModule {
@@ -1154,6 +1155,7 @@ impl ModuleHost {
                 transition_from: None,
                 descriptor_info,
                 lifecycle_busy: false,
+                callback_config: None,
             });
         Ok(admitted)
     }
@@ -1383,6 +1385,9 @@ impl ModuleControl for ModuleHostInner {
                 .find(|module| module.info.name == name)
                 .ok_or_else(|| Error::failed("module is not loaded"))?;
             let old = module.snapshot().state;
+            if module.callback_config.as_ref().is_some_and(|initial| initial != &config) {
+                return Err(Error::failed("scoped callback configuration is immutable"));
+            }
             if module.lifecycle_busy {
                 return Err(Error::failed(
                     "module lifecycle operation is already running",
@@ -2623,3 +2628,6 @@ mod tests;
 #[cfg(test)]
 #[path = "host_admission_tests.rs"]
 mod admission_tests;
+
+#[path = "host_callbacks.rs"]
+pub(crate) mod callbacks;

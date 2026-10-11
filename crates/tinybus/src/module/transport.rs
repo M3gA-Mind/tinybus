@@ -186,7 +186,7 @@ impl ModuleTransport {
         });
     }
 
-    async fn ensure_initialized(&self) -> Result<()> {
+    pub(crate) async fn ensure_initialized(&self) -> Result<()> {
         let result = self
             .init_result
             .get_or_init(|| async {
