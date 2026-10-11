@@ -432,3 +432,42 @@ async fn a_module_fault_revokes_dispatch_authority_before_peer_detach() {
     );
     assert!(resolves(&router, &call(&state)).is_err());
 }
+
+#[tokio::test]
+async fn restricted_outgoing_handle_preserves_typed_calls_and_metadata() {
+    let broker = Broker::new();
+    let host = ModuleHost::new(broker.clone());
+    let binding = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
+    let outgoing = binding
+        .proxy(
+            "org.freedesktop.DBus",
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+        )
+        .unwrap()
+        .with_timeout(Duration::from_secs(1));
+    assert_eq!(outgoing.destination().as_str(), "org.freedesktop.DBus");
+    assert_eq!(outgoing.path().as_str(), "/org/freedesktop/DBus");
+    assert_eq!(outgoing.interface().as_str(), "org.freedesktop.DBus");
+    let names: Vec<BusName> = outgoing.clone().call("ListNames", ()).await.unwrap();
+    assert!(names.contains(binding.unique_name()));
+    let streamed: Vec<BusName> = outgoing.call_streaming("ListNames", ()).await.unwrap();
+    assert_eq!(names, streamed);
+    assert!(
+        outgoing
+            .call_confidential::<serde_json::Value>("ListNames", ())
+            .await
+            .is_err()
+    );
+    assert!(
+        outgoing
+            .call_sensitive::<serde_json::Value>("ListNames", ())
+            .await
+            .is_err()
+    );
+    assert!(outgoing.attestation().await.unwrap().is_none());
+    assert!(outgoing.is_available().await.unwrap());
+    let _signals = outgoing.receive_signal("NameOwnerChanged").await.unwrap();
+    assert!(format!("{outgoing:?}").contains("HostCallbackProxy"));
+    binding.close().await.unwrap();
+}
