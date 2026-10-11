@@ -232,7 +232,58 @@ pub struct Connection {
     _close: Arc<CloseOnDrop>,
 }
 
+/// A non-owning connection reference for services issuing callbacks.
+///
+/// A served object must not retain its own strong connection: the connection
+/// owns that object tree, so doing so creates a cycle that keeps the service,
+/// transport and well-known name alive. Upgrade only for the duration of an
+/// actual callback. The reference never keeps the connection open or revives
+/// it after its last strong owner goes away.
+#[derive(Clone)]
+pub struct WeakConnection {
+    inner: std::sync::Weak<Inner>,
+    close: std::sync::Weak<CloseOnDrop>,
+}
+
+impl std::fmt::Debug for WeakConnection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WeakConnection")
+            .field("has_strong_owner", &(self.close.strong_count() != 0))
+            .finish_non_exhaustive()
+    }
+}
+
+impl WeakConnection {
+    /// Borrow an owning handle while another strong connection still exists.
+    ///
+    /// Dispatch tasks can retain internal state after the last public handle
+    /// drops. Upgrading the lifetime guard first prevents that state from
+    /// resurrecting a service whose transport is already being closed.
+    /// A still-owned but explicitly closed connection can be upgraded; calls
+    /// on it return the same closed-transport errors as its owning handles.
+    #[must_use]
+    pub fn upgrade(&self) -> Option<Connection> {
+        let close = self.close.upgrade()?;
+        Some(Connection {
+            inner: self.inner.upgrade()?,
+            _close: close,
+        })
+    }
+}
+
 impl Connection {
+    /// Retain callback access without owning this connection's lifetime.
+    ///
+    /// Store this reference in objects served by the same connection to avoid
+    /// a connection/object ownership cycle. Upgrade it only while issuing work.
+    #[must_use]
+    pub fn downgrade(&self) -> WeakConnection {
+        WeakConnection {
+            inner: Arc::downgrade(&self.inner),
+            close: Arc::downgrade(&self._close),
+        }
+    }
+
     /// Attach to the bus over `transport` and complete the `Hello` handshake.
     ///
     /// Returns once the broker has assigned a unique name, so

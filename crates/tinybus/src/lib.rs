@@ -92,7 +92,7 @@ pub mod version;
 pub mod __private;
 
 pub use crate::attest::Attestation;
-pub use crate::connection::Connection;
+pub use crate::connection::{Connection, WeakConnection};
 pub use crate::error::{Error, Result};
 pub use crate::events::{
     Event, EventBus, EventBusConfig, EventHandler, EventReceiver, SubscriptionHandle, TryRecvError,
