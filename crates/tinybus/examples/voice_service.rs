@@ -22,10 +22,11 @@
 //! a real integration does.
 
 #[cfg(not(unix))]
-fn main() {
+fn main() -> std::process::ExitCode {
     eprintln!(
         "voice_service requires Unix domain sockets; use the in-process transport on Windows"
     );
+    std::process::ExitCode::FAILURE
 }
 
 #[cfg(unix)]
