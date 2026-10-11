@@ -217,6 +217,22 @@ async fn revoke_after_route_selection_blocks_dispatch_and_direct_unverified_disp
     };
     assert!(
         guarded
+            .call(&endpoint().members[0], serde_json::json!([]))
+            .await
+            .is_err()
+    );
+    assert!(
+        guarded
+            .call_with_context(
+                &endpoint().members[0],
+                serde_json::json!([]),
+                &CallContext::brokered(state.module_peer().as_ref(), false)
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        guarded
             .call_with_context(
                 &endpoint().members[0],
                 serde_json::json!([]),
