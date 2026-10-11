@@ -103,6 +103,35 @@ impl SignalDelivery {
             context: SignalContext::default(),
         }
     }
+    pub(crate) fn received(message: Message, brokered: bool) -> Self {
+        if !brokered {
+            return Self::unverified(message);
+        }
+        let sender = message
+            .header
+            .sender
+            .as_ref()
+            .filter(|name| name.is_unique())
+            .cloned();
+        Self {
+            message,
+            context: SignalContext {
+                origin: SignalOrigin::Brokered,
+                sender,
+                local_publisher: None,
+            },
+        }
+    }
+    pub(crate) fn local(message: Message, publisher: LocalPublisherIdentity) -> Self {
+        Self {
+            message,
+            context: SignalContext {
+                origin: SignalOrigin::Local,
+                sender: None,
+                local_publisher: Some(publisher),
+            },
+        }
+    }
     /// Protocol data, including untrusted body and header values.
     pub fn message(&self) -> &Message {
         &self.message

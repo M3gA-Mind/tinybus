@@ -431,7 +431,10 @@ impl Connection {
         let _ = self
             .inner
             .signal_deliveries
-            .send(crate::SignalDelivery::unverified(message.clone()));
+            .send(crate::SignalDelivery::local(
+                message.clone(),
+                self.inner.local_publisher.clone(),
+            ));
         let _ = self.inner.signals.send(message);
     }
 
@@ -1416,7 +1419,7 @@ async fn dispatch_loop(inner: Arc<Inner>) {
                 // common case for a service that emits but never listens.
                 let _ = inner
                     .signal_deliveries
-                    .send(crate::SignalDelivery::unverified(message.clone()));
+                    .send(crate::SignalDelivery::received(message.clone(), brokered));
                 let _ = inner.signals.send(message);
             }
             MessageKind::MethodCall => {
