@@ -57,6 +57,8 @@ pub(crate) struct ModuleTransport {
     // let a second lifecycle callback overlap the still-running first one.
     lifecycle: Arc<Mutex<()>>,
     stop_task_spawned: Arc<AtomicBool>,
+    initialization_gate: StdMutex<Option<bool>>,
+    initialization_gate_changed: Notify,
 }
 
 // `module_ctx` is opaque and all access to it goes through callbacks whose ABI
@@ -127,6 +129,8 @@ impl ModuleTransport {
             drain_started: AtomicBool::new(false),
             lifecycle: Arc::new(Mutex::new(())),
             stop_task_spawned: Arc::new(AtomicBool::new(false)),
+            initialization_gate: StdMutex::new(Some(true)),
+            initialization_gate_changed: Notify::new(),
         });
         let config = context.config.lock().expect("module config lock");
         let config_slice = crate::module::abi::TbSlice {
@@ -186,7 +190,35 @@ impl ModuleTransport {
         });
     }
 
+    pub(crate) fn pause_initialization(&self) {
+        *self
+            .initialization_gate
+            .lock()
+            .expect("initialization gate lock") = None;
+    }
+
+    pub(crate) fn release_initialization(&self, allowed: bool) {
+        *self
+            .initialization_gate
+            .lock()
+            .expect("initialization gate lock") = Some(allowed);
+        self.initialization_gate_changed.notify_waiters();
+    }
+
     pub(crate) async fn ensure_initialized(&self) -> Result<()> {
+        loop {
+            let changed = self.initialization_gate_changed.notified();
+            let allowed = *self
+                .initialization_gate
+                .lock()
+                .expect("initialization gate lock");
+            match allowed {
+                Some(true) => break,
+                Some(false) => return Err(Error::transport("module callback admission failed")),
+                None => changed.await,
+            }
+        }
+
         let result = self
             .init_result
             .get_or_init(|| async {

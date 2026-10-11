@@ -177,8 +177,11 @@ impl HostCallbackBinding {
         }
         {
             let mut state = self.state.lifetime.lock().expect("callback lifetime lock");
-            if state.used || state.revoked || state.served.contains(&(path.clone(), name.clone()))
-                || state.registering.contains(&(path.clone(), name.clone())) {
+            if state.used
+                || state.revoked
+                || state.served.contains(&(path.clone(), name.clone()))
+                || state.registering.contains(&(path.clone(), name.clone()))
+            {
                 return Err(Error::failed(
                     "callback registration is immutable or duplicated",
                 ));
@@ -198,8 +201,12 @@ impl HostCallbackBinding {
             .await;
         {
             let mut state = self.state.lifetime.lock().expect("callback lifetime lock");
-            state.registering.retain(|entry| entry != &(path.clone(), name.clone()));
-            if result.is_ok() { state.served.push((path, name)); }
+            state
+                .registering
+                .retain(|entry| entry != &(path.clone(), name.clone()));
+            if result.is_ok() {
+                state.served.push((path, name));
+            }
         }
         result
     }
@@ -385,6 +392,7 @@ impl ModuleHost {
             let bytes = serde_json::to_vec(&config)
                 .map_err(|_| Error::failed("module configuration is invalid"))?;
             let (transport, host) = ModuleTransport::new(admitted.name.clone(), bytes);
+            transport.pause_initialization();
             transport.defer_initialize(artifact.init, host);
             let name = admitted.name.clone();
             rollback.transport = Some(transport.clone());
@@ -425,6 +433,7 @@ impl ModuleHost {
                 .lock()
                 .expect("router lock")
                 .add_host_callbacks(binding.state.clone())?;
+            transport.release_initialization(true);
             transport
         };
         if transport.ensure_initialized().await.is_err() {
@@ -462,7 +471,17 @@ impl Drop for LoadRollback<'_> {
         self.binding.revoke();
         self.binding.transport.close_outbound();
         if let Some(transport) = &self.transport {
-            let peer = self.binding.state.module_peer();
+            transport.release_initialization(false);
+            let peer = self.binding.state.module_peer().or_else(|| {
+                self.host
+                    .inner
+                    .loaded
+                    .lock()
+                    .expect("module list lock")
+                    .iter()
+                    .find(|module| Arc::ptr_eq(&module.transport, transport))
+                    .map(|module| module.unique_name.clone())
+            });
             if let Some(peer) = peer {
                 self.host
                     .inner
