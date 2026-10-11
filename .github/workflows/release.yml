@@ -35,7 +35,7 @@ jobs:
     needs: resolve
     permissions:
       contents: write
-    uses: tinyhumansai/.github/.github/workflows/sdk-release.yml@3e87ade76b622844985d0c665a3b075313e4545c
+    uses: tinyhumansai/.github/.github/workflows/sdk-release.yml@4adc1080fb495098e7af1aade82ed7e6e3c69bb7
     with:
       tag: ${{ needs.resolve.outputs.tag }}
       version: ${{ needs.resolve.outputs.version }}
