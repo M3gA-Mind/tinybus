@@ -326,7 +326,7 @@ struct RuntimeState {
     inbound: StdMutex<Option<mpsc::Sender<IncomingFrame>>>,
     host: HostCalls,
     runtime: StdMutex<Option<tokio::runtime::Runtime>>,
-    reinitialize: Option<Reinitialize>,
+    reinitialize: StdMutex<Option<Reinitialize>>,
 }
 
 type Reinitialize = Box<dyn Fn(*const u8, usize) -> i32 + Send + Sync>;
@@ -363,6 +363,13 @@ unsafe extern "C" fn shutdown(ctx: *mut c_void, deadline_ms: u64) -> i32 {
             return TB_BAD_ARGUMENT;
         }
         let state = unsafe { &*(ctx.cast::<RuntimeState>()) };
+        // Hold the callback lifecycle lock while stopping the runtime. An
+        // in-flight reinitializer finishes first; late calls see a tombstone.
+        let mut callback = state
+            .reinitialize
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        callback.take();
         state.inbound.lock().expect("module inbound lock").take();
         match state.runtime.lock().expect("module runtime lock").take() {
             Some(runtime) => {
@@ -383,7 +390,11 @@ unsafe extern "C" fn reinitialize(ctx: *mut c_void, ptr: *const u8, len: usize) 
             return TB_BAD_ARGUMENT;
         }
         let state = unsafe { &*(ctx.cast::<RuntimeState>()) };
-        let Some(reinitialize) = &state.reinitialize else {
+        let callback = state
+            .reinitialize
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(reinitialize) = callback.as_ref() else {
             return TB_CLOSED;
         };
         reinitialize(ptr, len)
@@ -496,6 +507,24 @@ where
     }
 }
 
+// Validate the frozen ABI prefix before configuration parsing or a factory can
+// allocate state. Never read or write beyond a caller's declared allocation.
+unsafe fn validate_start_arguments(
+    host: *const TbHostVtable,
+    out: *mut TbModuleVtable,
+    worker_threads: usize,
+) -> Option<(u32, TbHostVtable)> {
+    if host.is_null() || out.is_null() || worker_threads == 0 {
+        return None;
+    }
+    let out_capacity = unsafe { out.cast::<u32>().read() };
+    if out_capacity < TB_MODULE_VTABLE_BASE_SIZE {
+        return None;
+    }
+    let host = unsafe { TbHostVtable::read_compatible(host) }?;
+    Some((out_capacity, host))
+}
+
 unsafe fn start_module_runtime<F, Fut>(
     host: *const TbHostVtable,
     out: *mut TbModuleVtable,
@@ -510,19 +539,9 @@ where
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     match catch_unwind(AssertUnwindSafe(|| {
-        if host.is_null() || out.is_null() || worker_threads == 0 {
-            return TB_BAD_ARGUMENT;
-        }
-        // `out.size` is input as well as output: an older ABI-v1 host owns a
-        // shorter allocation. Read only the frozen first field until its
-        // capacity is known, then write no further than that boundary.
-        let out_capacity = unsafe { out.cast::<u32>().read() };
-        if out_capacity < TB_MODULE_VTABLE_BASE_SIZE {
-            return TB_BAD_ARGUMENT;
-        }
-        // `size` is the frozen prefix field; do not copy the full vtable until
-        // the host has proved that all v1 fields are present.
-        let Some(host) = (unsafe { TbHostVtable::read_compatible(host) }) else {
+        let Some((out_capacity, host)) =
+            (unsafe { validate_start_arguments(host, out, worker_threads) })
+        else {
             return TB_BAD_ARGUMENT;
         };
         let host = HostCalls(host);
@@ -633,7 +652,7 @@ where
             host,
             inbound: StdMutex::new(Some(inbound_tx)),
             runtime: StdMutex::new(Some(runtime)),
-            reinitialize: reinitializer,
+            reinitialize: StdMutex::new(reinitializer),
         });
         let state = Box::into_raw(state).cast::<c_void>();
         unsafe { write_module_vtable(out, out_capacity, state, supports_reinitialize) };
@@ -775,6 +794,12 @@ where
 }
 
 /// Initialize one configured instance with fresh captured setup state.
+///
+/// # Safety
+/// Non-null pointers must address readable host ABI prefixes and writable
+/// output storage matching their declared sizes. Host callbacks and context
+/// must remain valid until runtime shutdown. Null pointers and invalid sizes
+/// or worker counts are rejected before configuration or factory evaluation.
 #[doc(hidden)]
 pub unsafe fn start_reconfigurable_module_with_factory<C, F, Fut>(
     host: *const TbHostVtable,
@@ -785,7 +810,7 @@ pub unsafe fn start_reconfigurable_module_with_factory<C, F, Fut>(
 ) -> i32
 where
     C: serde::de::DeserializeOwned + Send + 'static,
-    F: Fn(Connection, C) -> Fut + Clone + Send + Sync + 'static,
+    F: Fn(Connection, C) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     unsafe {
@@ -794,13 +819,19 @@ where
             out,
             worker_threads,
             detach_on_panic,
-            factory,
+            || shared_factory_setup(factory),
             false,
         )
     }
 }
 
 /// Initialize one linked configured instance with fresh captured setup state.
+///
+/// # Safety
+/// Non-null pointers must address readable host ABI prefixes and writable
+/// output storage matching their declared sizes. Host callbacks and context
+/// must remain valid until runtime shutdown. Null pointers and invalid sizes
+/// or worker counts are rejected before configuration or factory evaluation.
 #[doc(hidden)]
 pub unsafe fn start_linked_reconfigurable_module_with_factory<C, F, Fut>(
     host: *const TbHostVtable,
@@ -811,7 +842,7 @@ pub unsafe fn start_linked_reconfigurable_module_with_factory<C, F, Fut>(
 ) -> i32
 where
     C: serde::de::DeserializeOwned + Send + 'static,
-    F: Fn(Connection, C) -> Fut + Clone + Send + Sync + 'static,
+    F: Fn(Connection, C) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
     unsafe {
@@ -820,10 +851,22 @@ where
             out,
             worker_threads,
             detach_on_panic,
-            factory,
+            || shared_factory_setup(factory),
             true,
         )
     }
+}
+
+// The factory callback itself is shared, rather than cloned: a user's Clone
+// may deep-copy interior state and detach initial setup from reinitialization.
+fn shared_factory_setup<C, F, Fut>(
+    factory: impl FnOnce() -> F,
+) -> impl Fn(Connection, C) -> Fut + Clone + Send + Sync + 'static
+where
+    F: Fn(Connection, C) -> Fut + Send + Sync + 'static,
+{
+    let setup = Arc::new(factory());
+    move |connection, config| setup(connection, config)
 }
 
 unsafe fn start_reconfigurable_module_factory_mode<C, F, Fut>(
@@ -839,6 +882,9 @@ where
     F: Fn(Connection, C) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
+    if unsafe { validate_start_arguments(host, out, worker_threads) }.is_none() {
+        return TB_BAD_ARGUMENT;
+    }
     let parsed = catch_unwind(AssertUnwindSafe(|| unsafe { parse_config::<C>(host) }));
     let config = match parsed {
         Ok(Ok(config)) => config,
@@ -904,7 +950,9 @@ where
 /// Configured modules may use `setup_factory = factory` in place of `setup`.
 /// After valid configuration is parsed, the safe no-argument factory runs once
 /// per ABI initialization and returns a
-/// cloneable `Fn(Connection, Config) -> Future<Output = Result<()>>`. Its captured
+/// `Fn(Connection, Config) -> Future<Output = Result<()>>`. The callback is shared
+/// by reference for initial setup and reinitialization, regardless of its Clone
+/// behavior. Its captured
 /// state is reused for that instance's reinitializations, allowing admission to
 /// remain bound without process-global state. Separate instances receive fresh
 /// state. A factory panic returns `TB_PANICKED` without unwinding into the host.
@@ -1144,3 +1192,7 @@ mod static_link_tests;
 #[cfg(test)]
 #[path = "setup_factory_tests.rs"]
 mod setup_factory_test;
+
+#[cfg(test)]
+#[path = "lifecycle_tests.rs"]
+mod lifecycle_test;

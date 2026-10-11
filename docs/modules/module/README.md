@@ -217,10 +217,11 @@ See [abi.md](abi.md) for the binary contract and
 ### Per-instance setup state
 
 Configured exports can use `setup_factory = factory` instead of `setup = setup`.
-The safe, no-argument factory returns a cloneable setup callback with the same
+The safe, no-argument factory returns a setup callback with the same
 `Fn(Connection, Config) -> Future<Output = Result<()>>` signature. TinyBus calls
 it once after parsing valid initial configuration, then retains its captured
-state for that instance's initial setup and every reinitialization. Separate
+state for that instance's initial setup and every reinitialization. The callback
+is shared by reference; its Clone implementation cannot detach that state. Separate
 ABI instances get fresh state; no global registry is needed.
 
 This permits a module to capture an immutable admission or mode in an Arc and

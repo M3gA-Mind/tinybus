@@ -94,7 +94,7 @@ fn a_module_whose_queue_is_full_reports_backpressure_rather_than_blocking_the_br
         host: HostCalls(host(b"{}")),
         inbound: StdMutex::new(Some(sender)),
         runtime: StdMutex::new(None),
-        reinitialize: None,
+        reinitialize: StdMutex::new(None),
     };
     let bytes = b"{}";
     let code = unsafe {
@@ -113,7 +113,7 @@ fn a_frame_over_the_size_cap_is_rejected_rather_than_truncated() {
         host: HostCalls(host(b"{}")),
         inbound: StdMutex::new(None),
         runtime: StdMutex::new(None),
-        reinitialize: None,
+        reinitialize: StdMutex::new(None),
     };
     let code = unsafe {
         deliver(
@@ -205,7 +205,7 @@ fn a_panicking_shutdown_callback_reports_panicked_not_timed_out() {
         host: HostCalls(host(b"{}")),
         inbound: StdMutex::new(None),
         runtime: StdMutex::new(None),
-        reinitialize: None,
+        reinitialize: StdMutex::new(None),
     };
     let _ = catch_unwind(AssertUnwindSafe(|| {
         let _guard = state.runtime.lock().unwrap();
@@ -229,7 +229,7 @@ fn deliver_and_shutdown_validate_their_arguments_and_closed_state() {
         host: HostCalls(host(b"{}")),
         inbound: StdMutex::new(None),
         runtime: StdMutex::new(None),
-        reinitialize: None,
+        reinitialize: StdMutex::new(None),
     };
     let bytes = b"{}";
     assert_eq!(
@@ -603,7 +603,7 @@ fn deliver_reports_closed_when_the_modules_queue_receiver_is_gone() {
         host: HostCalls(host(b"{}")),
         inbound: StdMutex::new(Some(tx)),
         runtime: StdMutex::new(None),
-        reinitialize: None,
+        reinitialize: StdMutex::new(None),
     };
     let bytes = b"{}";
     assert_eq!(
@@ -629,7 +629,7 @@ fn reinitialize_validates_its_arguments_and_reports_closed_without_a_handler() {
         host: HostCalls(host(b"{}")),
         inbound: StdMutex::new(None),
         runtime: StdMutex::new(None),
-        reinitialize: None,
+        reinitialize: StdMutex::new(None),
     };
     let ctx = std::ptr::from_ref(&state).cast_mut().cast();
     assert_eq!(
@@ -797,7 +797,7 @@ async fn admission_never_promotes_a_frame_already_queued_without_provenance() {
         host: HostCalls(table),
         inbound: StdMutex::new(Some(sender)),
         runtime: StdMutex::new(None),
-        reinitialize: None,
+        reinitialize: StdMutex::new(None),
     };
     let transport = ModuleTransport {
         host: HostCalls(table),
@@ -893,7 +893,7 @@ async fn unverified_native_frames_preserve_distinct_stream_owners_and_unverified
             host: HostCalls(table),
             inbound: StdMutex::new(Some(sender)),
             runtime: StdMutex::new(None),
-            reinitialize: None,
+            reinitialize: StdMutex::new(None),
         };
         let transport = Arc::new(ModuleTransport {
             host: HostCalls(table),

@@ -206,3 +206,129 @@ fn native_factory_starter_validates_host_before_constructing_state() {
     };
     assert_eq!(code, TB_BAD_ARGUMENT);
 }
+
+mod copying_state {
+    use super::*;
+    #[derive(Default)]
+    struct Mode(std::sync::Mutex<Option<bool>>);
+    impl Clone for Mode {
+        fn clone(&self) -> Self {
+            Self(std::sync::Mutex::new(*self.0.lock().unwrap()))
+        }
+    }
+    impl Mode {
+        fn admit(&self, requested: bool) -> bool {
+            let mut mode = self.0.lock().unwrap();
+            if mode.is_some_and(|previous| previous != requested) {
+                return false;
+            }
+            *mode = Some(requested);
+            true
+        }
+    }
+    fn factory() -> impl Fn(Connection, Config) -> SetupFuture + Clone + Send + Sync {
+        let mode = Mode::default();
+        move |connection, config: Config| {
+            let accepted = mode.admit(config.restricted);
+            Box::pin(async move {
+                if !accepted {
+                    return Err(tinybus::Error::failed("immutable mode"));
+                }
+                legacy_setup(connection, config).await
+            })
+        }
+    }
+    module_export_static! {
+        setup_factory = factory, config = Config, worker_threads = 1,
+        provides = ["ai.tinyhumans.tinybus.Factory"],
+        methods = ["Mode"], signals = [], requires = [], optional = [], lazy = false,
+    }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn factory_callback_with_copying_clone_keeps_initial_admission_on_reinitialize() {
+    let bus = MemoryBus::new();
+    let broker = Broker::new();
+    broker.clone().spawn(bus.clone());
+    let host = ModuleHost::new(broker);
+    host.attach_linked_with_config(
+        copying_state::linked_module().unwrap(),
+        serde_json::json!({"restricted":true}),
+    )
+    .unwrap();
+    let caller = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let proxy = caller
+        .proxy(
+            "ai.tinyhumans.tinybus.Factory",
+            "/factory",
+            "ai.tinyhumans.tinybus.Factory",
+        )
+        .unwrap();
+    assert!(proxy.call::<bool>("Mode", ()).await.unwrap());
+    assert!(
+        host.reinitialize("tinybus-module", serde_json::json!({"restricted":false}))
+            .await
+            .is_err(),
+        "a copying callback Clone must not reset the original admission"
+    );
+    assert!(proxy.call::<bool>("Mode", ()).await.unwrap());
+}
+
+mod failed_setup {
+    use super::*;
+    pub(super) static DROPPED: AtomicUsize = AtomicUsize::new(0);
+    struct Capture;
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            DROPPED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    fn factory() -> impl Fn(Connection, Config) -> SetupFuture + Send + Sync {
+        let capture = Capture;
+        move |_, _| {
+            let _ = &capture;
+            Box::pin(async { Err(tinybus::Error::failed("setup refused")) })
+        }
+    }
+    module_export_static! {
+        setup_factory = factory, config = Config, worker_threads = 1,
+        provides = ["ai.tinyhumans.tinybus.FailedFactory"],
+        methods = [], signals = [], requires = [], optional = [], lazy = false,
+    }
+}
+#[tokio::test(flavor = "current_thread")]
+async fn failed_initial_setup_releases_factory_capture_when_host_stops_instance() {
+    let bus = MemoryBus::new();
+    let broker = Broker::new();
+    broker.clone().spawn(bus);
+    let host = ModuleHost::new(broker);
+    let before = failed_setup::DROPPED.load(Ordering::SeqCst);
+    host.attach_linked_with_config(
+        failed_setup::linked_module().unwrap(),
+        serde_json::json!({"restricted":true}),
+    )
+    .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if host.list().iter().any(|m| {
+                matches!(
+                    m.state,
+                    tinybus::module::ModuleState::Failed { .. }
+                        | tinybus::module::ModuleState::Faulted { .. }
+                )
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    host.shutdown(std::time::Duration::from_secs(1)).await;
+    assert_eq!(
+        failed_setup::DROPPED.load(Ordering::SeqCst) - before,
+        1,
+        "failed instance tombstone must release callback capture"
+    );
+}
