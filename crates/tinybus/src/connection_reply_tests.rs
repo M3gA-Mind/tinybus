@@ -51,7 +51,7 @@ fn fixture_call(destination: BusName) -> Message {
         MemberName::new("Await").unwrap(), serde_json::json!([]))
 }
 
-async fn raw_control(peer: &Arc<dyn Transport>, serial: u64, member: &str, body: Value) -> Message {
+async fn raw_control(peer: &dyn Transport, serial: u64, member: &str, body: Value) -> Message {
     let mut call = Message::method_call(BusName::new(crate::BUS_NAME).unwrap(),
         ObjectPath::new(crate::BUS_PATH).unwrap(),
         InterfaceName::new(crate::BUS_INTERFACE).unwrap(),
@@ -69,11 +69,11 @@ async fn reject_forged_replies(named: bool, confidential: bool, genuine_error: b
     let broker = Broker::new();
     broker.clone().spawn(bus.clone());
     let responder = bus.connect().await.unwrap();
-    let hello = raw_control(&responder, 1, "Hello", serde_json::json!([])).await;
+    let hello = raw_control(responder.as_ref(), 1, "Hello", serde_json::json!([])).await;
     let responder_name = BusName::new(hello.body.as_str().unwrap()).unwrap();
     let alias = BusName::new("ai.tinyhumans.Fixture").unwrap();
     if named {
-        let reply = raw_control(&responder, 2, "RequestName", serde_json::json!([alias])).await;
+        let reply = raw_control(responder.as_ref(), 2, "RequestName", serde_json::json!([alias])).await;
         assert_eq!(reply.header.kind, MessageKind::MethodReturn);
     }
     #[cfg(feature = "modules")]
@@ -112,7 +112,7 @@ async fn reject_forged_replies(named: bool, confidential: bool, genuine_error: b
     assert_eq!(barrier.header.sender, forger.unique_name());
     let mut genuine = if genuine_error {
         Message::error_reply(&delivered.header, &Error::UnknownMethod {
-            interface: "ai.tinyhumans.Fixture".into(), member: "Await".into(),
+            interface: InterfaceName::new("ai.tinyhumans.Fixture").unwrap(), member: MemberName::new("Await").unwrap(),
         })
     } else {
         Message::method_return(&delivered.header, serde_json::json!("genuine"))
@@ -123,7 +123,7 @@ async fn reject_forged_replies(named: bool, confidential: bool, genuine_error: b
     if genuine_error {
         let error = result.unwrap_err();
         assert!(matches!(error, Error::MethodFailed { ref name, .. }
-            if name == Error::UnknownMethod { interface: "ai.tinyhumans.Fixture".into(), member: "Await".into() }.wire_name()));
+            if name == Error::UnknownMethod { interface: InterfaceName::new("ai.tinyhumans.Fixture").unwrap(), member: MemberName::new("Await").unwrap() }.wire_name()));
     } else { assert_eq!(result.unwrap(), serde_json::json!("genuine")); }
 }
 
@@ -156,14 +156,14 @@ async fn captured_alias_owner_is_checked_atomically_before_dispatch() {
     let original = Connection::connect(bus.connect().await.unwrap()).await.unwrap();
     let replacement = bus.connect().await.unwrap();
     let requester = bus.connect().await.unwrap();
-    raw_control(&replacement, 1, "Hello", serde_json::json!([])).await;
-    raw_control(&requester, 1, "Hello", serde_json::json!([])).await;
+    raw_control(replacement.as_ref(), 1, "Hello", serde_json::json!([])).await;
+    raw_control(requester.as_ref(), 1, "Hello", serde_json::json!([])).await;
     let alias = BusName::new("ai.tinyhumans.Fixture").unwrap();
     original.request_name(alias.clone()).await.unwrap();
-    let captured_reply = raw_control(&requester, 2, "ResolveCallTarget", serde_json::json!([alias])).await;
+    let captured_reply = raw_control(requester.as_ref(), 2, "ResolveCallTarget", serde_json::json!([alias])).await;
     let captured: BusName = serde_json::from_value(captured_reply.body).unwrap();
     original.release_name(alias.clone()).await.unwrap();
-    raw_control(&replacement, 2, "RequestName", serde_json::json!([alias])).await;
+    raw_control(replacement.as_ref(), 2, "RequestName", serde_json::json!([alias])).await;
     let mut call = fixture_call(alias.clone());
     call.header.expected_responder = Some(captured.clone());
     call.header.serial = 3;
