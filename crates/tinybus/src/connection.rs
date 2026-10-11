@@ -1389,3 +1389,7 @@ async fn dispatch(inner: &Inner, header: &Header, body: Value, brokered: bool) -
 #[cfg(test)]
 #[path = "connection_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "connection_reply_tests.rs"]
+mod reply_tests;
