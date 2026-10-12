@@ -594,17 +594,13 @@ impl ControlledRelease {
 impl Drop for ControlledRelease {
     fn drop(&mut self) {
         self.release();
-        // A failing test cannot join from Drop. The existing transport physical
-        // anchor remains authoritative; this task retains the real owner while
-        // requesting stop after all artificial gates have opened.
+        // Commit and schedule synchronously, before any Tokio cleanup observer
+        // could be canceled. request_terminal anchors PhysicalJob in the actual
+        // context and submits its OS thread; neither depends on this runtime.
+        // Only fixture-local locks can be poisoned by test assertions; release
+        // above recovers those. No SDK internal lock is held by this guard.
         if let Some(transport) = self.transport.take() {
-            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-                let barrier = self.barrier.clone();
-                runtime.spawn(async move {
-                    let _ = transport.stop(Duration::from_secs(2)).await;
-                    drop(barrier);
-                });
-            }
+            transport.request_terminal(false);
         }
     }
 }
@@ -683,9 +679,63 @@ async fn actual_native_early_unwind_releases_entry_and_reclaims_after_callback_r
     assert!(entered.is_ok());
     assert!(unwind.is_err());
     assert!(initialized.is_ok());
-    assert!(stopped.is_ok());
+    assert!(matches!(
+        stopped,
+        Ok(_)
+            | Err(super::super::super::transport::StopError::NotStarted(
+                Error::ConnectionClosed
+            ))
+    ));
     assert!(callback_entered_after_worker_join);
     assert!(reclaimed.is_ok());
+}
+
+#[test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+fn actual_native_release_owner_survives_canceled_waiter_and_runtime_drop() {
+    use super::super::super::transport::tests::native_fixture;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let (transport, host, init, barrier) = native_fixture();
+    barrier.state.lock().unwrap().1 = true;
+    transport.defer_initialize(init, host);
+    let initialized = runtime.block_on(transport.ensure_initialized());
+    let weak = Arc::downgrade(&barrier);
+    let (finish, receive) = std::sync::mpsc::channel();
+    *barrier.finish_gate.lock().unwrap() = Some(receive);
+    let mut cleanup = ControlledRelease::new(barrier.clone());
+    cleanup.transport = Some(transport.clone());
+    // This test's external finish control stays held to inspect physical owner
+    // retention. It is released before any assertions, including failure paths.
+    drop(cleanup);
+    let waiter = runtime.spawn({
+        let transport = transport.clone();
+        async move { transport.stop(Duration::from_secs(2)).await }
+    });
+    waiter.abort(); // intentionally cancel without relying on a first poll
+    let canceled = runtime.block_on(waiter);
+    let joined_worker = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified()).await
+    });
+    drop(runtime);
+    drop(barrier);
+    drop(transport);
+    let retained_during_callback = weak.strong_count() != 0;
+    let released = finish.send(());
+    // The physical thread is independent of the dropped Tokio runtime.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while weak.strong_count() != 0 && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let reclaimed_after_return = weak.strong_count() == 0;
+    assert!(initialized.is_ok());
+    assert!(canceled.unwrap_err().is_cancelled());
+    assert!(joined_worker.is_ok());
+    assert!(retained_during_callback);
+    assert!(released.is_ok());
+    assert!(reclaimed_after_return);
 }
 
 // Manually polling the public future lets ordinary shutdown commit while the
