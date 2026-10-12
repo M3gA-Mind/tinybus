@@ -110,10 +110,11 @@ fn a_module_log_line_reaches_the_hosts_subscriber_with_its_level() {
             .env(CHILD, "1")
             .output()
             .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            output.status.success(),
-            "isolated subscriber assertion failed: {}{}",
-            String::from_utf8_lossy(&output.stdout),
+            output.status.success() && stdout.contains("1 passed;"),
+            "isolated subscriber assertion failed or was not selected: {}{}",
+            stdout,
             String::from_utf8_lossy(&output.stderr),
         );
         return;
