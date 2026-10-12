@@ -126,6 +126,7 @@ pub(super) struct TerminalState {
     pub terminal_notify: tokio::sync::Notify,
     pub resources: StdMutex<StartupResources>,
     sdk_owners: AtomicUsize,
+    vtable_published: AtomicBool,
     lease: SlotLease,
     token: usize,
 }
@@ -157,7 +158,7 @@ impl TerminalState {
                 request_state: RequestState::Unregistered, finish_state: FinishState::Idle,
                 published: false, completion: None, job: None, payloads: PrimaryPayloads::default() }),
             changed: Condvar::new(), terminal_notify: tokio::sync::Notify::new(),
-            resources: StdMutex::new(StartupResources::default()), sdk_owners: AtomicUsize::new(0),
+            resources: StdMutex::new(StartupResources::default()), sdk_owners: AtomicUsize::new(0), vtable_published: AtomicBool::new(false),
             lease: SlotLease { admission: Arc::downgrade(admission), index }, token,
         });
         slots[index].anchor = Some(state.clone());
@@ -176,6 +177,17 @@ impl TerminalState {
         if slot.generation != generation { return None; }
         // Strong exact State is acquired before releasing registry exclusion.
         slot.anchor.as_ref().filter(|state| state.token == token).cloned()
+    }
+    pub fn mark_vtable_published(&self) { self.vtable_published.store(true, Ordering::Release); }
+    pub fn retain_uncertain_anchor(self: &Arc<Self>) {
+        self.uncertain.store(true, Ordering::Release);
+        if let Some(admission) = self.lease.admission.upgrade() {
+            let mut slots = admission.slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let slot = &mut slots[self.lease.index];
+            // This State's still-live lease forbids reuse while a C callback or
+            // retained view performs the final genuine-fault recheck.
+            if slot.generation == self.token >> 8 && slot.anchor.is_none() { slot.anchor = Some(self.clone()); }
+        }
     }
     pub fn view(self: &Arc<Self>) -> NativeInstanceLiveness { NativeInstanceLiveness { inner: self.clone() } }
     pub fn sdk_owner(self: &Arc<Self>) -> SdkOwner {
@@ -299,7 +311,6 @@ impl TerminalState {
             drop(anchor);
         }
     }
-    #[cfg(test)]
     pub fn empty_factory_failure(self: &Arc<Self>) {
         // No callable/controller was transferred. Retained views still hold the permit.
         self.commit(TerminalReason::SetupFailed); self.remove_anchor();
@@ -334,7 +345,10 @@ impl TerminalState {
                 Err(payload) => { self.source_panic(PayloadKind::Cleanup, payload); false }
             }
         } else { false };
-        if !released { self.uncertain.store(true, Ordering::Release); }
+        self.observe_host();
+        if !released || (self.has_fault() && self.vtable_published.load(Ordering::Acquire)) {
+            self.uncertain.store(true, Ordering::Release);
+        }
         let completion = if self.uncertain.load(Ordering::Acquire) { TerminalCompletion::Uncertain } else { completed };
         { let mut control = self.lock(); control.finish_state = FinishState::Complete; control.completion = Some(completion); }
         self.changed.notify_all();

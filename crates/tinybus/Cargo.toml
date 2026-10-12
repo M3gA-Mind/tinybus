@@ -140,3 +140,8 @@ required-features = ["modules"]
 name = "module_controlled_init"
 crate-type = ["cdylib"]
 required-features = ["modules"]
+
+[[example]]
+name = "module_terminal"
+crate-type = ["cdylib"]
+required-features = ["modules"]

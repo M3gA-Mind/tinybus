@@ -1332,7 +1332,9 @@ unsafe extern "C" fn terminal_shutdown(ctx: *mut c_void, deadline_ms: u64) -> i3
     let completion = state.wait(Duration::from_millis(deadline_ms));
     // Genuine source/native Fault cannot earn accepted-vtable physical success.
     state.observe_host();
-    if completion != TerminalCompletion::PhysicallyStopped || state.has_fault() { return TB_PANICKED; }
+    if completion != TerminalCompletion::PhysicallyStopped || state.has_fault() {
+        state.retain_uncertain_anchor(); return TB_PANICKED;
+    }
     TB_OK
 }
 unsafe extern "C" fn terminal_reinitialize(ctx: *mut c_void, ptr: *const u8, len: usize) -> i32 {
@@ -1496,6 +1498,7 @@ where C: serde::de::DeserializeOwned + Send + 'static,
         });
         state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).initial = Some(task);
         let context = state.context();
+        state.mark_vtable_published();
         if capacity >= size_of::<TbModuleVtable>() as u32 {
             unsafe { out.write(TbModuleVtable { size: size_of::<TbModuleVtable>() as u32, _reserved: 0,
                 module_ctx: context, deliver: terminal_deliver, shutdown: terminal_shutdown, reinitialize: Some(terminal_reinitialize) }); }
@@ -1509,6 +1512,10 @@ where C: serde::de::DeserializeOwned + Send + 'static,
         Ok(code) => code,
         Err(payload) => { state.source_panic(terminal::PayloadKind::Startup, payload); TB_PANICKED }
     };
+    if code == TB_BAD_ARGUMENT && state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).config.is_none() {
+        // Parsing failed before any factory/hook/config owner transfer.
+        state.empty_factory_failure(); return code;
+    }
     if code != TB_OK {
         if let Some(owner) = &state.owner { owner.stop(); }
         if !state.is_terminal() { state.signal(TerminalReason::SetupFailed); }

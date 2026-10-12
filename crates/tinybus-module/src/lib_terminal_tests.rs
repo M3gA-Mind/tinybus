@@ -43,7 +43,7 @@ fn shutdown_rechecks_actual_native_fault_after_local_stop_and_physical_finish() 
     state.register(RuntimeHooks::new(|_| {}, move || {
         entered_tx.send(()).unwrap(); worker_release.wait(); TerminalCompletion::PhysicallyStopped
     }));
-    state.publish();
+    state.mark_vtable_published(); state.publish();
     let ptr = state.context().addr();
     let caller = std::thread::spawn(move || unsafe { terminal_shutdown(ptr as *mut c_void, 3000) });
     entered_rx.recv().unwrap();
@@ -51,6 +51,8 @@ fn shutdown_rechecks_actual_native_fault_after_local_stop_and_physical_finish() 
     release.wait();
     let code = caller.join().unwrap();
     assert_eq!(code, TB_PANICKED, "actual native Fault cannot disappear behind local Stop");
+    drop(state);
+    assert!(terminal::TerminalState::lookup(std::ptr::with_exposed_provenance_mut(ptr)).is_some(), "published Fault must retain the exact anchor instead of refunding its permit");
 }
 
 mod controlled {
