@@ -840,7 +840,10 @@ async fn native_callback_setup_failure_race(panic_setup: bool) {
             .load_file_with_host_callbacks(artifact, config, &loading_binding)
             .await
     });
-    tokio::time::timeout(Duration::from_secs(2), attached.notified())
+    // Admission hashes the real artifact twice before this hook; instrumented
+    // CI builds can spend several seconds there. This is a fixture setup bound,
+    // independent of the lifecycle deadline and the race assertions below.
+    tokio::time::timeout(Duration::from_secs(30), attached.notified())
         .await
         .unwrap();
     let transport = host.inner.loaded.lock().unwrap()[0].transport.clone();
