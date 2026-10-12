@@ -98,6 +98,50 @@ impl CallbackState {
                         .is_some_and(|member| endpoint.members.contains(member))
             })
     }
+
+    pub(crate) fn matches_directed_signal(
+        &self,
+        source: &BusName,
+        destination: &BusName,
+        header: &Header,
+    ) -> bool {
+        let state = self.lifetime.lock().expect("callback lifetime lock");
+        state.active
+            && self.module_live()
+            && state.module.as_ref() == Some(source)
+            && source == destination
+            && self.signals.iter().any(|signal| {
+                header.path.as_ref() == Some(&signal.path)
+                    && header.interface.as_ref() == Some(&signal.interface)
+                    && header
+                        .member
+                        .as_ref()
+                        .is_some_and(|member| signal.members.contains(member))
+            })
+    }
+
+    fn signal_destination(
+        &self,
+        path: &ObjectPath,
+        interface: &InterfaceName,
+        member: &MemberName,
+    ) -> Result<BusName> {
+        let state = self.lifetime.lock().expect("callback lifetime lock");
+        if !state.active
+            || !self.module_live()
+            || !self.signals.iter().any(|signal| {
+                &signal.path == path
+                    && &signal.interface == interface
+                    && signal.members.contains(member)
+            })
+        {
+            return Err(Error::failed("directed signal authority is unavailable"));
+        }
+        state
+            .module
+            .clone()
+            .ok_or_else(|| Error::failed("directed signal recipient is unavailable"))
+    }
 }
 
 /// Read-only liveness and authenticated module identity for a callback worker.
@@ -272,6 +316,35 @@ impl HostCallbackBinding {
     pub fn guard(&self) -> HostCallbackGuard {
         HostCallbackGuard(self.state.clone())
     }
+
+    /// Emit a signal only to this binding's current verified module peer.
+    ///
+    /// The destination comes from the live binding and is never caller-chosen.
+    /// The broker checks the exact declaration and active binding again when
+    /// routing, closing the revoke/send race.
+    ///
+    /// # Errors
+    /// Returns an error for an undeclared signal, inactive or revoked binding,
+    /// missing recipient, or closed/backpressured transport.
+    pub async fn emit_signal(
+        &self,
+        path: &ObjectPath,
+        interface: &InterfaceName,
+        member: &MemberName,
+        body: impl serde::Serialize,
+    ) -> Result<()> {
+        let destination = self
+            .state
+            .signal_destination(path, interface, member)?;
+        let message = crate::message::Message::directed_signal(
+            destination,
+            path.clone(),
+            interface.clone(),
+            member.clone(),
+            crate::connection::to_body(&body)?,
+        );
+        self.connection.send(message).await
+    }
     /// Immediately and idempotently prevent new route and user-dispatch admission.
     /// Running user futures remain accounted for until actual completion/drop.
     pub fn revoke(&self) {
@@ -418,6 +491,24 @@ impl ModuleHost {
         &self,
         endpoints: Vec<HostCallbackEndpoint>,
     ) -> Result<HostCallbackBinding> {
+        self.prepare_host_callbacks_with_signals(endpoints, Vec::new())
+            .await
+    }
+
+    /// Create a private callback recipient with a finite directed-signal set.
+    ///
+    /// Every signal declaration must share a path and interface with one of
+    /// the callback endpoints. Directed signals target only the exact verified
+    /// module peer loaded with the returned binding.
+    ///
+    /// # Errors
+    /// Rejects malformed or duplicate declarations, undeclared signal
+    /// endpoints, or a failed local TinyBus connection.
+    pub async fn prepare_host_callbacks_with_signals(
+        &self,
+        endpoints: Vec<HostCallbackEndpoint>,
+        signals: Vec<HostCallbackSignal>,
+    ) -> Result<HostCallbackBinding> {
         if endpoints.is_empty()
             || endpoints.len() > 32
             || endpoints.iter().any(|endpoint| {
@@ -436,6 +527,24 @@ impl ModuleHost {
             })
         {
             return Err(Error::failed("callback endpoint declaration is invalid"));
+        }
+        if signals.iter().any(|signal| {
+            signal.members.is_empty()
+                || signal.members.len() > 64
+                || signal
+                    .members
+                    .iter()
+                    .enumerate()
+                    .any(|(i, member)| signal.members[..i].contains(member))
+                || !endpoints
+                    .iter()
+                    .any(|endpoint| endpoint.path == signal.path && endpoint.interface == signal.interface)
+        }) || signals.iter().enumerate().any(|(i, signal)| {
+            signals[..i].iter().any(|previous| {
+                previous.path == signal.path && previous.interface == signal.interface
+            })
+        }) {
+            return Err(Error::failed("callback signal declaration is invalid"));
         }
         let (host, peer) = MemoryTransport::pair();
         let unique = self.inner.broker.attach(Arc::new(peer));
@@ -466,6 +575,7 @@ impl ModuleHost {
             state: Arc::new(CallbackState {
                 destination,
                 endpoints,
+                signals,
                 module_transport: Mutex::new(None),
                 lifetime: Mutex::new(Lifetime {
                     active: false,
