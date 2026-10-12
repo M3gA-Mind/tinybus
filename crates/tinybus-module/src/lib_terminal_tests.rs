@@ -2576,3 +2576,159 @@ async fn compiled_native_entered_initial_and_reinit_work_settle_before_original_
         }
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a fresh-process privately pinned __native-fixture-support eight-artifact cohort"]
+async fn compiled_native_method_payload_and_whole_connection_drop_retain_actual_sdk_owners() {
+    let path = std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_TERMINAL_MODULE").unwrap());
+    let warm = native_fixture_host();
+    let (events, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
+    let events = Box::into_raw(Box::new(events));
+    let controls = NativeControls {
+        ctx: events.cast(),
+        event: native_event,
+    };
+    warm.load_file_with_config(&path, native_controls_config(0, &controls))
+        .unwrap();
+    let configure: unsafe extern "C" fn(
+        usize,
+        *mut c_void,
+        unsafe extern "C" fn(*mut c_void, u32, u32),
+    ) = unsafe { native_fixture_symbol(&path, c"terminal_test_factory_mode") };
+    let owners: extern "C" fn() -> usize =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_sdk_owners") };
+    let release_views: extern "C" fn() -> usize =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_release_views") };
+    let (_, _, drops, _, flags) = unsafe { terminal_fixture_symbols(&path) };
+    warm.shutdown(Duration::from_secs(5)).await;
+    while !matches!(receiver.recv_timeout(Duration::from_secs(5)), Ok((6, _))) {}
+    for mode in [50u8, 51, 52] {
+        let (events, receiver) = std::sync::mpsc::channel();
+        let barrier = Box::into_raw(Box::new(NativeBarrierControls {
+            events,
+            blocked_event: if mode == 50 { 30 } else { 32 },
+            release: (StdMutex::new(false), std::sync::Condvar::new()),
+        }));
+        let controls = NativeControls {
+            ctx: barrier.cast(),
+            event: native_barrier_event,
+        };
+        unsafe {
+            configure(46, barrier.cast(), native_barrier_event);
+        }
+        let broker = tinybus::broker::Broker::new();
+        let bus = tinybus::transport::memory::MemoryBus::new();
+        broker.clone().spawn(bus.clone());
+        let client = Connection::connect(bus.connect().await.unwrap())
+            .await
+            .unwrap();
+        let host = Arc::new(tinybus::module::ModuleHost::new(broker));
+        let before = drops();
+        host.load_file_with_config(&path, native_controls_config(mode, &controls))
+            .unwrap();
+        let mut seen = Vec::new();
+        while !seen.iter().any(|event: &(u32, u32)| event.0 == 31) {
+            seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        let call = (mode == 50).then(|| {
+            tokio::spawn(async move {
+                client
+                    .proxy(
+                        "ai.tinyhumans.TerminalFixture",
+                        "/terminal",
+                        "ai.tinyhumans.TerminalFixture",
+                    )
+                    .unwrap()
+                    .with_timeout(Duration::from_secs(10))
+                    .call::<serde_json::Value>("Panic", ())
+                    .await
+            })
+        });
+        if mode == 50 {
+            while !seen.iter().any(|event| event.0 == 30) {
+                seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+        }
+        let stopping_host = host.clone();
+        let stopping = tokio::spawn(async move {
+            stopping_host.shutdown(Duration::from_secs(8)).await;
+        });
+        if mode != 50 {
+            while !seen.iter().any(|event| event.0 == 32) {
+                seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+        }
+        stopping.await.unwrap(); // actual SDK Runtime shutdown_timeout elapsed
+        let held_owners = owners();
+        let timed_out_native = flags();
+        seen.extend(receiver.try_iter());
+        let actual_finish = seen.iter().filter(|event| **event == (5, 1)).count();
+        let actual_join = seen.iter().filter(|event| **event == (7, 1)).count();
+        let retained_controller = drops() == before;
+        // Always settle controlled work before asserting: release real foreign
+        // Drop, await actual call and actual counted last Connection observer.
+        unsafe { &*barrier }.release();
+        let call_result = match call {
+            Some(call) => Some(call.await.unwrap()),
+            None => None,
+        };
+        while !seen.iter().any(|event| event.0 == 6) {
+            seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while owners() != 0 || drops() == before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let settled_native = flags();
+        release_views();
+        seen.extend(receiver.try_iter());
+        drop(host);
+        unsafe {
+            drop(Box::from_raw(barrier));
+        }
+        assert!(
+            held_owners > 0,
+            "whole SDK-owned Connection task/Drop mode {mode}"
+        );
+        assert!(retained_controller);
+        assert_eq!(
+            actual_finish, 1,
+            "actual original controller finish is separate"
+        );
+        assert_eq!(actual_join, 1);
+        assert_eq!(
+            timed_out_native & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+            0
+        );
+        assert_eq!(
+            settled_native & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+            0
+        );
+        if mode == 50 {
+            assert!(
+                seen.contains(&(29, 7)),
+                "Fault/request-done/actualSDKowner before first payload Drop"
+            );
+            assert!(call_result.unwrap().is_err());
+            assert_ne!(
+                timed_out_native & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT,
+                0
+            );
+        } else {
+            assert!(
+                seen.iter().any(|event| event.0 == 35 && event.1 & 6 == 6),
+                "owner already stopped, bounded request done before whole Connection Drop"
+            );
+            if mode == 52 {
+                assert_ne!(
+                    settled_native & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT,
+                    0,
+                    "explicit resource-drop observer fences Fault even after owner suppression"
+                );
+            }
+        }
+    }
+}

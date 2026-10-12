@@ -206,7 +206,7 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
     }
     let (request, finish) = (controller.clone(), controller.clone());
     let capture = FactoryCapture(controller);
-    let setup = move |_: Connection, config: Config| {
+    let setup = move |connection: Connection, config: Config| {
         let controller = capture.controller();
         controller.observe(16);
         controller.emit(26, u32::from(tokio::runtime::Handle::try_current().is_ok()));
@@ -270,6 +270,21 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
         if config.mode == 4 {
             panic!("controlled native setup construction");
         }
+        if (50..=52).contains(&config.mode) {
+            let object = TerminalObject {
+                controller: controller.clone(),
+                mode: config.mode,
+            };
+            let work = controller.clone();
+            return Box::pin(async move {
+                connection.serve_at("/terminal".parse()?, object).await?;
+                connection
+                    .request_name("ai.tinyhumans.TerminalFixture")
+                    .await?;
+                work.emit(31, 1);
+                Ok(())
+            }) as FixtureFuture;
+        }
         Box::pin(SetupFuture {
             controller: controller.clone(),
             mode: config.mode,
@@ -328,7 +343,7 @@ pub extern "C" fn tinybus_module_manifest_v1() -> TbSlice {
         name: "module-terminal",
         version: env!("CARGO_PKG_VERSION"),
         provides: &["ai.tinyhumans.TerminalFixture"],
-        methods: &[],
+        methods: &["Panic"],
         signals: &[],
         requires: &[],
         optional: &[],
@@ -567,5 +582,59 @@ pub extern "C" fn terminal_test_unowned() -> bool {
     #[cfg(not(feature = "__native-fixture-support"))]
     {
         true
+    }
+}
+
+struct MethodPayload(Arc<Controller>);
+impl Drop for MethodPayload {
+    fn drop(&mut self) {
+        let query = *NATIVE_QUERY.lock().unwrap();
+        let native = query.map_or(0, |query| unsafe { (query.query)(query.ctx) });
+        #[cfg(feature = "__native-fixture-support")]
+        let evidence = u32::from(native & TB_NATIVE_TERMINAL_FAULT != 0)
+            | (u32::from(self.0.view.__fixture_request_done()) << 1)
+            | (u32::from(self.0.view.__fixture_sdk_owners() != 0) << 2);
+        #[cfg(not(feature = "__native-fixture-support"))]
+        let evidence = native;
+        // First payload-disposal action reads the actual native query and
+        // actual request state before entering the trusted blocking control.
+        self.0.emit(29, evidence);
+        self.0.emit(30, 0);
+        self.0.emit(33, 1);
+    }
+}
+struct TerminalObject {
+    controller: Arc<Controller>,
+    mode: u8,
+}
+#[tinybus::interface(name = "ai.tinyhumans.TerminalFixture")]
+impl TerminalObject {
+    async fn panic(&self) -> Result<()> {
+        std::panic::panic_any(MethodPayload(self.controller.clone()));
+    }
+}
+impl Drop for TerminalObject {
+    fn drop(&mut self) {
+        if self.mode == 51 || self.mode == 52 {
+            self.controller.observe(35);
+            self.controller.emit(32, u32::from(self.mode));
+            self.controller.emit(33, u32::from(self.mode));
+            if self.mode == 52 {
+                panic!("controlled native Connection object destructor");
+            }
+        }
+    }
+}
+/// Counts actual surviving SDK Connection/task owners, not messages/futures.
+#[unsafe(no_mangle)]
+pub extern "C" fn terminal_test_sdk_owners() -> usize {
+    #[cfg(feature = "__native-fixture-support")]
+    {
+        let view = RETAINED_VIEWS.lock().unwrap().last().cloned();
+        view.map_or(0, |view| view.__fixture_sdk_owners())
+    }
+    #[cfg(not(feature = "__native-fixture-support"))]
+    {
+        0
     }
 }
