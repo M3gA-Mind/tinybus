@@ -1593,6 +1593,7 @@ where
                 let construct_state = Arc::downgrade(&state);
                 let construct_setup = setup.clone();
                 let construct_slot = slot.clone();
+                let construct_handle = handle.clone();
                 let code = state.construct_reinit(Box::new(move || {
                     let Some(state) = construct_state.upgrade() else {
                         return TB_CLOSED;
@@ -1600,6 +1601,11 @@ where
                     if !state.is_live() {
                         return TB_CLOSED;
                     }
+                    // active_reinit keeps the actual State-owned Runtime alive until
+                    // this worker acknowledges construction and the ABI caller settles.
+                    // Enter its context locally, outside all locks, for synchronous C/F
+                    // construction; the guard never leaves this physical worker.
+                    let _runtime_scope = construct_handle.enter();
                     let config = match serde_json::from_slice::<C>(&bytes) {
                         Ok(config) => config,
                         Err(_) => return TB_BAD_ARGUMENT,

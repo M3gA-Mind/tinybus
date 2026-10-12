@@ -227,7 +227,13 @@ mod controlled {
             }
             match self.mode {
                 0 => Poll::Ready(Ok(())),
-                5 => self.timer.as_mut().unwrap().as_mut().poll(cx).map(|()| Ok(())),
+                5 => self
+                    .timer
+                    .as_mut()
+                    .unwrap()
+                    .as_mut()
+                    .poll(cx)
+                    .map(|()| Ok(())),
                 2 => panic!("controlled setup poll"),
                 3 => Poll::Ready(Err(Error::failed("controlled setup failure"))),
                 _ => Poll::Pending,
@@ -290,11 +296,17 @@ mod controlled {
             let timer = (config.mode == 5).then(|| {
                 // Construct synchronously in F, before returning its future.
                 let timer = Box::pin(tokio::time::sleep(Duration::from_millis(1)));
-                fixture.events.send(Event::TimerConstruct(
-                    std::thread::current().id(),
-                    std::thread::current().name().unwrap_or("unnamed").to_owned(),
-                    tokio::runtime::Handle::current().id(),
-                )).unwrap();
+                fixture
+                    .events
+                    .send(Event::TimerConstruct(
+                        std::thread::current().id(),
+                        std::thread::current()
+                            .name()
+                            .unwrap_or("unnamed")
+                            .to_owned(),
+                        tokio::runtime::Handle::current().id(),
+                    ))
+                    .unwrap();
                 timer
             });
             Box::pin(SetupFuture {
@@ -1299,41 +1311,75 @@ async fn linked_reinit_synchronous_timer_uses_retained_runtime_on_same_worker() 
     let caller_runtime = tokio::runtime::Handle::current().id();
     let (fixture, events) = controlled::fixture();
     let broker = tinybus::broker::Broker::new();
-    broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+    broker
+        .clone()
+        .spawn(tinybus::transport::memory::MemoryBus::new());
     let host = Arc::new(tinybus::module::ModuleHost::new(broker));
     host.attach_linked_with_config(
-        controlled::linked_module().unwrap(), serde_json::json!({"mode":5}),
-    ).unwrap();
+        controlled::linked_module().unwrap(),
+        serde_json::json!({"mode":5}),
+    )
+    .unwrap();
     let mut observed = vec![events.recv_timeout(Duration::from_secs(3)).unwrap()];
     tokio::time::timeout(Duration::from_secs(3), async {
-        while !host.list().iter().any(|info| matches!(info.state, tinybus::module::ModuleState::Ready)) {
+        while !host
+            .list()
+            .iter()
+            .any(|info| matches!(info.state, tinybus::module::ModuleState::Ready))
+        {
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
-    let first = host.reinitialize("tinybus-module", serde_json::json!({"mode":5})).await;
-    let second = host.reinitialize("tinybus-module", serde_json::json!({"mode":5})).await;
+    })
+    .await
+    .unwrap();
+    let first = host
+        .reinitialize("tinybus-module", serde_json::json!({"mode":5}))
+        .await;
+    let second = host
+        .reinitialize("tinybus-module", serde_json::json!({"mode":5}))
+        .await;
     let caller_restored = tokio::runtime::Handle::current().id() == caller_runtime;
     let view = fixture.view.lock().unwrap().as_ref().unwrap().clone();
     host.shutdown(Duration::from_secs(8)).await;
     let completion = view.inner.wait(Duration::from_secs(5));
-    let after_stop = host.reinitialize("tinybus-module", serde_json::json!({"mode":5})).await;
+    let after_stop = host
+        .reinitialize("tinybus-module", serde_json::json!({"mode":5}))
+        .await;
     observed.extend(events.try_iter());
-    let constructors: Vec<_> = observed.iter().filter_map(|event| match event {
-        controlled::Event::TimerConstruct(thread, name, runtime) => Some((*thread, name.as_str(), *runtime)),
-        _ => None,
-    }).collect();
+    let constructors: Vec<_> = observed
+        .iter()
+        .filter_map(|event| match event {
+            controlled::Event::TimerConstruct(thread, name, runtime) => {
+                Some((*thread, name.as_str(), *runtime))
+            }
+            _ => None,
+        })
+        .collect();
     // Actual caller, controller worker and SDK cleanup have settled before assertions,
     // including the unfixed constructor-panic path.
-    assert!(first.is_ok() && second.is_ok(), "synchronous timer reinit failed: {first:?}, {second:?}");
+    assert!(
+        first.is_ok() && second.is_ok(),
+        "synchronous timer reinit failed: {first:?}, {second:?}"
+    );
     assert_eq!(completion, TerminalCompletion::PhysicallyStopped);
     assert_eq!(fixture.joins.load(Ordering::SeqCst), 1);
     assert_eq!(constructors.len(), 3);
     assert_eq!(constructors[1].1, "tinybus-terminal");
     assert_eq!(constructors[2].1, "tinybus-terminal");
     assert_eq!(constructors[1].0, constructors[2].0);
-    assert!(constructors.iter().all(|entry| entry.2 == constructors[0].2));
+    assert!(
+        constructors
+            .iter()
+            .all(|entry| entry.2 == constructors[0].2)
+    );
     assert_ne!(constructors[0].2, caller_runtime);
     assert!(caller_restored);
     assert!(after_stop.is_err());
-    assert_eq!(observed.iter().filter(|event| matches!(event, controlled::Event::Poll(5))).count(), 3);
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|event| matches!(event, controlled::Event::Poll(5)))
+            .count(),
+        3
+    );
 }
