@@ -2974,3 +2974,60 @@ async fn compiled_native_nested_factory_reinit_restore_exact_owner_and_suppress_
         assert!(seen.iter().any(|event| event.0 == 13 && event.1 & 7 == 7));
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a fresh-process privately pinned __native-fixture-support eight-artifact cohort"]
+async fn compiled_native_first_foreign_cleanup_panic_keeps_later_resources_and_attempts_original_finish()
+ {
+    let path = std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_TERMINAL_MODULE").unwrap());
+    let (events, receiver) = std::sync::mpsc::channel();
+    // This callback owner deliberately stays retained with the SDK's uncertain
+    // untouched later F/Runtime/callback resources after the first Drop failure.
+    let barrier = Box::into_raw(Box::new(NativeBarrierControls {
+        events,
+        blocked_event: 25,
+        release: (StdMutex::new(false), std::sync::Condvar::new()),
+    }));
+    let controls = NativeControls {
+        ctx: barrier.cast(),
+        event: native_barrier_event,
+    };
+    let host = native_fixture_host();
+    host.load_file_with_config(&path, native_controls_config(47, &controls))
+        .unwrap();
+    let (_, _, _, _, flags) = unsafe { terminal_fixture_symbols(&path) };
+    let mut seen = Vec::new();
+    while !seen.iter().any(|event: &(u32, u32)| event.0 == 2) {
+        seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    host.shutdown(Duration::from_millis(30)).await;
+    while !seen.iter().any(|event| event.0 == 25) {
+        seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    let before_release = flags();
+    seen.extend(receiver.try_iter());
+    let finished_early = seen.iter().any(|event| event.0 == 5);
+    unsafe { &*barrier }.release();
+    while !seen.iter().any(|event| event.0 == 5) {
+        seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    host.shutdown(Duration::from_secs(5)).await;
+    host.shutdown(Duration::from_millis(30)).await;
+    drop(host);
+    let after = flags();
+    seen.extend(receiver.try_iter());
+    assert!(!finished_early);
+    assert_eq!(
+        before_release & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+        0
+    );
+    assert_eq!(seen.iter().filter(|event| **event == (5, 1)).count(), 1);
+    assert_eq!(seen.iter().filter(|event| **event == (7, 1)).count(), 1);
+    assert!(seen.iter().any(|event| event.0 == 13 && event.1 & 7 == 7));
+    assert!(!seen.iter().any(|event| matches!(event.0, 6 | 17 | 20)));
+    assert_ne!(after & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
+    assert_eq!(
+        after & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+        0
+    );
+}

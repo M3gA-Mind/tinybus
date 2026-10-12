@@ -656,7 +656,10 @@ pub extern "C" fn terminal_test_dispatch(index: usize) -> bool {
     let dispatch = FACTORY_DISPATCHES.lock().unwrap().get(index).cloned();
     dispatch.is_some_and(|dispatch| {
         tracing::dispatcher::with_default(&dispatch, || {
-            let enabled = !tracing::info_span!("terminal_factory_dispatch").is_disabled();
+            let span = tracing::info_span!("terminal_factory_dispatch");
+            let enabled = span
+                .metadata()
+                .is_some_and(|metadata| dispatch.enabled(metadata));
             tracing::info!("retained native factory dispatcher");
             enabled
         })
