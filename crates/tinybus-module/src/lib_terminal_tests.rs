@@ -762,3 +762,37 @@ async fn actual_connection_object_drop_after_runtime_timeout_denies_physical_com
     assert_eq!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0);
     assert!(still_anchored, "blocked whole-Connection teardown cannot refund admission");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_connection_object_drop_panic_fences_fault_after_owner_suppression() {
+    let _serial = controlled::TEST_LOCK.lock().await;
+    let (fixture, events) = controlled::fixture();
+    let broker = tinybus::broker::Broker::new();
+    broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+    let host = Arc::new(tinybus::module::ModuleHost::new(broker));
+    host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":0})).unwrap();
+    events.recv_timeout(Duration::from_secs(3)).unwrap();
+    let view = fixture.view.lock().unwrap().take().unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (settled_tx, settled_rx) = std::sync::mpsc::channel();
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let connection = view.inner.resources.lock().unwrap().connection.lock().unwrap().clone().unwrap();
+    connection.serve_at("/teardown".parse().unwrap(), TeardownObject {
+        entered: entered_tx, release: release.clone(), settled: settled_tx, panic: true,
+    }).await.unwrap();
+    drop(connection);
+    let stopping_host = host.clone();
+    let stopping = tokio::spawn(async move { stopping_host.shutdown(Duration::from_secs(8)).await; });
+    entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    release.wait();
+    settled_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    stopping.await.unwrap(); // Runtime teardown settles the real panicking destructor.
+    let completion = view.inner.wait(Duration::ZERO);
+    let flags = unsafe { (view.inner.host.0.native_terminal_state.unwrap())(view.inner.host.0.host_ctx) };
+    let still_anchored = terminal::TerminalState::lookup(view.inner.context()).is_some();
+
+    assert_eq!(completion, TerminalCompletion::Uncertain);
+    assert_eq!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0);
+    assert!(still_anchored, "panicking Connection teardown cannot refund admission");
+    assert_ne!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
+}
