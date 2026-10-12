@@ -10,11 +10,18 @@ fn endpoint() -> HostCallbackEndpoint {
         members: vec!["Observe".parse().unwrap()],
     }
 }
+fn signal_declaration() -> HostCallbackSignal {
+    HostCallbackSignal {
+        path: "/callback".parse().unwrap(),
+        interface: "org.example.Callback".parse().unwrap(),
+        members: vec!["WatchChanged".parse().unwrap()],
+    }
+}
 fn state(source: BusName, destination: BusName) -> Arc<CallbackState> {
     Arc::new(CallbackState {
         destination,
         endpoints: vec![endpoint()],
-        signals: vec![],
+        signals: vec![signal_declaration()],
         module_transport: Mutex::new(None),
         lifetime: Mutex::new(Lifetime {
             active: true,
@@ -27,6 +34,67 @@ fn state(source: BusName, destination: BusName) -> Arc<CallbackState> {
         }),
         drained: Notify::new(),
     })
+}
+
+#[test]
+fn directed_signals_target_only_the_live_bound_module_and_declared_member() {
+    let mut router = Router::default();
+    let (binding_id, binding_peer) = router.attach(tokio::sync::mpsc::channel(8).0);
+    let (module_id, module_peer) = router.attach(tokio::sync::mpsc::channel(8).0);
+    let (outsider_id, outsider_peer) = router.attach(tokio::sync::mpsc::channel(8).0);
+    let (target_sender, mut target_receiver) = tokio::sync::mpsc::channel(8);
+    let (outsider_sender, mut outsider_receiver) = tokio::sync::mpsc::channel(8);
+    router.peers.get_mut(&module_id).unwrap().outbox = target_sender;
+    router.peers.get_mut(&outsider_id).unwrap().outbox = outsider_sender;
+    router.add_match(outsider_id, MatchRule::new().directed_signals()).unwrap();
+    router.set_attestation_for_unique(
+        &module_peer,
+        crate::attest::Attestation {
+            name: "org.example.Module".parse().unwrap(),
+            sha256: "a".repeat(64),
+        },
+    );
+    let capability = state(module_peer.clone(), binding_peer.clone());
+    router.add_host_callbacks(capability.clone()).unwrap();
+
+    let path = "/callback".parse().unwrap();
+    let interface = "org.example.Callback".parse().unwrap();
+    let member = "WatchChanged".parse().unwrap();
+    let mut message = Message::directed_signal(
+        module_peer.clone(),
+        path.clone(),
+        interface.clone(),
+        member.clone(),
+        serde_json::json!([{"watch_id":"opaque","notice":{"kind":"invalidated"}}]),
+    );
+    message.header.sender = Some(binding_peer.clone());
+    let target = router
+        .directed_signal_target(&binding_peer, &module_peer, &message.header)
+        .unwrap();
+    target.try_send(message.clone()).unwrap();
+    assert_eq!(target_receiver.try_recv().unwrap(), message);
+    assert!(outsider_receiver.try_recv().is_err());
+
+    let mut forged = message.clone();
+    forged.header.destination = Some(outsider_peer.clone());
+    assert!(router
+        .directed_signal_target(&binding_peer, &outsider_peer, &forged.header)
+        .is_err());
+    assert!(router
+        .directed_signal_target(&outsider_peer, &module_peer, &message.header)
+        .is_err());
+    let mut wrong_member = message.clone();
+    wrong_member.header.member = Some("Other".parse().unwrap());
+    assert!(router
+        .directed_signal_target(&binding_peer, &module_peer, &wrong_member.header)
+        .is_err());
+
+    router.revoke_host_callbacks(&capability);
+    assert!(router
+        .directed_signal_target(&binding_peer, &module_peer, &message.header)
+        .is_err());
+    router.detach(binding_id);
+    assert!(router.owner_of(&module_peer).is_some());
 }
 fn call(state: &CallbackState) -> Message {
     let endpoint = endpoint();

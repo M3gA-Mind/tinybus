@@ -592,6 +592,12 @@ impl Router {
         destination: &BusName,
         header: &crate::message::Header,
     ) -> Result<mpsc::Sender<Message>> {
+        if header.kind != MessageKind::DirectedSignal
+            || header.sender.as_ref() != Some(source)
+            || header.destination.as_ref() != Some(destination)
+        {
+            return Err(Error::failed("directed signal routing fields are invalid"));
+        }
         if !self.host_callbacks.iter().any(|capability| {
             capability.matches_directed_signal(source, destination, header)
         }) {
