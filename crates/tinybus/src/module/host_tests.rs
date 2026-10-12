@@ -2198,7 +2198,7 @@ fn staged_module(artifact: &Path, hash: &str) -> (tempfile::TempDir, PathBuf) {
     let root = artifact.parent().expect("artifact has a parent directory");
     let dir = tempfile::tempdir_in(root).unwrap();
     #[cfg(windows)]
-    super::cache::secure_release_cache(dir.path(), dir.path());
+    crate::module::cache::secure_release_cache(dir.path(), dir.path());
     let file_name = artifact.file_name().unwrap();
     let staged = dir.path().join(file_name);
     std::fs::copy(artifact, &staged).unwrap();
