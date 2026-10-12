@@ -1242,3 +1242,30 @@ mod setup_factory_test;
 #[cfg(test)]
 #[path = "lib_lifecycle_tests.rs"]
 mod lifecycle_test;
+
+/// Initialize an opted-in instance with native admission and physical hooks.
+///
+/// # Safety
+/// Uphold [`start_module`]'s ABI and output contracts. The compatible native
+/// query and copied host context must remain valid for every retained view,
+/// including after host destruction. Only the actual native query grants
+/// authority; unsupported hosts reject the factory before invoking it.
+#[doc(hidden)]
+pub unsafe fn start_terminal_reconfigurable_module_with_factory<C, F, Fut>(
+    host: *const TbHostVtable, out: *mut TbModuleVtable, worker_threads: usize,
+    _detach_on_panic: bool, factory: impl FnOnce(NativeInstanceLiveness) -> Result<(F, RuntimeHooks)>,
+) -> i32
+where C: serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(Connection, C) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let Some((_, compatible)) = (unsafe { validate_start_arguments(host, out, worker_threads) }) else { return TB_BAD_ARGUMENT; };
+    let Some(state) = terminal::TerminalState::admit(HostCalls(compatible), None) else { return TB_CLOSED; };
+    let _result = factory(state.view());
+    state.empty_factory_failure();
+    TB_CLOSED
+}
+
+#[cfg(test)]
+#[path = "lib_terminal_tests.rs"]
+mod terminal_runtime_tests;
