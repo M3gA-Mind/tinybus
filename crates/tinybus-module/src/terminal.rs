@@ -584,7 +584,7 @@ impl TerminalState {
     }
     fn run_finish(self: &Arc<Self>) {
         let _scope = self.owner.as_ref().map(ExecutionOwner::enter);
-        let finish = loop {
+        loop {
             let mut control = self.lock();
             // Retirement takes precedence over waiting for active_reinit:
             // that caller may itself be awaiting this worker's acknowledgment.
@@ -609,18 +609,27 @@ impl TerminalState {
                 control.request_state, RequestState::Idle | RequestState::Running
             ) {
                 control.finish_state = FinishState::Running;
-                break control.finish.take();
+                break;
             }
             drop(self.changed.wait(control).unwrap_or_else(std::sync::PoisonError::into_inner));
         };
-        let cleanup = catch_unwind(AssertUnwindSafe(|| self.settle_setup()));
-        let setup_settled = match cleanup {
-            Ok(settled) => settled,
-            Err(payload) => {
-                self.source_panic(PayloadKind::Cleanup, payload);
-                false
+        // Execution settlement is distinct from foreign capture destruction.
+        // A failed prior retirement retains all later captures, but does not
+        // spend the controller's still-uninvoked physical finish callback.
+        let execution_settled = self.settle_execution();
+        let retirement_failed = self.lock().retirement_failed;
+        let setup_settled = if execution_settled && !retirement_failed {
+            match catch_unwind(AssertUnwindSafe(|| self.dispose_setup())) {
+                Ok(()) => true,
+                Err(payload) => {
+                    self.source_panic(PayloadKind::Cleanup, payload);
+                    false
+                }
             }
+        } else {
+            execution_settled
         };
+        let finish = self.lock().finish.take();
         let completed = if setup_settled {
             if let Some(owner) = &self.owner {
                 owner.stop();
@@ -639,7 +648,7 @@ impl TerminalState {
             self.lock().finish = finish;
             TerminalCompletion::Uncertain
         };
-        let released = if completed == TerminalCompletion::PhysicallyStopped {
+        let released = if completed == TerminalCompletion::PhysicallyStopped && !retirement_failed {
             match catch_unwind(AssertUnwindSafe(|| self.release_resources())) {
                 Ok(released) => released,
                 Err(payload) => {
@@ -669,8 +678,8 @@ impl TerminalState {
             self.remove_anchor();
         }
     }
-    fn settle_setup(self: &Arc<Self>) -> bool {
-        let (initial, handle, reinitialize, future, reinit_future) = {
+    fn settle_execution(self: &Arc<Self>) -> bool {
+        let (initial, handle) = {
             let mut resources = self
                 .resources
                 .lock()
@@ -681,9 +690,6 @@ impl TerminalState {
                     .runtime
                     .as_ref()
                     .map(|runtime| runtime.handle().clone()),
-                resources.reinitialize.clone(),
-                resources.initial_future.clone(),
-                resources.reinit_future.clone(),
             )
         };
         if let Some(initial) = initial {
@@ -708,13 +714,15 @@ impl TerminalState {
                 }
             }
         }
-        // Fence the admitted synchronous callback without taking its foreign
-        // captures yet. Terminal admission denies a waiter after this fence.
-        drop(
-            reinitialize
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        true
+    }
+    fn dispose_setup(&self) {
+        // The worker already observed active_reinit=false. Every last capture
+        // is taken mechanically and destroyed after all bookkeeping unlocks.
+        let (reinitialize, future, reinit_future) = {
+            let resources = self.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (resources.reinitialize.clone(), resources.initial_future.clone(), resources.reinit_future.clone())
+        };
         if let Some(owner) = &self.owner {
             owner.stop();
         }
@@ -735,7 +743,6 @@ impl TerminalState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         drop(future);
-        true
     }
     fn release_resources(&self) -> bool {
         // Take one owner at a time. If its foreign Drop panics, the enclosing
