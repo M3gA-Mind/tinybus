@@ -53,8 +53,11 @@ fn native_query_is_required_before_terminal_factory_evaluation() {
     ] {
         let native = std::sync::atomic::AtomicU32::new(flags.unwrap_or(0));
         let mut host = host();
-        host.host_ctx = (&native as *const std::sync::atomic::AtomicU32).cast_mut().cast();
-        host.native_terminal_state = flags.map(|_| native_query as unsafe extern "C" fn(*mut c_void) -> u32);
+        host.host_ctx = (&native as *const std::sync::atomic::AtomicU32)
+            .cast_mut()
+            .cast();
+        host.native_terminal_state =
+            flags.map(|_| native_query as unsafe extern "C" fn(*mut c_void) -> u32);
         let calls = AtomicUsize::new(0);
         let mut out = output();
         let code = unsafe {
@@ -74,7 +77,10 @@ fn native_query_is_required_before_terminal_factory_evaluation() {
         };
         assert_eq!(code, TB_CLOSED, "query {flags:?}");
         assert_eq!(calls.load(Ordering::SeqCst), 0, "query {flags:?}");
-        assert!(out.module_ctx.is_null(), "denied init cannot publish output");
+        assert!(
+            out.module_ctx.is_null(),
+            "denied init cannot publish output"
+        );
     }
 }
 
@@ -83,14 +89,22 @@ fn invalid_initial_config_rejects_before_factory_or_output_publication() {
     let native = std::sync::atomic::AtomicU32::new(tinybus::module::abi::TB_NATIVE_TERMINAL_LIVE);
     let bytes = b"{";
     let mut host = host();
-    host.host_ctx = (&native as *const std::sync::atomic::AtomicU32).cast_mut().cast();
+    host.host_ctx = (&native as *const std::sync::atomic::AtomicU32)
+        .cast_mut()
+        .cast();
     host.native_terminal_state = Some(native_query);
-    host.config = TbSlice { ptr: bytes.as_ptr(), len: bytes.len() };
+    host.config = TbSlice {
+        ptr: bytes.as_ptr(),
+        len: bytes.len(),
+    };
     let calls = AtomicUsize::new(0);
     let mut out = output();
     let code = unsafe {
         start_terminal_reconfigurable_module_with_factory::<serde_json::Value, _, _>(
-            &host, &mut out, 1, true,
+            &host,
+            &mut out,
+            1,
+            true,
             |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok((
@@ -219,6 +233,7 @@ mod controlled {
         worker: StdMutex<Option<std::thread::JoinHandle<bool>>>,
         pub requests: AtomicUsize,
         pub joins: AtomicUsize,
+        pub workers_started: AtomicUsize,
         pub finishes: AtomicUsize,
         pub hook_failure: AtomicUsize,
         pub factory_failure: AtomicUsize,
@@ -241,6 +256,7 @@ mod controlled {
             worker: StdMutex::new(None),
             requests: AtomicUsize::new(0),
             joins: AtomicUsize::new(0),
+            workers_started: AtomicUsize::new(0),
             finishes: AtomicUsize::new(0),
             hook_failure: AtomicUsize::new(0),
             factory_failure: AtomicUsize::new(0),
@@ -345,9 +361,14 @@ mod controlled {
     fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)> {
         let fixture = NEXT.lock().unwrap().take().unwrap();
         *fixture.view.lock().unwrap() = Some(view.clone());
-        view.inner.reject_startup_for_test(fixture.startup_failure.load(Ordering::Acquire) as u8);
+        view.inner
+            .reject_startup_for_test(fixture.startup_failure.load(Ordering::Acquire) as u8);
         match fixture.factory_failure.load(Ordering::Acquire) {
-            1 => return Err(Error::failed("controlled factory failure before hook transfer")),
+            1 => {
+                return Err(Error::failed(
+                    "controlled factory failure before hook transfer",
+                ));
+            }
             2 => std::panic::panic_any(HookPayload(fixture.clone())),
             _ => {}
         }
@@ -372,6 +393,7 @@ mod controlled {
                         })
                         .unwrap(),
                 );
+                fixture.workers_started.fetch_add(1, Ordering::Release);
             }
             drop(worker);
             if config.mode == 4 {
@@ -453,7 +475,9 @@ async fn actual_linked_posttransfer_startup_panics_keep_received_captures_on_phy
         let (fixture, events) = controlled::fixture();
         fixture.startup_failure.store(stage, Ordering::Release);
         let broker = tinybus::broker::Broker::new();
-        broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+        broker
+            .clone()
+            .spawn(tinybus::transport::memory::MemoryBus::new());
         let host = Arc::new(tinybus::module::ModuleHost::new(broker));
         let rejected = host.attach_linked_with_config(
             controlled::linked_module().unwrap(),
@@ -472,21 +496,44 @@ async fn actual_linked_posttransfer_startup_panics_keep_received_captures_on_phy
         assert!(view.inner.request_done_for_test());
         assert_eq!(fixture.requests.load(Ordering::Acquire), 1, "stage {stage}");
         assert_eq!(fixture.finishes.load(Ordering::Acquire), 1, "stage {stage}");
-        assert_eq!(fixture.config_drops.load(Ordering::Acquire), 1, "stage {stage}");
-        assert!(observations.iter().any(|event| matches!(event,
-            controlled::Event::FactoryDrop(name) if name == "tinybus-terminal")), "stage {stage}");
-        assert!(observations.iter().filter_map(|event| match event {
-            controlled::Event::ConfigDrop(name) | controlled::Event::FutureDrop(name) => Some(name),
-            _ => None,
-        }).all(|name| name == "tinybus-terminal"), "stage {stage}");
-        let launched = observations.iter().any(|event| matches!(event, controlled::Event::Poll(_)));
-        assert_eq!(fixture.joins.load(Ordering::Acquire), usize::from(launched), "stage {stage}");
+        assert_eq!(
+            fixture.config_drops.load(Ordering::Acquire),
+            1,
+            "stage {stage}"
+        );
+        assert!(
+            observations.iter().any(|event| matches!(event,
+            controlled::Event::FactoryDrop(name) if name == "tinybus-terminal")),
+            "stage {stage}"
+        );
+        assert!(
+            observations
+                .iter()
+                .filter_map(|event| match event {
+                    controlled::Event::ConfigDrop(name) | controlled::Event::FutureDrop(name) =>
+                        Some(name),
+                    _ => None,
+                })
+                .all(|name| name == "tinybus-terminal"),
+            "stage {stage}"
+        );
+        assert_eq!(
+            fixture.joins.load(Ordering::Acquire),
+            fixture.workers_started.load(Ordering::Acquire),
+            "stage {stage}"
+        );
         assert_ne!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
-        assert_eq!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0);
+        assert_eq!(
+            flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+            0
+        );
         assert!(terminal::TerminalState::lookup(view.inner.context()).is_some());
         if stage == 5 || stage == 6 {
-            assert_eq!(view.inner.transport_drop_thread_for_test().as_deref(),
-                Some("tinybus-terminal"), "actual startup transport stage {stage}");
+            assert_eq!(
+                view.inner.transport_drop_thread_for_test().as_deref(),
+                Some("tinybus-terminal"),
+                "actual startup transport stage {stage}"
+            );
         }
         let resources = view.inner.resources.lock().unwrap();
         assert!(resources.runtime.is_none());
@@ -503,7 +550,9 @@ async fn actual_linked_factory_failure_disposes_received_config_on_physical_work
         let (fixture, events) = controlled::fixture();
         fixture.factory_failure.store(mode, Ordering::Release);
         let broker = tinybus::broker::Broker::new();
-        broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+        broker
+            .clone()
+            .spawn(tinybus::transport::memory::MemoryBus::new());
         let host = Arc::new(tinybus::module::ModuleHost::new(broker));
         let rejected = host.attach_linked_with_config(
             controlled::linked_module().unwrap(),
@@ -519,11 +568,14 @@ async fn actual_linked_factory_failure_disposes_received_config_on_physical_work
         // Parsed C already belongs to SDK: its actual Drop must occur on the
         // original physical job even though no output vtable was returned.
         assert!(rejected.is_err());
-        assert_eq!(completed, if mode == 1 {
-            TerminalCompletion::PhysicallyStopped
-        } else {
-            TerminalCompletion::Uncertain
-        });
+        assert_eq!(
+            completed,
+            if mode == 1 {
+                TerminalCompletion::PhysicallyStopped
+            } else {
+                TerminalCompletion::Uncertain
+            }
+        );
         assert_eq!(fixture.config_drops.load(Ordering::Acquire), 1);
         assert_eq!(fixture.requests.load(Ordering::Acquire), 0);
         assert_eq!(fixture.finishes.load(Ordering::Acquire), 0);
@@ -533,8 +585,11 @@ async fn actual_linked_factory_failure_disposes_received_config_on_physical_work
             controlled::Event::ConfigDrop(name) if name == "tinybus-terminal")));
         assert_eq!(observations.len(), 1);
         assert_ne!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
-        assert_eq!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0,
-            "SDK failed-init cleanup cannot fabricate host physical completion");
+        assert_eq!(
+            flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+            0,
+            "SDK failed-init cleanup cannot fabricate host physical completion"
+        );
         assert!(!view.is_live());
         if mode == 1 {
             assert!(terminal::TerminalState::lookup(view.inner.context()).is_none());
@@ -551,11 +606,15 @@ async fn actual_linked_hook_panics_and_uncertain_finish_preserve_once_join_and_a
         let (fixture, events) = controlled::fixture();
         fixture.hook_failure.store(mode, Ordering::Release);
         let broker = tinybus::broker::Broker::new();
-        broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+        broker
+            .clone()
+            .spawn(tinybus::transport::memory::MemoryBus::new());
         let host = Arc::new(tinybus::module::ModuleHost::new(broker));
         host.attach_linked_with_config(
-            controlled::linked_module().unwrap(), serde_json::json!({"mode":1}),
-        ).unwrap();
+            controlled::linked_module().unwrap(),
+            serde_json::json!({"mode":1}),
+        )
+        .unwrap();
         let entered = events.recv_timeout(Duration::from_secs(3)).unwrap();
         let view = fixture.view.lock().unwrap().take().unwrap();
         let context = view.inner.context();
@@ -582,9 +641,17 @@ async fn actual_linked_hook_panics_and_uncertain_finish_preserve_once_join_and_a
         if mode != 3 {
             assert_ne!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
         }
-        let future_drop = observations.iter().position(|event| matches!(event,
-            controlled::Event::FutureDrop(name) if name == "tinybus-terminal")).unwrap();
-        let finish = observations.iter().position(|event| matches!(event, controlled::Event::Finish)).unwrap();
+        let future_drop = observations
+            .iter()
+            .position(|event| {
+                matches!(event,
+            controlled::Event::FutureDrop(name) if name == "tinybus-terminal")
+            })
+            .unwrap();
+        let finish = observations
+            .iter()
+            .position(|event| matches!(event, controlled::Event::Finish))
+            .unwrap();
         assert!(future_drop < finish);
         // Neither a later cause upgrade nor shutdown retry spends hooks again.
         view.request_fault();
@@ -600,11 +667,15 @@ async fn actual_linked_rejected_physical_spawn_retains_received_resources_withou
     let _serial = controlled::TEST_LOCK.lock().await;
     let (fixture, events) = controlled::fixture();
     let broker = tinybus::broker::Broker::new();
-    broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+    broker
+        .clone()
+        .spawn(tinybus::transport::memory::MemoryBus::new());
     let host = Arc::new(tinybus::module::ModuleHost::new(broker));
     host.attach_linked_with_config(
-        controlled::linked_module().unwrap(), serde_json::json!({"mode":1}),
-    ).unwrap();
+        controlled::linked_module().unwrap(),
+        serde_json::json!({"mode":1}),
+    )
+    .unwrap();
     let entered = events.recv_timeout(Duration::from_secs(3)).unwrap();
     let view = fixture.view.lock().unwrap().take().unwrap();
     let context = view.inner.context();
@@ -625,12 +696,19 @@ async fn actual_linked_rejected_physical_spawn_retains_received_resources_withou
     assert_eq!(fixture.requests.load(Ordering::Acquire), 1);
     assert_eq!(fixture.finishes.load(Ordering::Acquire), 0);
     assert_eq!(fixture.joins.load(Ordering::Acquire), 1);
-    assert!(!observations.iter().any(|event| matches!(event,
-        controlled::Event::FactoryDrop(_) | controlled::Event::FutureDrop(_) | controlled::Event::Finish)));
+    assert!(!observations.iter().any(|event| matches!(
+        event,
+        controlled::Event::FactoryDrop(_)
+            | controlled::Event::FutureDrop(_)
+            | controlled::Event::Finish
+    )));
     assert!(!view.is_live());
     drop(host);
     view.request_fault();
-    assert_eq!(view.inner.wait(Duration::from_millis(20)), TerminalCompletion::Uncertain);
+    assert_eq!(
+        view.inner.wait(Duration::from_millis(20)),
+        TerminalCompletion::Uncertain
+    );
     assert_eq!(fixture.requests.load(Ordering::Acquire), 1);
     assert_eq!(fixture.finishes.load(Ordering::Acquire), 0);
     let anchored = terminal::TerminalState::lookup(context).unwrap();
@@ -1103,10 +1181,15 @@ impl Drop for BlockingMethodPayload {
         let flags = unsafe { host.native_terminal_state.unwrap()(host.host_ctx) };
         // This sample is the first foreign payload-disposal action. It reads
         // actual copied native authority and the real registered request state.
-        self.0.entered.send((
-            flags, state.request_done_for_test(), state.sdk_owner_count_for_test(),
-            tokio::runtime::Handle::current().id(),
-        )).unwrap();
+        self.0
+            .entered
+            .send((
+                flags,
+                state.request_done_for_test(),
+                state.sdk_owner_count_for_test(),
+                tokio::runtime::Handle::current().id(),
+            ))
+            .unwrap();
         drop(state);
         self.0.release.wait();
         self.0.settled.send(()).unwrap();
@@ -1121,7 +1204,11 @@ impl tinybus::Interface for MethodPayloadObject {
     fn members(&self) -> Vec<tinybus::MemberName> {
         vec!["Panic".parse().unwrap()]
     }
-    async fn call(&self, _: &tinybus::MemberName, _: serde_json::Value) -> Result<serde_json::Value> {
+    async fn call(
+        &self,
+        _: &tinybus::MemberName,
+        _: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         std::panic::panic_any(BlockingMethodPayload(self.0.clone()));
     }
 }
@@ -1133,31 +1220,47 @@ async fn actual_method_observer_fences_native_fault_and_request_done_before_bloc
     let broker = tinybus::broker::Broker::new();
     let bus = tinybus::transport::memory::MemoryBus::new();
     broker.clone().spawn(bus.clone());
-    let client = Connection::connect(bus.connect().await.unwrap()).await.unwrap();
+    let client = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
     let host = Arc::new(tinybus::module::ModuleHost::new(broker));
     host.attach_linked_with_config(
-        controlled::linked_module().unwrap(), serde_json::json!({"mode":0}),
-    ).unwrap();
+        controlled::linked_module().unwrap(),
+        serde_json::json!({"mode":0}),
+    )
+    .unwrap();
     events.recv_timeout(Duration::from_secs(3)).unwrap();
     let view = fixture.view.lock().unwrap().take().unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (settled_tx, settled_rx) = std::sync::mpsc::channel();
     let release = Arc::new(std::sync::Barrier::new(2));
     let gate = Arc::new(MethodPayloadGate {
-        state: Arc::downgrade(&view.inner), entered: entered_tx,
-        release: release.clone(), settled: settled_tx,
+        state: Arc::downgrade(&view.inner),
+        entered: entered_tx,
+        release: release.clone(),
+        settled: settled_tx,
     });
     let (connection, module_runtime) = {
         let resources = view.inner.resources.lock().unwrap();
         let connection = resources.connection.lock().unwrap().clone().unwrap();
-        (connection, resources.runtime.as_ref().unwrap().handle().id())
+        (
+            connection,
+            resources.runtime.as_ref().unwrap().handle().id(),
+        )
     };
     let destination = connection.unique_name().unwrap().to_string();
-    connection.serve_at("/payload".parse().unwrap(), MethodPayloadObject(gate)).await.unwrap();
+    connection
+        .serve_at("/payload".parse().unwrap(), MethodPayloadObject(gate))
+        .await
+        .unwrap();
     drop(connection);
     let call = tokio::spawn(async move {
-        client.proxy(&destination, "/payload", "ai.tinyhumans.tinybus.Payload")
-            .unwrap().with_timeout(Duration::from_secs(8)).call::<serde_json::Value>("Panic", ()).await
+        client
+            .proxy(&destination, "/payload", "ai.tinyhumans.tinybus.Payload")
+            .unwrap()
+            .with_timeout(Duration::from_secs(8))
+            .call::<serde_json::Value>("Panic", ())
+            .await
     });
     let sample = entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     // Actual method task is held in foreign payload Drop. Its Connection owner
@@ -1175,16 +1278,27 @@ async fn actual_method_observer_fences_native_fault_and_request_done_before_bloc
         while view.inner.sdk_owner_count_for_test() != 0 {
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     // All controlled payload work, actual method caller and controller worker
     // have settled before assertions; the conservative original anchor remains.
     assert_ne!(sample.0 & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
-    assert!(sample.1, "installed observer must finish bounded request before foreign Drop");
-    assert!(sample.2 > 0, "actual method Connection/task must retain SDK State owner");
+    assert!(
+        sample.1,
+        "installed observer must finish bounded request before foreign Drop"
+    );
+    assert!(
+        sample.2 > 0,
+        "actual method Connection/task must retain SDK State owner"
+    );
     assert_eq!(sample.3, module_runtime);
     assert_eq!(completion, TerminalCompletion::Uncertain);
     assert!(anchored && retained_sdk > 0);
-    assert_eq!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0);
+    assert_eq!(
+        flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+        0
+    );
     assert_eq!(fixture.requests.load(Ordering::Acquire), 1);
     assert_eq!(fixture.finishes.load(Ordering::Acquire), 1);
     assert_eq!(fixture.joins.load(Ordering::Acquire), 1);

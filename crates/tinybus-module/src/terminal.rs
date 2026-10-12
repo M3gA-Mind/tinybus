@@ -243,7 +243,10 @@ impl SdkOwner {
     #[cfg(test)]
     pub(super) fn record_transport_drop_for_test(&self) {
         *self.state.transport_drop_thread.lock().unwrap() = Some(
-            std::thread::current().name().unwrap_or("unnamed").to_owned(),
+            std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_owned(),
         );
     }
     pub fn caught_panic(&self) {
@@ -613,7 +616,10 @@ impl TerminalState {
     }
     #[cfg(test)]
     pub(super) fn request_done_for_test(&self) -> bool {
-        matches!(self.lock().request_state, RequestState::Done | RequestState::Panicked)
+        matches!(
+            self.lock().request_state,
+            RequestState::Done | RequestState::Panicked
+        )
     }
     fn schedule(self: &Arc<Self>) {
         let job = {
@@ -636,7 +642,9 @@ impl TerminalState {
         #[cfg(not(test))]
         let rejected = false;
         let submitted = if rejected {
-            Err(std::io::Error::other("controlled terminal worker spawn failure"))
+            Err(std::io::Error::other(
+                "controlled terminal worker spawn failure",
+            ))
         } else {
             std::thread::Builder::new()
                 .name("tinybus-terminal".into())
