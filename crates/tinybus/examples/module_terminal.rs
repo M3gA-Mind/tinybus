@@ -10,6 +10,9 @@ use std::{
 use tinybus::{Connection, Result};
 static DROPPED: AtomicUsize = AtomicUsize::new(0);
 static EARLY: Mutex<Option<Controls>> = Mutex::new(None);
+static NEXT_FACTORY_MODE: AtomicUsize = AtomicUsize::new(0);
+static FACTORIES: AtomicUsize = AtomicUsize::new(0);
+static RETAINED_VIEWS: Mutex<Vec<NativeInstanceLiveness>> = Mutex::new(Vec::new());
 #[derive(Clone, Copy)]
 struct NativeQuery {
     ctx: *mut c_void,
@@ -40,6 +43,7 @@ impl Controls {
 struct Controller {
     controls: Mutex<Option<Controls>>,
     view: NativeInstanceLiveness,
+    mode: AtomicUsize,
     wake: (Mutex<bool>, Condvar),
     worker: Mutex<Option<std::thread::JoinHandle<bool>>>,
 }
@@ -94,14 +98,29 @@ impl Drop for SetupFuture {
 type FixtureFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 type FixtureSetup = Box<dyn Fn(Connection, Config) -> FixtureFuture + Send + Sync>;
 fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)> {
+    FACTORIES.fetch_add(1, Ordering::AcqRel);
+    let factory_mode = NEXT_FACTORY_MODE.swap(0, Ordering::AcqRel);
+    if factory_mode == 3 {
+        RETAINED_VIEWS.lock().unwrap().push(view.clone());
+    }
     let early = EARLY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
-    let held_finish = early.is_some();
+    if let Some(controls) = early {
+        controls.emit(9, factory_mode as u32);
+    }
+    if factory_mode == 1 {
+        return Err(tinybus::Error::failed("controlled factory error"));
+    }
+    if factory_mode == 2 {
+        panic!("controlled factory panic");
+    }
+    let held_finish = early.is_some() && factory_mode == 0;
     let controller = Arc::new(Controller {
         controls: Mutex::new(early),
         view,
+        mode: AtomicUsize::new(factory_mode),
         wake: (Mutex::new(false), Condvar::new()),
         worker: Mutex::new(None),
     });
@@ -122,6 +141,7 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
                 .cast::<Controls>()
                 .read_unaligned()
         };
+        controller.mode.store(usize::from(config.mode), Ordering::Release);
         *controller
             .controls
             .lock()
@@ -175,6 +195,9 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
             request.wake.1.notify_all();
             request.emit(3, 1);
+            if request.mode.load(Ordering::Acquire) == 10 {
+                panic!("controlled native request panic");
+            }
         },
         move || {
             if held_finish {
@@ -188,6 +211,11 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
             let outcome = worker.map(|worker| worker.join());
             let joined = outcome.is_none() || matches!(outcome, Some(Ok(true)));
             finish.emit(5, u32::from(joined));
+            match finish.mode.load(Ordering::Acquire) {
+                11 => panic!("controlled native finish panic"),
+                12 => return TerminalCompletion::Uncertain,
+                _ => {}
+            }
             if joined {
                 TerminalCompletion::PhysicallyStopped
             } else {
@@ -291,4 +319,37 @@ pub extern "C" fn terminal_test_native_flags() -> u32 {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     query.map_or(0, |query| unsafe { (query.query)(query.ctx) })
+}
+
+/// # Safety
+/// Controls must remain live through all emitted callbacks. Modes only configure
+/// this example fixture; they do not grant native permission or construct views.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn terminal_test_factory_mode(
+    mode: usize,
+    ctx: *mut c_void,
+    event: unsafe extern "C" fn(*mut c_void, u32, u32),
+) {
+    *EARLY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some(Controls { ctx, event });
+    NEXT_FACTORY_MODE.store(mode, Ordering::Release);
+}
+/// Counts actual factory invocations, including those which return no hooks.
+#[unsafe(no_mangle)]
+pub extern "C" fn terminal_test_factories() -> usize {
+    FACTORIES.load(Ordering::Acquire)
+}
+/// Samples escaped actual factory-provided views against their copied host query.
+#[unsafe(no_mangle)]
+pub extern "C" fn terminal_test_retained_live() -> usize {
+    let views = RETAINED_VIEWS.lock().unwrap().clone();
+    views.iter().filter(|view| view.is_live()).count()
+}
+/// Release escaped actual views outside their fixture storage lock.
+#[unsafe(no_mangle)]
+pub extern "C" fn terminal_test_release_views() -> usize {
+    let views = std::mem::take(&mut *RETAINED_VIEWS.lock().unwrap());
+    let count = views.len();
+    drop(views);
+    count
 }
