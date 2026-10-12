@@ -3057,7 +3057,7 @@ async fn compiled_native_first_foreign_cleanup_panic_keeps_later_resources_and_a
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires a fresh-process privately pinned __native-fixture-support eight-artifact cohort"]
-async fn compiled_native_prior_reinit_future_drop_uses_configured_handle_and_retains_settlement() {
+async fn compiled_native_prior_reinit_future_drop_restores_owner_and_retains_settlement() {
     let path = std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_TERMINAL_MODULE").unwrap());
     let warm = native_fixture_host();
     let (events, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
@@ -3160,8 +3160,13 @@ async fn compiled_native_prior_reinit_future_drop_uses_configured_handle_and_ret
         assert_eq!(seen.iter().filter(|event| **event == (5, 1)).count(), 1);
         assert_eq!(seen.iter().filter(|event| **event == (7, 1)).count(), 1);
         assert!(
-            seen.contains(&(38, 1)),
-            "actual previous future Drop requires its configured Tokio Handle: {seen:?}"
+            seen.contains(&(38, 0)),
+            "construction Handle guard ends before its ack and later foreign Drop: {seen:?}"
+        );
+        assert!(seen.iter().any(|event| event.0 == 39 && event.1 & 1 == 1));
+        assert!(
+            seen.contains(&(25, 1)),
+            "actual previous Drop on the same physical worker"
         );
         if mode == 49 {
             assert_eq!(later_resources & (1 | 8 | 16 | 32), 1 | 8 | 16 | 32);

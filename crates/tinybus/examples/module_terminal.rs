@@ -155,7 +155,10 @@ impl Drop for SetupFuture {
                 .emit(38, u32::from(tokio::runtime::Handle::try_current().is_ok()));
         }
         if self.mode == 42 || self.mode == 47 || self.mode == 48 || self.mode == 49 {
-            self.controller.emit(25, 0);
+            self.controller.emit(
+                25,
+                u32::from(std::thread::current().name() == Some("tinybus-terminal")),
+            );
         }
         if self.mode == 47 || self.mode == 49 {
             std::panic::panic_any(PrimaryPayload(*self.controller.controls.lock().unwrap()));
