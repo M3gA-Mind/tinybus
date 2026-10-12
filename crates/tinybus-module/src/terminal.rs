@@ -60,12 +60,18 @@ impl NativeInstanceLiveness {
     #[doc(hidden)]
     #[cfg(feature = "__native-fixture-support")]
     pub fn __fixture_owner_is_current(&self) -> bool {
-        self.inner.owner.as_ref().is_some_and(ExecutionOwner::is_current_for_fixture)
+        self.inner
+            .owner
+            .as_ref()
+            .is_some_and(ExecutionOwner::is_current_for_fixture)
     }
     #[doc(hidden)]
     #[cfg(feature = "__native-fixture-support")]
     pub fn __fixture_owner_is_stopped(&self) -> bool {
-        self.inner.owner.as_ref().is_some_and(ExecutionOwner::is_stopped_for_fixture)
+        self.inner
+            .owner
+            .as_ref()
+            .is_some_and(ExecutionOwner::is_stopped_for_fixture)
     }
     #[doc(hidden)]
     #[cfg(feature = "__native-fixture-support")]

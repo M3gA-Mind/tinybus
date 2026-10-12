@@ -966,6 +966,34 @@ async fn compiled_native_terminal_owns_initial_cancellation_panics_join_and_stal
                 "retired successful context must not act on replacement mode {mode}"
             );
         }
+        // The instrumented fixture compares Arc identity internally. Only
+        // booleans cross its controls; neither TLS nor these events authorize work.
+        assert!(
+            seen.iter()
+                .any(|(event, bits)| *event == 10 && bits & 1 != 0)
+        );
+        assert!(
+            seen.iter()
+                .any(|(event, bits)| *event == 12 && bits & 1 != 0)
+        );
+        assert!(
+            seen.iter()
+                .any(|(event, bits)| *event == 13 && bits & 7 == 7)
+        );
+        assert!(
+            seen.iter()
+                .any(|(event, bits)| *event == 15 && bits & 7 == 7)
+        );
+        if mode != 4 {
+            assert!(
+                seen.iter()
+                    .any(|(event, bits)| *event == 11 && bits & 9 == 9)
+            );
+            assert!(
+                seen.iter()
+                    .any(|(event, bits)| *event == 14 && bits & 1 != 0)
+            );
+        }
         assert_eq!(seen.iter().filter(|(event, _)| *event == 3).count(), 1);
         assert_eq!(
             seen.iter()

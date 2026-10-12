@@ -34,9 +34,11 @@ impl ExecutionOwner {
     }
     #[cfg(feature = "__native-fixture-support")]
     pub(super) fn is_current_for_fixture(&self) -> bool {
-        OWNER.with(|slot| slot.borrow().as_ref().is_some_and(|current| {
-            Arc::ptr_eq(&self.live, &current.live)
-        }))
+        OWNER.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .is_some_and(|current| Arc::ptr_eq(&self.live, &current.live))
+        })
     }
     #[cfg(feature = "__native-fixture-support")]
     pub(super) fn is_stopped_for_fixture(&self) -> bool {

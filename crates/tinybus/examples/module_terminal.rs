@@ -50,10 +50,13 @@ struct Controller {
 impl Controller {
     fn observe(&self, event: u32) {
         #[cfg(feature = "__native-fixture-support")]
-        self.emit(event, u32::from(self.view.__fixture_owner_is_current())
-            | (u32::from(self.view.__fixture_owner_is_stopped()) << 1)
-            | (u32::from(self.view.__fixture_request_done()) << 2)
-            | (u32::from(self.view.__fixture_sdk_owners() != 0) << 3));
+        self.emit(
+            event,
+            u32::from(self.view.__fixture_owner_is_current())
+                | (u32::from(self.view.__fixture_owner_is_stopped()) << 1)
+                | (u32::from(self.view.__fixture_request_done()) << 2)
+                | (u32::from(self.view.__fixture_sdk_owners() != 0) << 3),
+        );
         #[cfg(not(feature = "__native-fixture-support"))]
         let _ = event;
     }
@@ -140,7 +143,9 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
     #[cfg(feature = "__native-fixture-support")]
     match factory_mode {
         20 => controller.view.__fixture_reject_worker_spawn(),
-        21..=28 => controller.view.__fixture_reject_startup((factory_mode - 20) as u8),
+        21..=28 => controller
+            .view
+            .__fixture_reject_startup((factory_mode - 20) as u8),
         _ => {}
     }
     if held_finish {
@@ -161,7 +166,9 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
                 .cast::<Controls>()
                 .read_unaligned()
         };
-        controller.mode.store(usize::from(config.mode), Ordering::Release);
+        controller
+            .mode
+            .store(usize::from(config.mode), Ordering::Release);
         *controller
             .controls
             .lock()
@@ -352,8 +359,9 @@ pub unsafe extern "C" fn terminal_test_factory_mode(
     ctx: *mut c_void,
     event: unsafe extern "C" fn(*mut c_void, u32, u32),
 ) {
-    *EARLY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-        Some(Controls { ctx, event });
+    *EARLY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Controls { ctx, event });
     NEXT_FACTORY_MODE.store(mode, Ordering::Release);
 }
 /// Counts actual factory invocations, including those which return no hooks.
