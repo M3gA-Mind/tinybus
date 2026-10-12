@@ -1702,6 +1702,13 @@ where
             },
             _owner: state.sdk_owner(),
         });
+        // Attach before any later fallible startup boundary. The ABI/task local
+        // is never the sole owner of the received SDK transport.
+        state
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .transport = Some(transport.clone());
         #[cfg(test)]
         state.startup_checkpoint_for_test(5);
         let (handle, connection_slot, factory) = {

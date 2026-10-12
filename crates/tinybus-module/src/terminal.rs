@@ -191,6 +191,7 @@ pub(super) struct StartupResources {
     pub reinitialize: Arc<StdMutex<Option<TerminalReinitialize>>>,
     pub connection: Arc<StdMutex<Option<Connection>>>,
     pub inbound: Option<mpsc::Sender<IncomingFrame>>,
+    pub transport: Option<Arc<TerminalTransport>>,
     pub initial: Option<tokio::task::JoinHandle<Result<()>>>,
     pub initial_future: SetupFutureSlot,
     pub reinit_future: SetupFutureSlot,
@@ -206,6 +207,7 @@ impl Default for StartupResources {
             reinitialize: Arc::new(StdMutex::new(None)),
             connection: Arc::new(StdMutex::new(None)),
             inbound: None,
+            transport: None,
             initial: None,
             initial_future: Arc::new(StdMutex::new(None)),
             reinit_future: Arc::new(StdMutex::new(None)),
@@ -908,6 +910,13 @@ impl TerminalState {
             .inbound
             .take();
         drop(inbound);
+        let transport = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .transport
+            .take();
+        drop(transport);
         let runtime = self
             .resources
             .lock()
