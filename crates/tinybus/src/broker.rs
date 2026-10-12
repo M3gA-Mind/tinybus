@@ -50,11 +50,20 @@ pub struct Broker {
     // failed upgrade by falling back to the ordinary routing error.
     #[cfg(feature = "modules")]
     modules: Arc<Mutex<Option<Weak<dyn crate::module::host::ModuleControl>>>>,
-    // None is legacy permissive mode. Some(empty) denies all mutating module
+    // None is legacy permissive mode. An unselected binding denies mutating module
     // calls until the host attaches one concrete controller transport. The
     // binding never follows a well-known name or changes on disconnect.
     #[cfg(feature = "modules")]
-    module_controller: Option<Arc<Mutex<Option<BusName>>>>,
+    module_controller: Option<Arc<Mutex<ModuleControllerBinding>>>,
+}
+
+#[cfg(feature = "modules")]
+#[derive(Default)]
+enum ModuleControllerBinding {
+    #[default]
+    Unselected,
+    Attaching,
+    Selected(BusName),
 }
 
 impl Broker {
@@ -85,7 +94,7 @@ impl Broker {
     #[cfg(feature = "modules")]
     pub fn new_restricted_module_control() -> Self {
         Self {
-            module_controller: Some(Arc::new(Mutex::new(None))),
+            module_controller: Some(Arc::new(Mutex::new(ModuleControllerBinding::Unselected))),
             ..Self::new()
         }
     }
@@ -110,14 +119,18 @@ impl Broker {
         let Some(binding) = &self.module_controller else {
             return Err(module_control_denied());
         };
-        let mut controller = binding.lock().expect("module controller lock");
-        if controller.is_some() {
-            return Err(module_control_denied());
+        {
+            let mut controller = binding.lock().expect("module controller lock");
+            if !matches!(*controller, ModuleControllerBinding::Unselected) {
+                return Err(module_control_denied());
+            }
+            // Reserve selection before attachment, but release the lock before
+            // external transport callbacks (including its diagnostic label).
+            *controller = ModuleControllerBinding::Attaching;
         }
-        // Keep selection locked across attachment: a spawned reader cannot
-        // admit control until its immutable connection binding is published.
         let unique = self.attach(transport);
-        *controller = Some(unique.clone());
+        *binding.lock().expect("module controller lock") =
+            ModuleControllerBinding::Selected(unique.clone());
         Ok(unique)
     }
 
@@ -527,7 +540,10 @@ impl Broker {
             operation,
             ModuleMember::List | ModuleMember::Get | ModuleMember::GetManifest
         ) && self.module_controller.as_ref().is_some_and(|binding| {
-            binding.lock().expect("module controller lock").as_ref() != Some(from_name)
+            !matches!(
+                &*binding.lock().expect("module controller lock"),
+                ModuleControllerBinding::Selected(controller) if controller == from_name
+            )
         }) {
             // Admission precedes argument parsing and every control callback;
             // neither body fields nor a forged sender header can select it.
