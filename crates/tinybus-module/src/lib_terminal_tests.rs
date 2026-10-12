@@ -37,13 +37,60 @@ fn output() -> TbModuleVtable {
 }
 #[test]
 fn native_query_is_required_before_terminal_factory_evaluation() {
+    use tinybus::module::abi::*;
+    // Exactly LIVE is the sole admitted value. Missing, empty, terminal,
+    // combined and unknown flags must not evaluate arbitrary factory code.
+    for flags in [
+        None,
+        Some(0),
+        Some(TB_NATIVE_TERMINAL_STOP_INTENT),
+        Some(TB_NATIVE_TERMINAL_FAULT),
+        Some(TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED),
+        Some(TB_NATIVE_TERMINAL_LIVE | TB_NATIVE_TERMINAL_STOP_INTENT),
+        Some(TB_NATIVE_TERMINAL_LIVE | TB_NATIVE_TERMINAL_FAULT),
+        Some(TB_NATIVE_TERMINAL_LIVE | (1 << 31)),
+        Some(u32::MAX),
+    ] {
+        let native = std::sync::atomic::AtomicU32::new(flags.unwrap_or(0));
+        let mut host = host();
+        host.host_ctx = (&native as *const std::sync::atomic::AtomicU32).cast_mut().cast();
+        host.native_terminal_state = flags.map(|_| native_query as unsafe extern "C" fn(*mut c_void) -> u32);
+        let calls = AtomicUsize::new(0);
+        let mut out = output();
+        let code = unsafe {
+            start_terminal_reconfigurable_module_with_factory::<serde_json::Value, _, _>(
+                &host,
+                &mut out,
+                1,
+                true,
+                |_| {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok((
+                        |_: Connection, _: serde_json::Value| async { Ok(()) },
+                        RuntimeHooks::new(|_| {}, || TerminalCompletion::PhysicallyStopped),
+                    ))
+                },
+            )
+        };
+        assert_eq!(code, TB_CLOSED, "query {flags:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "query {flags:?}");
+        assert!(out.module_ctx.is_null(), "denied init cannot publish output");
+    }
+}
+
+#[test]
+fn invalid_initial_config_rejects_before_factory_or_output_publication() {
+    let native = std::sync::atomic::AtomicU32::new(tinybus::module::abi::TB_NATIVE_TERMINAL_LIVE);
+    let bytes = b"{";
+    let mut host = host();
+    host.host_ctx = (&native as *const std::sync::atomic::AtomicU32).cast_mut().cast();
+    host.native_terminal_state = Some(native_query);
+    host.config = TbSlice { ptr: bytes.as_ptr(), len: bytes.len() };
     let calls = AtomicUsize::new(0);
+    let mut out = output();
     let code = unsafe {
         start_terminal_reconfigurable_module_with_factory::<serde_json::Value, _, _>(
-            &host(),
-            &mut output(),
-            1,
-            true,
+            &host, &mut out, 1, true,
             |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 Ok((
@@ -53,12 +100,9 @@ fn native_query_is_required_before_terminal_factory_evaluation() {
             },
         )
     };
-    assert_eq!(code, TB_CLOSED);
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        0,
-        "missing native query must leave the factory untouched"
-    );
+    assert_eq!(code, TB_BAD_ARGUMENT);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(out.module_ctx.is_null());
 }
 
 unsafe extern "C" fn native_query(ctx: *mut c_void) -> u32 {
