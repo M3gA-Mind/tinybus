@@ -231,3 +231,25 @@ configuration validation, deadlines and error codes remain authoritative.
 Factory panics return the native initialization panic code. The factory form
 is available in module_export, module_export_static and
 module_export_optional_static; legacy setup callbacks remain supported.
+
+## Host-required activation
+
+Use ModuleHost::load_file_with_requirements when setup must not run unless the
+module exposes a particular contract. Construct ModuleRequirements from the
+exact package identity, validated bus name and object path, plus
+RequiredInterface entries containing interface names, accepted version ranges
+and mandatory method names. Versions describe the provided interface's
+implemented version; all required methods must belong to that same interface.
+
+The loader checks the actual loaded artifact before activation and retains its
+manifest and initializer together. It refuses provisional .manifest.json
+sidecars on this path. An actual embedded lazy-init declaration remains
+supported: requirements are checked before the initializer is registered.
+A mismatch cannot run setup or receive its configuration. Existing admission,
+dependency, ABI, digest and confidential-delivery rules still apply.
+
+This is admission for trusted native code. Platform loading may execute library
+static constructors before the manifest can be inspected; it is not a process
+sandbox. Directory and artifact permission checks retain their existing trust
+boundary. After initialization, the host must still verify any instance-specific
+immutable mode through the module's public contract before sending credentials.
