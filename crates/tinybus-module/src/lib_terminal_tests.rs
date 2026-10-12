@@ -164,6 +164,7 @@ mod controlled {
         ConfigDrop(String),
         ConfigParsing,
         TimerConstruct(std::thread::ThreadId, String, tokio::runtime::Id),
+        TimerDrop(Option<tokio::runtime::Id>),
         Finish,
         FactoryDrop(String),
     }
@@ -242,6 +243,13 @@ mod controlled {
     }
     impl Drop for SetupFuture {
         fn drop(&mut self) {
+            if self.mode == 5 {
+                let _ = self.fixture.events.send(Event::TimerDrop(
+                    tokio::runtime::Handle::try_current()
+                        .ok()
+                        .map(|handle| handle.id()),
+                ));
+            }
             if let Some(view) = self.fixture.view.lock().unwrap().as_ref() {
                 let slot = view.inner.resources.lock().unwrap().reinitialize.clone();
                 if slot.try_lock().is_err() {
@@ -1375,6 +1383,18 @@ async fn linked_reinit_synchronous_timer_uses_retained_runtime_on_same_worker() 
     assert_ne!(constructors[0].2, caller_runtime);
     assert!(caller_restored);
     assert!(after_stop.is_err());
+    let cleanup_contexts: Vec<_> = observed
+        .iter()
+        .filter_map(|event| match event {
+            controlled::Event::TimerDrop(context) => Some(context),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cleanup_contexts.len(), 3);
+    assert!(
+        cleanup_contexts.iter().all(|context| context.is_none()),
+        "constructor runtime guard must be restored before later physical-worker cleanup"
+    );
     assert_eq!(
         observed
             .iter()
