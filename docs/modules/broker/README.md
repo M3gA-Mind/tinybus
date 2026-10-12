@@ -34,3 +34,51 @@ Emitted when a well-known name is claimed or released, including by a peer
 dying. This is how the kernel learns an integration is gone in milliseconds
 rather than at the next timeout. Subscribers still have to ask for it; the
 broker does not push it at peers that did not.
+
+## Restricted module control (`modules` feature)
+
+`Broker::new()` keeps legacy permissive module-control behavior. Embeddings
+that pass tenant credentials or actor grants to modules should choose
+`Broker::new_restricted_module_control()` instead. It starts closed. The trusted
+host calls `attach_module_controller` with the concrete server transport end;
+only its paired client connection can mutate module lifecycle/configuration.
+No wire method or caller-selected name can select a controller.
+
+```rust,no_run
+# #[cfg(feature = "modules")]
+# async fn example() -> tinybus::Result<()> {
+use std::sync::Arc;
+use tinybus::{Connection, broker::Broker, module::host::ModuleHost};
+use tinybus::transport::memory::MemoryTransport;
+
+let broker = Broker::new_restricted_module_control();
+let (server, client) = MemoryTransport::pair();
+let _controller_name = broker.attach_module_controller(Arc::new(server))?;
+let controller = Connection::connect(Box::new(client)).await?;
+let host = ModuleHost::new(broker.clone());
+// Keep `controller` and `host` alive in trusted host code. Other connections
+// use ordinary `broker.attach` or a listener; they never receive control.
+# let _ = (controller, host);
+# Ok(())
+# }
+```
+
+Admission is checked against the broker's actual ingress connection before
+argument parsing or module-host lookup. Unauthorized LoadModule,
+LoadGithubModule, ReinitializeModule, StopModule, EnableModule and RescanModules
+return `ai.tinyhumans.tinybus.Error.ModuleControlDenied` without callbacks or
+state mutation. ListModules, GetModule and GetModuleManifest remain available
+for inspection. Module inspection is not a confidentiality boundary.
+
+Selection is atomic and exactly once across broker clones. Replacing ModuleHost
+cannot relax it. Disconnect does not transfer control to a replacement peer or
+well-known-name owner; construct a new restricted broker to select a new
+controller. Already admitted work may finish after disconnect. There is no
+public JSON capability or controller reassignment method.
+
+This restricts **wire callers**, not trusted Rust code or loaded native code.
+Direct ModuleHost methods remain trusted host APIs. Keep the controller's
+client endpoint away from untrusted tasks, and do not proxy arbitrary user
+requests through it. A loaded module shares the host address space; this API
+does not sandbox it. Incoming module-method actor authorization still uses
+`CallContext` and is independent of module-control admission.

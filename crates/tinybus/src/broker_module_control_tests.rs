@@ -266,3 +266,101 @@ async fn permissive_broker_retains_legacy_control_calls_and_cannot_claim_restric
     let (server, _client) = MemoryTransport::pair();
     assert!(broker.attach_module_controller(Arc::new(server)).is_err());
 }
+
+#[tokio::test]
+async fn closed_admission_precedes_missing_host_lookup_and_no_wire_method_selects_controller() {
+    let broker = Broker::new_restricted_module_control();
+    let stranger = peer(&broker, false).await;
+    for (member, args) in operations() {
+        let error = invoke(&stranger, member, args, None).await.unwrap_err();
+        assert_eq!(error.wire_name(), DENIED);
+    }
+    let error = invoke(
+        &stranger,
+        "AttachModuleController",
+        serde_json::json!([stranger.unique_name().unwrap()]),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        error.wire_name(),
+        "ai.tinyhumans.tinybus.Error.UnknownMethod"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_host_selection_attaches_exactly_one_controller() {
+    let broker = Broker::new_restricted_module_control();
+    let control = install_control(&broker);
+    let start = Arc::new(tokio::sync::Barrier::new(2));
+    let mut selectors = Vec::new();
+    for _ in 0..2 {
+        let broker = broker.clone();
+        let start = start.clone();
+        selectors.push(tokio::spawn(async move {
+            let (server, client) = MemoryTransport::pair();
+            start.wait().await;
+            (broker.attach_module_controller(Arc::new(server)), client)
+        }));
+    }
+    let mut winner = None;
+    let mut refused = 0;
+    for selector in selectors {
+        let (result, client) = selector.await.unwrap();
+        match result {
+            Ok(_) => winner = Some(Connection::connect(Box::new(client)).await.unwrap()),
+            Err(error) => {
+                assert_eq!(error.wire_name(), DENIED);
+                refused += 1;
+            }
+        }
+    }
+    assert_eq!(refused, 1);
+    invoke(
+        &winner.unwrap(),
+        "StopModule",
+        serde_json::json!(["fixture", 1]),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(*control.0.lock().unwrap(), vec!["StopModule"]);
+}
+
+#[tokio::test]
+async fn replacing_module_host_does_not_relax_broker_controller_admission() {
+    let broker = Broker::new_restricted_module_control();
+    let owner = peer(&broker, true).await;
+    let stranger = peer(&broker, false).await;
+    let host = crate::module::host::ModuleHost::new(broker.clone());
+    let error = invoke(
+        &stranger,
+        "ReinitializeModule",
+        serde_json::json!(["fixture", {}]),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.wire_name(), DENIED);
+    drop(host);
+    let replacement = install_control(&broker);
+    let error = invoke(
+        &stranger,
+        "LoadModule",
+        serde_json::json!(["fixture.so", {}]),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.wire_name(), DENIED);
+    invoke(
+        &owner,
+        "LoadModule",
+        serde_json::json!(["fixture.so", {}]),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(*replacement.0.lock().unwrap(), vec!["LoadModule"]);
+}
