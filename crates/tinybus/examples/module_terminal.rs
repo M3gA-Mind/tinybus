@@ -265,7 +265,7 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
             let joined = outcome.is_none() || matches!(outcome, Some(Ok(true)));
             finish.emit(5, u32::from(joined));
             match finish.mode.load(Ordering::Acquire) {
-                11 => panic!("controlled native finish panic"),
+                11 => std::panic::panic_any(PrimaryPayload(*finish.controls.lock().unwrap())),
                 12 => return TerminalCompletion::Uncertain,
                 _ => {}
             }

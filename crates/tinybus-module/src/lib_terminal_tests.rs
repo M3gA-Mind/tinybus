@@ -1995,7 +1995,7 @@ fn native_fixture_host() -> Arc<tinybus::module::ModuleHost> {
 #[ignore = "requires the privately pinned __native-fixture-support eight-artifact cohort"]
 async fn compiled_native_factory_and_hook_failures_preserve_original_finish_and_fault() {
     let path = std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_TERMINAL_MODULE").unwrap());
-    let (sender, receiver) = std::sync::mpsc::channel();
+    let (sender, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
     let sender = Box::into_raw(Box::new(sender));
     let controls = NativeControls {
         ctx: sender.cast(),
@@ -2024,7 +2024,7 @@ async fn compiled_native_factory_and_hook_failures_preserve_original_finish_and_
         unsafe extern "C" fn(*mut c_void, u32, u32),
     ) = unsafe { native_fixture_symbol(&path, c"terminal_test_factory_mode") };
     for mode in [1usize, 2, 10, 11, 12] {
-        let (sender, receiver) = std::sync::mpsc::channel();
+        let (sender, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
         // Uncertain primary/control resources intentionally retain this bounded
         // fixture context; a manual join is never substituted for SDK completion.
         let sender = Box::into_raw(Box::new(sender));
