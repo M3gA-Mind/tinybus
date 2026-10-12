@@ -36,6 +36,10 @@ impl RequiredInterface {
 }
 
 /// Exact module address and interfaces a host permits to initialize.
+///
+/// This is host-selected admission policy, not a sandbox. Library static
+/// constructors can run during platform loading, before its manifest is read.
+/// Version ranges refer to the provided interface's implemented version.
 #[derive(Debug, Clone)]
 pub struct ModuleRequirements {
     module: String,
@@ -52,7 +56,11 @@ impl ModuleRequirements {
         interfaces: Vec<RequiredInterface>,
     ) -> Result<Self> {
         let module = module.into();
-        if module.is_empty() || module.len() > 256 || module.chars().any(char::is_control) {
+        if bus_name.is_unique()
+            || module.is_empty()
+            || module.len() > 256
+            || module.chars().any(char::is_control)
+        {
             return Err(Error::Protocol(
                 "required module identity is invalid".into(),
             ));

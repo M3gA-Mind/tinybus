@@ -89,3 +89,91 @@ async fn a_provisional_lazy_sidecar_cannot_satisfy_activation_requirements() {
         "a refused artifact must not register for later calls"
     );
 }
+
+fn matching_manifest() -> ModuleManifest {
+    let mut manifest = super::tests::manifest();
+    manifest
+        .provides
+        .push(super::super::manifest::ProvidedInterface {
+            version: crate::version::InterfaceVersion {
+                interface: InterfaceName::new("ai.tinyhumans.module.Clock").unwrap(),
+                speaks: Version::new(1, 15, 0),
+                accepts: VersionRange::at_least(Version::new(1, 0, 0)),
+            },
+            methods: vec![MemberName::new("RoutedRead").unwrap()],
+            signals: vec![],
+        });
+    manifest
+}
+
+#[test]
+fn the_matching_loaded_artifact_reaches_its_original_initializer() {
+    let _lock = LOCK.lock().unwrap();
+    SETUPS.store(0, Ordering::SeqCst);
+    let host = ModuleHost::new(Broker::new());
+    let artifact = LoadedArtifact {
+        descriptor: TbAbiDescriptor::current("clock", "0.1.0"),
+        manifest: matching_manifest(),
+        init: counted_setup,
+    };
+    let error = host
+        .activate_required(
+            Path::new("clock.so"),
+            artifact,
+            serde_json::json!({}),
+            &required(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("initialization failed"));
+    assert_eq!(SETUPS.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn requirements_compare_identity_address_versions_and_methods_on_one_interface() {
+    let required = required();
+    let original = matching_manifest();
+    required.check(&original).unwrap();
+    let mut changed = original.clone();
+    changed.module.name = "different".into();
+    assert!(required.check(&changed).is_err());
+    let mut changed = original.clone();
+    changed.bus_name = BusName::new("ai.tinyhumans.module.Other").unwrap();
+    assert!(required.check(&changed).is_err());
+    let mut changed = original.clone();
+    changed.object_path = ObjectPath::new("/other").unwrap();
+    assert!(required.check(&changed).is_err());
+    let mut changed = original.clone();
+    changed.provides[0].version.speaks = Version::new(1, 14, 0);
+    assert!(required.check(&changed).is_err());
+    let mut changed = original.clone();
+    changed.provides[0].version.speaks = Version::new(2, 0, 0);
+    assert!(required.check(&changed).is_err());
+    let mut changed = original.clone();
+    changed.provides[0].methods.clear();
+    assert!(required.check(&changed).is_err());
+    let mut changed = original;
+    changed.provides[0].version.interface =
+        InterfaceName::new("ai.tinyhumans.module.Other").unwrap();
+    assert!(required.check(&changed).is_err());
+}
+
+#[test]
+fn invalid_requirements_are_refused_without_echoing_input() {
+    let bus = BusName::new("ai.tinyhumans.module.Clock").unwrap();
+    let path = ObjectPath::new("/clock").unwrap();
+    for module in ["", "secret\nvalue", &"a".repeat(257)] {
+        let error = ModuleRequirements::new(module, bus.clone(), path.clone(), vec![]).unwrap_err();
+        assert!(!error.to_string().contains("secret"));
+    }
+    assert!(
+        ModuleRequirements::new("clock", BusName::new(":1.42").unwrap(), path, vec![]).is_err()
+    );
+    assert!(
+        RequiredInterface::new(
+            InterfaceName::new("ai.tinyhumans.module.Clock").unwrap(),
+            VersionRange::new(Version::new(2, 0, 0), Some(Version::new(1, 0, 0))),
+            vec![]
+        )
+        .is_err()
+    );
+}

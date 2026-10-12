@@ -587,6 +587,17 @@ impl ModuleHost {
     }
 
     /// Load an artifact only if its actual manifest satisfies host requirements.
+    ///
+    /// The actual loaded artifact is retained through activation. Lazy sidecars
+    /// are refused; an embedded lazy-init declaration remains supported and is
+    /// checked before its initializer is registered. This does not prevent
+    /// platform library constructors from running while loading trusted code.
+    ///
+    /// # Errors
+    ///
+    /// Returns a native admission error for unsafe files, provisional sidecars,
+    /// incompatible requirements, missing dependencies, or initialization failure.
+    /// No configuration callback runs on a requirements mismatch.
     pub fn load_file_with_requirements(
         &self,
         path: impl AsRef<Path>,
