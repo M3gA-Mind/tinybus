@@ -59,8 +59,8 @@ fn an_unsupported_actual_manifest_is_refused_before_setup() {
     );
 }
 
-#[test]
-fn a_provisional_lazy_sidecar_cannot_satisfy_activation_requirements() {
+#[tokio::test]
+async fn a_provisional_lazy_sidecar_cannot_satisfy_activation_requirements() {
     let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
     let filename = if cfg!(windows) {
         "clock.dll"
