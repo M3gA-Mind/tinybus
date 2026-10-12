@@ -593,8 +593,23 @@ impl ModuleHost {
         config: serde_json::Value,
         requirements: &super::ModuleRequirements,
     ) -> Result<ModuleInfo> {
-        let _ = requirements;
-        self.load_file_with_config(path, config)
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        check_directory(parent)?;
+        check_file(path)?;
+        // Sidecars are provisional declarations: this admission path needs the
+        // manifest and init pointer from the same actual loaded library.
+        if read_lazy_manifest(path)?.is_some() {
+            return Err(Error::module_refused(
+                path,
+                "required activation refuses lazy sidecars",
+            ));
+        }
+        let artifact = loader::load(path, self.inner.strict.load(Ordering::Acquire))?;
+        self.activate_required(path, artifact, config, requirements)
     }
 
     fn activate_required(
@@ -604,7 +619,9 @@ impl ModuleHost {
         config: serde_json::Value,
         requirements: &super::ModuleRequirements,
     ) -> Result<ModuleInfo> {
-        requirements.check(&artifact.manifest)?;
+        requirements.check(&artifact.manifest).map_err(|_| {
+            Error::module_refused(path, "artifact does not satisfy required module surface")
+        })?;
         self.activate(path, artifact, config, None)
     }
 

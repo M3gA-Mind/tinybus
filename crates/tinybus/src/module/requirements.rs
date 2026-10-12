@@ -64,13 +64,30 @@ impl ModuleRequirements {
             interfaces,
         })
     }
-    pub(crate) fn check(&self, _manifest: &ModuleManifest) -> Result<()> {
-        let _ = (
-            &self.module,
-            &self.bus_name,
-            &self.object_path,
-            &self.interfaces,
-        );
+    pub(crate) fn check(&self, manifest: &ModuleManifest) -> Result<()> {
+        if manifest.module.name != self.module
+            || manifest.bus_name != self.bus_name
+            || manifest.object_path != self.object_path
+        {
+            return Err(Error::Protocol(
+                "required module identity does not match".into(),
+            ));
+        }
+        for required in &self.interfaces {
+            let matches = manifest.provides.iter().any(|provided| {
+                provided.version.interface == required.name
+                    && required.versions.accepts(&provided.version.speaks)
+                    && required
+                        .methods
+                        .iter()
+                        .all(|method| provided.methods.contains(method))
+            });
+            if !matches {
+                return Err(Error::Protocol(
+                    "required module interface is unavailable".into(),
+                ));
+            }
+        }
         Ok(())
     }
 }
