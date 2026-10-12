@@ -1060,6 +1060,11 @@ impl ModuleTransport {
     }
 
     #[cfg(test)]
+    pub(crate) fn native_terminal_state_for_test(&self) -> u32 {
+        unsafe { host_native_terminal_state(std::ptr::from_ref(self.context).cast_mut().cast()) }
+    }
+
+    #[cfg(test)]
     pub(crate) fn lifecycle_is_owned_for_test(&self) -> bool {
         self.lifecycle.try_lock().is_err()
     }

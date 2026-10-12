@@ -5,6 +5,7 @@ struct CommittingCallback {
     entered: tokio::sync::mpsc::Sender<()>,
     release: Arc<tokio::sync::Semaphore>,
     committed: Arc<AtomicUsize>,
+    context: Arc<StdMutex<Option<crate::CallContext>>>,
 }
 #[async_trait::async_trait]
 impl crate::Interface for CommittingCallback {
@@ -25,6 +26,7 @@ impl crate::Interface for CommittingCallback {
     ) -> Result<serde_json::Value> {
         assert!(context.is_confidential());
         assert!(context.authenticated_sender().is_some());
+        *self.context.lock().unwrap() = Some(context.clone());
         self.entered.send(()).await.unwrap();
         let _release = self.release.acquire().await.unwrap();
         // A native port may already have admitted its transaction. Revoking
@@ -34,9 +36,39 @@ impl crate::Interface for CommittingCallback {
     }
 }
 
+#[derive(Clone, Copy)]
+enum DrainStop {
+    Complete,
+    Timeout,
+    Cancel,
+}
+
+struct CallbackRelease(Arc<tokio::sync::Semaphore>);
+impl Drop for CallbackRelease {
+    fn drop(&mut self) {
+        self.0.add_permits(1);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires TINYBUS_TEST_CONTEXT_MODULE to point at the built cdylib"]
 async fn stopping_a_verified_module_drains_its_admitted_host_callback_before_native_shutdown() {
+    stop_after_admitted_callback(DrainStop::Complete).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TINYBUS_TEST_CONTEXT_MODULE to point at the built cdylib"]
+async fn host_stop_drain_timeout_retains_stop_intent_and_denies_new_admission() {
+    stop_after_admitted_callback(DrainStop::Timeout).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TINYBUS_TEST_CONTEXT_MODULE to point at the built cdylib"]
+async fn host_stop_drain_cancellation_retains_stop_intent_and_denies_new_admission() {
+    stop_after_admitted_callback(DrainStop::Cancel).await;
+}
+
+async fn stop_after_admitted_callback(mode: DrainStop) {
     let artifact = PathBuf::from(std::env::var_os("TINYBUS_TEST_CONTEXT_MODULE").unwrap());
     let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
     let (_dir, artifact) = staged_module(&artifact, &hash);
@@ -52,6 +84,7 @@ async fn stopping_a_verified_module_drains_its_admitted_host_callback_before_nat
     let (entered, mut receiver) = tokio::sync::mpsc::channel(1);
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let committed = Arc::new(AtomicUsize::new(0));
+    let context = Arc::new(StdMutex::new(None));
     binding
         .serve_at(
             "/callback".parse().unwrap(),
@@ -59,6 +92,7 @@ async fn stopping_a_verified_module_drains_its_admitted_host_callback_before_nat
                 entered,
                 release: release.clone(),
                 committed: committed.clone(),
+                context: context.clone(),
             },
         )
         .await
@@ -75,8 +109,10 @@ async fn stopping_a_verified_module_drains_its_admitted_host_callback_before_nat
         )
         .unwrap()
         .with_timeout(Duration::from_secs(2));
+    let release_on_failure = CallbackRelease(release.clone());
+    let first_proxy = proxy.clone();
     let request = tokio::spawn(async move {
-        proxy
+        first_proxy
             .call_confidential::<serde_json::Value>("ConfidentialCallback", ())
             .await
     });
@@ -84,35 +120,74 @@ async fn stopping_a_verified_module_drains_its_admitted_host_callback_before_nat
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(binding.guard().running(), 1);
     let transport = host.inner.loaded.lock().unwrap()[0].transport.clone();
-    let stopping = host.inner.stop(&loaded.name, Duration::from_secs(2));
-    tokio::pin!(stopping);
-    let completed_early = std::future::poll_fn(|context| {
-        std::task::Poll::Ready(std::future::Future::poll(stopping.as_mut(), context).is_ready())
+    let deadline = if matches!(mode, DrainStop::Timeout) {
+        Duration::ZERO
+    } else {
+        Duration::from_secs(2)
+    };
+    let mut stopping = Some(Box::pin(host.inner.stop(&loaded.name, deadline)));
+    let mut early = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(
+            match std::future::Future::poll(stopping.as_mut().unwrap().as_mut(), cx) {
+                std::task::Poll::Ready(result) => Some(result),
+                std::task::Poll::Pending => None,
+            },
+        )
     })
     .await;
+    if !matches!(mode, DrainStop::Complete) {
+        drop(stopping.take());
+    }
+    let terminal_while_held = transport.native_terminal_state_for_test();
     let shutdown_started_early = transport.stop_task_spawned();
+    let physically_stopped_early =
+        terminal_while_held & crate::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED != 0;
     let still_running = binding.guard().running();
-    // Always release the actual worker before asserting the intended RED.
-    release.add_permits(1);
+    let authority_denied = !binding
+        .guard()
+        .authorizes(context.lock().unwrap().as_ref().unwrap());
+    let owner_retained = host
+        .inner
+        .loaded
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|module| Arc::ptr_eq(&module.transport, &transport));
+    let enable_denied = host.inner.enable(&loaded.name, true).is_err();
+    let new_call_denied = proxy
+        .call_confidential::<serde_json::Value>("ConfidentialCallback", ())
+        .await
+        .is_err();
+    // Release and consume real callback/physical cleanup before all assertions.
+    drop(release_on_failure);
     tokio::time::timeout(Duration::from_secs(2), binding.guard().drained())
         .await
         .unwrap();
-    if !completed_early {
-        stopping.await.unwrap();
-    }
+    let stopped = if let Some(stopping) = stopping {
+        if let Some(result) = early.take() {
+            result
+        } else {
+            stopping.await
+        }
+    } else {
+        host.inner.stop(&loaded.name, Duration::from_secs(2)).await
+    };
     let _outcome = request.await.unwrap();
+    assert!(stopped.is_ok());
     assert_eq!(committed.load(Ordering::Acquire), 1);
     assert_eq!(still_running, 1);
-    assert!(
-        !completed_early,
-        "stop completed before admitted callback commit"
+    assert!(authority_denied && owner_retained && enable_denied && new_call_denied);
+    assert!(!shutdown_started_early && !physically_stopped_early);
+    assert_eq!(
+        terminal_while_held,
+        crate::module::abi::TB_NATIVE_TERMINAL_STOP_INTENT,
+        "native authority must close before admitted provider work drains"
     );
-    assert!(
-        !shutdown_started_early,
-        "native shutdown started before callback commit"
-    );
+    assert!(!transport.is_faulted());
+    if matches!(mode, DrainStop::Timeout) {
+        assert!(early.is_some_and(|result| result.is_err()));
+    }
 }
 
 #[tokio::test]
