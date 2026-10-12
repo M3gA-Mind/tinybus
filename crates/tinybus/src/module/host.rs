@@ -588,7 +588,9 @@ impl ModuleHost {
 
     /// Load an artifact only if its actual manifest satisfies host requirements.
     pub fn load_file_with_requirements(
-        &self, path: impl AsRef<Path>, config: serde_json::Value,
+        &self,
+        path: impl AsRef<Path>,
+        config: serde_json::Value,
         requirements: &super::ModuleRequirements,
     ) -> Result<ModuleInfo> {
         let _ = requirements;
@@ -596,7 +598,10 @@ impl ModuleHost {
     }
 
     fn activate_required(
-        &self, path: &Path, artifact: LoadedArtifact, config: serde_json::Value,
+        &self,
+        path: &Path,
+        artifact: LoadedArtifact,
+        config: serde_json::Value,
         requirements: &super::ModuleRequirements,
     ) -> Result<ModuleInfo> {
         requirements.check(&artifact.manifest)?;
