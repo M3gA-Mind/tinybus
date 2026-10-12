@@ -1318,6 +1318,10 @@ impl PhysicalJob {
         let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             transport.stop_sync(self.deadline)
         }));
+        // Completion is observable before this worker releases its lifecycle
+        // guard. Clear native activity first so a completed stop cannot leave
+        // enable/disable reporting that opaque work is still running.
+        drop(pending);
         let mut state = transport
             .context
             .physical
@@ -1345,7 +1349,6 @@ impl PhysicalJob {
                 hook();
             }
         }
-        drop(pending);
         drop(guard);
     }
 }
