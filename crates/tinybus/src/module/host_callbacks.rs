@@ -36,6 +36,8 @@ pub(crate) struct CallbackState {
     lifetime: Mutex<Lifetime>,
     drained: Notify,
     physical_drained: std::sync::Condvar,
+    #[cfg(test)]
+    pub(crate) physical_wait_started: Notify,
 }
 
 impl CallbackState {
@@ -47,6 +49,8 @@ impl CallbackState {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.active = false;
         state.revoked = true;
+        #[cfg(test)]
+        self.physical_wait_started.notify_one();
         while state.running != 0 {
             state = self
                 .physical_drained
@@ -493,6 +497,8 @@ impl ModuleHost {
                 }),
                 drained: Notify::new(),
                 physical_drained: std::sync::Condvar::new(),
+                #[cfg(test)]
+                physical_wait_started: Notify::new(),
             }),
         })
     }

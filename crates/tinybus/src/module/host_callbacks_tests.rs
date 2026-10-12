@@ -25,6 +25,8 @@ fn state(source: BusName, destination: BusName) -> Arc<CallbackState> {
             registering: vec![],
         }),
         drained: Notify::new(),
+        physical_drained: std::sync::Condvar::new(),
+        physical_wait_started: Notify::new(),
     })
 }
 fn call(state: &CallbackState) -> Message {
@@ -1240,4 +1242,132 @@ async fn actual_callback_setup_error_still_faults_after_ordinary_stop() {
 #[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
 async fn actual_callback_setup_unwind_still_faults_after_ordinary_stop() {
     native_callback_setup_failure_race(true).await;
+}
+
+#[test]
+fn a_transport_rejects_replacement_of_its_exact_callback_account() {
+    let first = state(":1.1".parse().unwrap(), ":1.2".parse().unwrap());
+    let second = state(":1.3".parse().unwrap(), ":1.4".parse().unwrap());
+    let original = Arc::downgrade(&first);
+    let replacement = Arc::downgrade(&second);
+    let (transport, _) = ModuleTransport::new("one-account".into(), vec![]);
+    transport.bind_host_callbacks(first.clone()).unwrap();
+    let rejected = transport.bind_host_callbacks(second.clone());
+    drop(first);
+    drop(second);
+    assert!(rejected.is_err());
+    assert!(original.upgrade().is_some());
+    assert!(replacement.upgrade().is_none());
+}
+
+struct DestructionObserved {
+    guard: HostCallbackGuard,
+    observed: Arc<AtomicUsize>,
+}
+impl Drop for DestructionObserved {
+    fn drop(&mut self) {
+        self.observed.store(self.guard.running(), Ordering::Release);
+    }
+}
+struct PendingUntilDestroyed {
+    entered: Arc<Notify>,
+    guard: HostCallbackGuard,
+    observed: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Interface for PendingUntilDestroyed {
+    fn name(&self) -> InterfaceName {
+        endpoint().interface
+    }
+    fn members(&self) -> Vec<MemberName> {
+        endpoint().members
+    }
+    async fn call(&self, _: &MemberName, _: serde_json::Value) -> Result<serde_json::Value> {
+        Err(Error::failed("context required"))
+    }
+    async fn call_with_context(
+        &self,
+        _: &MemberName,
+        _: serde_json::Value,
+        _: &CallContext,
+    ) -> Result<serde_json::Value> {
+        let _destruction = DestructionObserved {
+            guard: self.guard.clone(),
+            observed: self.observed.clone(),
+        };
+        self.entered.notify_one();
+        std::future::pending().await
+    }
+}
+
+#[test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+fn runtime_drop_destroys_provider_future_before_offruntime_native_cleanup() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let account = state(":1.1".parse().unwrap(), ":1.2".parse().unwrap());
+    let observed = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(Notify::new());
+    let (transport, view, barrier) = runtime.block_on(async {
+        let (transport, view, init, barrier) = crate::module::transport::tests::native_fixture();
+        barrier.state.lock().unwrap().1 = true;
+        transport.bind_host_callbacks(account.clone()).unwrap();
+        transport.defer_initialize(init, view);
+        transport.ensure_initialized().await.unwrap();
+        barrier.entered.notified().await;
+        let guarded = GuardedInterface {
+            interface: PendingUntilDestroyed {
+                entered: entered.clone(),
+                guard: HostCallbackGuard(account.clone()),
+                observed: observed.clone(),
+            },
+            endpoint: endpoint(),
+            state: account.clone(),
+        };
+        let context = CallContext::brokered(account.module_peer().as_ref(), true);
+        tokio::spawn(async move {
+            guarded
+                .call_with_context(&endpoint().members[0], serde_json::json!([]), &context)
+                .await
+        });
+        entered.notified().await;
+        transport.request_terminal(false);
+        account.physical_wait_started.notified().await;
+        (transport, view, barrier)
+    });
+    let count_before_drop = HostCallbackGuard(account.clone()).running();
+    let terminal_before_drop = unsafe { view.native_terminal_state.unwrap()(view.host_ctx) };
+    let lifecycle_free = !transport.lifecycle_is_owned_for_test();
+    // This drops the actual GuardedInterface/user future, not a caller observer.
+    drop(runtime);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let completed = loop {
+        if unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }
+            & crate::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED
+            != 0
+        {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::yield_now();
+    };
+    assert!(completed, "actual native callback return remains pending");
+    assert_eq!(count_before_drop, 1);
+    assert_eq!(
+        terminal_before_drop,
+        crate::module::abi::TB_NATIVE_TERMINAL_STOP_INTENT
+    );
+    assert!(lifecycle_free);
+    assert_eq!(
+        observed.load(Ordering::Acquire),
+        1,
+        "user future destruction precedes counter release"
+    );
+    assert_eq!(HostCallbackGuard(account).running(), 0);
+    assert!(barrier.state.lock().unwrap().2);
+    assert!(!transport.is_faulted());
 }

@@ -41,6 +41,7 @@ enum DrainStop {
     Complete,
     Timeout,
     Cancel,
+    DropHost,
 }
 
 struct CallbackRelease(Arc<tokio::sync::Semaphore>);
@@ -66,6 +67,12 @@ async fn host_stop_drain_timeout_retains_stop_intent_and_denies_new_admission() 
 #[ignore = "requires TINYBUS_TEST_CONTEXT_MODULE to point at the built cdylib"]
 async fn host_stop_drain_cancellation_retains_stop_intent_and_denies_new_admission() {
     stop_after_admitted_callback(DrainStop::Cancel).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TINYBUS_TEST_CONTEXT_MODULE to point at the built cdylib"]
+async fn host_drop_after_cancelled_stop_waits_for_actual_provider_drain() {
+    stop_after_admitted_callback(DrainStop::DropHost).await;
 }
 
 async fn stop_after_admitted_callback(mode: DrainStop) {
@@ -159,6 +166,49 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
         .call_confidential::<serde_json::Value>("ConfidentialCallback", ())
         .await
         .is_err();
+    if matches!(mode, DrainStop::DropHost) {
+        let account = host.inner.loaded.lock().unwrap()[0]
+            .callback_state
+            .clone()
+            .unwrap();
+        let host_owner = Arc::downgrade(&host.inner);
+        drop(stopping);
+        drop(host);
+        let entered = tokio::time::timeout(
+            Duration::from_secs(2),
+            account.physical_wait_started.notified(),
+        )
+        .await;
+        let terminal_after_drop = transport.native_terminal_state_for_test();
+        let still_counted = binding.guard().running();
+        let lifecycle_free = !transport.lifecycle_is_owned_for_test();
+        drop(release_on_failure);
+        tokio::time::timeout(Duration::from_secs(2), binding.guard().drained())
+            .await
+            .unwrap();
+        let completed = tokio::time::timeout(Duration::from_secs(2), async {
+            while transport.native_terminal_state_for_test()
+                & crate::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED
+                == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        let _outcome = request.await;
+        assert!(completed.is_ok());
+        assert!(entered.is_ok());
+        assert!(host_owner.upgrade().is_none());
+        assert_eq!(still_counted, 1);
+        assert_eq!(
+            terminal_after_drop,
+            crate::module::abi::TB_NATIVE_TERMINAL_STOP_INTENT
+        );
+        assert!(lifecycle_free && authority_denied && new_call_denied);
+        assert_eq!(committed.load(Ordering::Acquire), 1);
+        assert!(!transport.is_faulted());
+        return;
+    }
     // Release and consume real callback/physical cleanup before all assertions.
     drop(release_on_failure);
     tokio::time::timeout(Duration::from_secs(2), binding.guard().drained())
