@@ -19,6 +19,17 @@ pub struct HostCallbackEndpoint {
     pub members: Vec<MemberName>,
 }
 
+/// A finite set of recipient-directed signals a host callback may emit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostCallbackSignal {
+    /// Fixed object path; it must match a declared callback endpoint.
+    pub path: ObjectPath,
+    /// Fixed interface; it must match a declared callback endpoint.
+    pub interface: InterfaceName,
+    /// Permitted signal members, between one and 64 distinct names.
+    pub members: Vec<MemberName>,
+}
+
 struct Lifetime {
     active: bool,
     used: bool,
@@ -32,6 +43,7 @@ struct Lifetime {
 pub(crate) struct CallbackState {
     pub(crate) destination: BusName,
     endpoints: Vec<HostCallbackEndpoint>,
+    signals: Vec<HostCallbackSignal>,
     module_transport: Mutex<Option<std::sync::Weak<ModuleTransport>>>,
     lifetime: Mutex<Lifetime>,
     drained: Notify,
