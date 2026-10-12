@@ -16,10 +16,14 @@ fn host() -> HostCalls {
 #[test]
 fn observed_native_terminal_never_reopens_a_retained_view() {
     FLAGS.store(TB_NATIVE_TERMINAL_LIVE, Ordering::Release);
-    let view = NativeInstanceLiveness { inner: Arc::new(TerminalState { host: host(), closed: AtomicBool::new(false) }) };
+    let admission = Admission::new();
+    let state = TerminalState::admit_in(&admission, host(), None).unwrap();
+    let view = state.view();
     assert!(view.is_live());
     FLAGS.store(TB_NATIVE_TERMINAL_STOP_INTENT, Ordering::Release);
     assert!(!view.is_live());
     FLAGS.store(TB_NATIVE_TERMINAL_LIVE, Ordering::Release);
     assert!(!view.is_live(), "an observed terminal tombstone must stay closed");
+    state.publish();
+    assert_eq!(state.wait(Duration::from_secs(3)), TerminalCompletion::PhysicallyStopped);
 }
