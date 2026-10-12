@@ -648,6 +648,7 @@ impl ModuleHost {
         // turn the returned successful snapshot into Faulted or Stopped.
         if lifetime.revoked
             || !lifetime.active
+            || transport.admission_closed()
             || !transport.is_ready()
             || !matches!(info.state, ModuleState::Ready)
         {

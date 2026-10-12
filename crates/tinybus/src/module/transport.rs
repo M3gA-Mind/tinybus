@@ -406,7 +406,7 @@ impl ModuleTransport {
         self.initialization_gate_changed.notify_waiters();
     }
 
-    fn admission_closed(&self) -> bool {
+    pub(crate) fn admission_closed(&self) -> bool {
         self.context.admission_closed.load(Ordering::Acquire)
     }
 
