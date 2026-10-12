@@ -99,7 +99,7 @@ fn the_header_omits_absent_fields_rather_than_writing_nulls() {
 }
 
 #[test]
-fn a_signal_cannot_be_confidential_because_it_is_a_broadcast() {
+fn a_signal_cannot_be_confidential() {
     let mut sig = Message::signal(
         ObjectPath::root(),
         InterfaceName::new("ai.tinyhumans.Test").unwrap(),
@@ -108,7 +108,7 @@ fn a_signal_cannot_be_confidential_because_it_is_a_broadcast() {
     );
     sig.header.confidential = true;
     let err = sig.validate().unwrap_err();
-    assert!(err.to_string().contains("broadcast"), "{err}");
+    assert!(err.to_string().contains("private body"), "{err}");
 }
 
 #[test]
