@@ -2082,3 +2082,158 @@ async fn compiled_native_factory_and_hook_failures_preserve_original_finish_and_
         }
     }
 }
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a fresh-process privately pinned __native-fixture-support eight-artifact cohort"]
+async fn compiled_native_retained_views_bound_256_and_release_only_at_actual_last_drop() {
+    let path = std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_TERMINAL_MODULE").unwrap());
+    let (sender, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
+    let sender = Box::into_raw(Box::new(sender));
+    let controls = NativeControls {
+        ctx: sender.cast(),
+        event: native_event,
+    };
+    let bootstrap = native_fixture_host();
+    bootstrap
+        .load_file_with_config(&path, native_controls_config(0, &controls))
+        .unwrap();
+    let (context, probe, drops, _, _) = unsafe { terminal_fixture_symbols(&path) };
+    let before = drops();
+    bootstrap.shutdown(Duration::from_secs(5)).await;
+    while !matches!(receiver.recv_timeout(Duration::from_secs(5)), Ok((6, _))) {}
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while drops() == before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    unsafe {
+        drop(Box::from_raw(sender));
+    }
+    drop(bootstrap);
+    let configure: unsafe extern "C" fn(
+        usize,
+        *mut c_void,
+        unsafe extern "C" fn(*mut c_void, u32, u32),
+    ) = unsafe { native_fixture_symbol(&path, c"terminal_test_factory_mode") };
+    let factories: extern "C" fn() -> usize =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_factories") };
+    let retained_live: extern "C" fn() -> usize =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_retained_live") };
+    let release_one: extern "C" fn() -> bool =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_release_one_view") };
+    let release_all: extern "C" fn() -> usize =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_release_views") };
+    let mut first_token = None;
+    let mut admitted = 0;
+    let mut all_settled = true;
+    for _ in 0..256 {
+        let (sender, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
+        let sender = Box::into_raw(Box::new(sender));
+        let controls = NativeControls {
+            ctx: sender.cast(),
+            event: native_event,
+        };
+        unsafe {
+            configure(3, sender.cast(), native_event);
+        }
+        let host = native_fixture_host();
+        let result = host.load_file_with_config(&path, native_controls_config(0, &controls));
+        if result.is_err() {
+            unsafe {
+                drop(Box::from_raw(sender));
+            }
+            break;
+        }
+        first_token.get_or_insert(context());
+        admitted += 1;
+        let before = drops();
+        host.shutdown(Duration::from_secs(5)).await;
+        let mut settled = false;
+        while let Ok(event) = receiver.recv_timeout(Duration::from_secs(5)) {
+            if event.0 == 6 {
+                settled = true;
+                break;
+            }
+        }
+        settled &= tokio::time::timeout(Duration::from_secs(5), async {
+            while drops() == before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        all_settled &= settled;
+        drop(host);
+        if settled {
+            unsafe {
+                drop(Box::from_raw(sender));
+            }
+        } else {
+            break;
+        }
+    }
+    let before_factory = factories();
+    let denied_host = native_fixture_host();
+    let denied =
+        denied_host.load_file_with_config(&path, serde_json::json!({"mode":0,"test_controls":[]}));
+    drop(denied_host);
+    let factories_after_denial = factories();
+    let live_after_host_drops = retained_live();
+    let released_one = release_one();
+    let (sender, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
+    let sender = Box::into_raw(Box::new(sender));
+    let controls = NativeControls {
+        ctx: sender.cast(),
+        event: native_event,
+    };
+    unsafe {
+        configure(3, sender.cast(), native_event);
+    }
+    let replacement = native_fixture_host();
+    let replacement_result =
+        replacement.load_file_with_config(&path, native_controls_config(0, &controls));
+    let new_token = context();
+    let stale = first_token.map(probe);
+    let before = drops();
+    replacement.shutdown(Duration::from_secs(5)).await;
+    let mut replacement_settled = false;
+    if replacement_result.is_ok() {
+        while let Ok(event) = receiver.recv_timeout(Duration::from_secs(5)) {
+            if event.0 == 6 {
+                replacement_settled = true;
+                break;
+            }
+        }
+        replacement_settled &= tokio::time::timeout(Duration::from_secs(5), async {
+            while drops() == before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+    }
+    drop(replacement);
+    if replacement_settled {
+        unsafe {
+            drop(Box::from_raw(sender));
+        }
+    }
+    let released_rest = release_all();
+    // All actual controller joins and SDK capture destruction precede assertions.
+    // No uncertain anchor was reset; this filter starts in a fresh process.
+    assert!(all_settled && replacement_settled);
+    assert_eq!(admitted, 256);
+    assert!(denied.is_err());
+    assert_eq!(factories_after_denial, before_factory);
+    assert_eq!(live_after_host_drops, 0);
+    assert!(released_one && replacement_result.is_ok());
+    assert_eq!(
+        new_token & 255,
+        first_token.unwrap() & 255,
+        "the exact freed slot must be reusable"
+    );
+    assert_ne!(new_token, first_token.unwrap());
+    assert_eq!(stale, Some(TB_CLOSED));
+    assert_eq!(released_rest, 256);
+}

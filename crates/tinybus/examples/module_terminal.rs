@@ -444,3 +444,18 @@ pub extern "C" fn terminal_test_release_views() -> usize {
     drop(views);
     count
 }
+/// Release one genuinely retained view, allowing its actual State last-Drop.
+#[unsafe(no_mangle)]
+pub extern "C" fn terminal_test_release_one_view() -> bool {
+    let view = {
+        let mut views = RETAINED_VIEWS.lock().unwrap();
+        if views.is_empty() {
+            None
+        } else {
+            Some(views.remove(0))
+        }
+    };
+    let released = view.is_some();
+    drop(view);
+    released
+}
