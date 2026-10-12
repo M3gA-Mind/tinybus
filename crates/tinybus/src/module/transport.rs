@@ -81,6 +81,10 @@ pub(crate) struct ModuleTransport {
     before_worker_lock: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     before_init_publication: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    // Native fixtures pass a borrowed controller through C config. Retain its
+    // actual owner with the physical transport, including uncertain jobs.
+    #[cfg(test)]
+    pub(crate) fixture_controller: StdMutex<Option<Arc<dyn Send + Sync>>>,
 }
 
 // Reservations cover physical callback execution, including signals. They are
@@ -275,6 +279,8 @@ impl ModuleTransport {
             before_worker_lock: StdMutex::new(None),
             #[cfg(test)]
             before_init_publication: StdMutex::new(None),
+            #[cfg(test)]
+            fixture_controller: StdMutex::new(None),
         });
         *context.owner.lock().expect("physical owner lock") = Arc::downgrade(&transport);
         let config = context.config.lock().expect("module config lock");

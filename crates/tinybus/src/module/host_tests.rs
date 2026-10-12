@@ -3247,7 +3247,9 @@ async fn actual_native_rejected_stop_submission_retains_guard_through_host_drop(
         !barrier.state.lock().unwrap().2,
         "Host Drop cannot refund and resubmit an uncertain owner"
     );
-    // One deliberately retained native uncertainty instance, with its controller
-    // lifetime retained explicitly; no process-wide leak or backing-Drop claim.
-    std::mem::forget(barrier);
+    // This one uncertain physical owner retains its actual controller.
+    // It makes no process-wide leak or backing-Drop claim.
+    let controller = Arc::downgrade(&barrier);
+    drop(barrier);
+    assert!(controller.upgrade().is_some());
 }

@@ -146,6 +146,8 @@ pub struct HostCallbackBinding {
     #[cfg(test)]
     after_attach: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
+    fixture_controller: Mutex<Option<Arc<dyn Send + Sync>>>,
+    #[cfg(test)]
     before_load_decision: Mutex<Option<(Arc<Notify>, tokio::sync::oneshot::Receiver<()>)>>,
 }
 
@@ -441,6 +443,8 @@ impl ModuleHost {
             #[cfg(test)]
             after_attach: Mutex::new(None),
             #[cfg(test)]
+            fixture_controller: Mutex::new(None),
+            #[cfg(test)]
             before_load_decision: Mutex::new(None),
             state: Arc::new(CallbackState {
                 destination,
@@ -538,6 +542,19 @@ impl ModuleHost {
             let fingerprint = callback_config_fingerprint(&bytes);
             drop(config);
             let (transport, host) = ModuleTransport::new(admitted.name.clone(), bytes);
+            #[cfg(test)]
+            {
+                // Transfer the fixture config borrow before C can enter, so
+                // setup unwind and loader cancellation retain the same owner.
+                *transport
+                    .fixture_controller
+                    .lock()
+                    .expect("fixture controller lock") = binding
+                    .fixture_controller
+                    .lock()
+                    .expect("fixture controller lock")
+                    .take();
+            }
             transport.pause_initialization();
             transport.defer_initialize(artifact.init, host);
             let name = admitted.name.clone();

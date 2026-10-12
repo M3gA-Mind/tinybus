@@ -572,6 +572,7 @@ async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: 
     let (_dir, artifact) = super::super::tests::staged_module(&artifact, &hash);
     let host = ModuleHost::new(Broker::new());
     let binding = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
+    *binding.fixture_controller.lock().unwrap() = Some(barrier.clone());
     let (entered, _) = tokio::sync::mpsc::channel(1);
     binding
         .serve_at(
@@ -704,6 +705,7 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
     let (_dir, artifact) = super::super::tests::staged_module(&artifact, &hash);
     let host = Arc::new(ModuleHost::new(Broker::new()));
     let binding = Arc::new(served_native_binding(&host).await);
+    *binding.fixture_controller.lock().unwrap() = Some(barrier.clone());
     let decision = Arc::new(Notify::new());
     let (resume, release) = tokio::sync::oneshot::channel();
     *binding.before_load_decision.lock().unwrap() = Some((decision.clone(), release));
@@ -819,6 +821,7 @@ async fn native_callback_setup_failure_race(panic_setup: bool) {
     let (_dir, artifact) = super::super::tests::staged_module(&artifact, &hash);
     let host = Arc::new(ModuleHost::new(Broker::new()));
     let binding = Arc::new(served_native_binding(&host).await);
+    *binding.fixture_controller.lock().unwrap() = Some(barrier.clone());
     let attached = Arc::new(Notify::new());
     let seen = attached.clone();
     let (resume, release) = std::sync::mpsc::channel();

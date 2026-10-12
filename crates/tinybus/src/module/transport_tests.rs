@@ -1538,6 +1538,7 @@ pub(crate) fn native_fixture() -> (
     }
     .to_vec();
     let (transport, host) = ModuleTransport::new("actual-native".into(), config);
+    *transport.fixture_controller.lock().unwrap() = Some(barrier.clone());
     (transport, host, artifact.init, barrier)
 }
 
@@ -1571,8 +1572,14 @@ async fn actual_native_controller_is_owned_until_shutdown_callback_returns() {
     drop(barrier);
     let retained_through_transport = weak.upgrade().is_some();
     drop(transport);
-    assert!(weak.upgrade().is_none(), "successful fixture owner is reclaimed");
-    assert!(retained, "physical owner must retain the borrowed native controller");
+    assert!(
+        weak.upgrade().is_none(),
+        "successful fixture owner is reclaimed"
+    );
+    assert!(
+        retained,
+        "physical owner must retain the borrowed native controller"
+    );
     assert!(retained_through_transport);
 }
 
@@ -1987,10 +1994,11 @@ async fn actual_native_late_eager_publication_cannot_refund_failed_cleanup_spawn
     drop(transport);
     drop(job);
     assert!(weak.upgrade().is_some());
-    // The deliberately unjoinable native instance retains its externally anchored
-    // controller too. This is one explicit uncertain test instance, not global
-    // leak-bound or secret-erasure proof.
-    std::mem::forget(barrier);
+    // The existing uncertain physical owner retains this one controller too.
+    // No separate leaked controller is needed; this is not global leak-bound proof.
+    let controller = Arc::downgrade(&barrier);
+    drop(barrier);
+    assert!(controller.upgrade().is_some());
 }
 
 unsafe extern "C" fn initialize_short_output(
