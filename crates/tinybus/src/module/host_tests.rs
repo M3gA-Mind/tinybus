@@ -2188,7 +2188,7 @@ async fn one_refused_module_does_not_stop_the_others_in_the_directory_from_loadi
 /// tracing subscriber inside the library, so initializing the same DLL path
 /// twice shares state even across independent hosts. Windows staging uses the
 /// release-cache ACL repair so the real admission gate remains in force.
-fn staged_module(artifact: &Path, hash: &str) -> (tempfile::TempDir, PathBuf) {
+pub(super) fn staged_module(artifact: &Path, hash: &str) -> (tempfile::TempDir, PathBuf) {
     // Staged beside the artifact rather than in `/tmp`: the loader refuses a
     // directory another user could write to, and `/tmp` is exactly that. The
     // artifact's own directory is user-owned (CI builds into

@@ -67,12 +67,30 @@ pub unsafe extern "C" fn tinybus_module_init_v1(
     out: *mut TbModuleVtable,
 ) -> i32 {
     let host = unsafe { &*host };
-    if host.config.len != size_of::<Controls>() {
-        return TB_BAD_ARGUMENT;
-    }
-    let controls = unsafe { host.config.ptr.cast::<Controls>().read_unaligned() };
     let copied_config =
         unsafe { std::slice::from_raw_parts(host.config.ptr, host.config.len) }.to_vec();
+    // The public loader serializes JSON. This declared test fixture accepts the
+    // same finite Controls bytes in a JSON array, without product-side seams.
+    let encoded;
+    let bytes = if copied_config.len() == size_of::<Controls>() {
+        &copied_config
+    } else {
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&copied_config) else {
+            return TB_BAD_ARGUMENT;
+        };
+        let Some(value) = value.get("test_controls") else {
+            return TB_BAD_ARGUMENT;
+        };
+        let Ok(value) = serde_json::from_value::<Vec<u8>>(value.clone()) else {
+            return TB_BAD_ARGUMENT;
+        };
+        encoded = value;
+        &encoded
+    };
+    if bytes.len() != size_of::<Controls>() {
+        return TB_BAD_ARGUMENT;
+    }
+    let controls = unsafe { bytes.as_ptr().cast::<Controls>().read_unaligned() };
     // The host-side barrier blocks actual opaque C entry, retaining its config
     // borrow through fault publication and initiating waiter abandonment.
     unsafe {

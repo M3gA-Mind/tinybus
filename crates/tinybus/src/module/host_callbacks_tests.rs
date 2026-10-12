@@ -556,3 +556,89 @@ fn configuration_fingerprints_preserve_json_equality_without_normalizing_strings
         fingerprint(&serde_json::json!(0.01))
     );
 }
+
+// Manually polling the public future lets ordinary shutdown commit while the
+// loader is suspended; no scheduler race decides which cancellation is tested.
+async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: bool) {
+    use std::future::Future;
+    use super::super::super::transport::tests::{native_fixture, native_fixture_json};
+    let (unused, _, _, barrier) = native_fixture();
+    let config = native_fixture_json(&unused);
+    drop(unused);
+    let artifact = std::path::PathBuf::from(
+        std::env::var_os("TINYBUS_TEST_CONTROLLED_INIT_MODULE").unwrap());
+    let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
+    let (_dir, artifact) = super::super::tests::staged_module(&artifact, &hash);
+    let host = ModuleHost::new(Broker::new());
+    let binding = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
+    let (entered, _) = tokio::sync::mpsc::channel(1);
+    binding.serve_at(endpoint().path, BlockingCallback {
+        entered,
+        release: Arc::new(tokio::sync::Semaphore::new(0)),
+        published: Arc::new(AtomicUsize::new(0)),
+        guard: binding.guard(),
+    }).await.unwrap();
+    let mut load = Box::pin(host.load_file_with_host_callbacks(&artifact, config, &binding));
+    std::future::poll_fn(|cx| {
+        assert!(load.as_mut().poll(cx).is_pending(), "loader awaits real C init");
+        std::task::Poll::Ready(())
+    }).await;
+    tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified()).await.unwrap();
+    let transport = host.inner.loaded.lock().unwrap()[0].transport.clone();
+    let view = barrier.state.lock().unwrap().0.unwrap();
+    barrier.state.lock().unwrap().1 = true;
+    barrier.changed.notify_all();
+    transport.ensure_initialized().await.unwrap();
+    // Advance the public future to its real withheld-Ready observation.
+    std::future::poll_fn(|cx| {
+        assert!(load.as_mut().poll(cx).is_pending(), "fixture withholds Ready");
+        std::task::Poll::Ready(())
+    }).await;
+    let (finish, receive) = std::sync::mpsc::channel();
+    *barrier.finish_gate.lock().unwrap() = Some(receive);
+    let stopping = transport.clone();
+    let stop = tokio::spawn(async move { stopping.stop(Duration::from_secs(2)).await });
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified()).await.unwrap();
+    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 2);
+    let load_result = if reject_gate {
+        transport.release_initialization(false);
+        drop(load);
+        None
+    } else if drop_load {
+        drop(load);
+        None
+    } else {
+        // Real not-ready branch awaits close, whose native return is held.
+        std::future::poll_fn(|cx| {
+            match load.as_mut().poll(cx) {
+                std::task::Poll::Pending => std::task::Poll::Ready(None),
+                std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
+            }
+        }).await
+    };
+    let held_flags = unsafe { view.native_terminal_state.unwrap()(view.host_ctx) };
+    let held_fault = transport.is_faulted();
+    finish.send(()).unwrap(); // Always release opaque C before RED assertions.
+    assert!(stop.await.unwrap().is_ok());
+    if let Some(result) = load_result { assert!(result.is_err()); }
+    assert_eq!(held_flags, 2, "ordinary cancellation cannot invent Fault");
+    assert!(!held_fault);
+    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 10);
+    assert!(barrier.state.lock().unwrap().2);
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_callback_notready_after_ordinary_stop_preserves_cause() {
+    native_callback_load_after_ordinary_stop(false, false).await;
+}
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_callback_load_drop_after_ordinary_stop_preserves_cause() {
+    native_callback_load_after_ordinary_stop(true, false).await;
+}
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_callback_gate_rejection_after_ordinary_stop_preserves_cause() {
+    native_callback_load_after_ordinary_stop(false, true).await;
+}

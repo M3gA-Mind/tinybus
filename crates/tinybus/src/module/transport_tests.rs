@@ -2072,3 +2072,17 @@ fn actual_native_initializer_owner_outlives_runtime_and_host_handle_drop() {
     drop(retained);
     assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 14);
 }
+
+pub(crate) fn native_fixture_json(transport: &ModuleTransport) -> serde_json::Value {
+    serde_json::json!({"test_controls": *transport.context.config.lock().unwrap()})
+}
+
+#[tokio::test]
+async fn rejected_observer_after_ordinary_stop_preserves_nonfault_cause() {
+    let (transport, view) = ModuleTransport::new("ordinary-cancellation".into(), vec![]);
+    let _ = transport.clone().stop(Duration::from_secs(1)).await;
+    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 2);
+    transport.release_initialization(false);
+    assert!(!transport.is_faulted());
+    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 2);
+}
