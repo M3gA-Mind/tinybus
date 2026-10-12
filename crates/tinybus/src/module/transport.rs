@@ -616,7 +616,6 @@ impl ModuleTransport {
         self: Arc<Self>,
         deadline: Duration,
     ) -> std::result::Result<i32, StopError> {
-        self.stop_task_spawned.store(false, Ordering::Release);
         let started = std::time::Instant::now();
         let lifecycle = tokio::time::timeout(deadline, self.lifecycle.clone().lock_owned())
             .await
@@ -626,6 +625,10 @@ impl ModuleTransport {
                 ))
             })?;
         let remaining = deadline.saturating_sub(started.elapsed());
+        // A retry that cannot acquire the physical lock must not erase the
+        // original running stop's host transition. Only its new lock owner may
+        // replace that marker, immediately before handing the lock to the task.
+        self.stop_task_spawned.store(false, Ordering::Release);
         self.stop_task_spawned.store(true, Ordering::Release);
         let task = tokio::task::spawn_blocking(move || {
             let _lifecycle = lifecycle;
