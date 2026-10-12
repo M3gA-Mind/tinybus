@@ -26,3 +26,30 @@ fn native_query_is_required_before_terminal_factory_evaluation() {
     assert_eq!(code, TB_CLOSED);
     assert_eq!(calls.load(Ordering::SeqCst), 0, "missing native query must leave the factory untouched");
 }
+
+unsafe extern "C" fn native_query(ctx: *mut c_void) -> u32 {
+    unsafe { &*ctx.cast::<std::sync::atomic::AtomicU32>() }.load(Ordering::Acquire)
+}
+#[test]
+fn shutdown_rechecks_actual_native_fault_after_local_stop_and_physical_finish() {
+    let flags = Arc::new(std::sync::atomic::AtomicU32::new(tinybus::module::abi::TB_NATIVE_TERMINAL_LIVE));
+    let mut host = host();
+    host.host_ctx = Arc::as_ptr(&flags).cast_mut().cast();
+    host.native_terminal_state = Some(native_query);
+    let state = terminal::TerminalState::admit(HostCalls(host), None).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let worker_release = release.clone();
+    state.register(RuntimeHooks::new(|_| {}, move || {
+        entered_tx.send(()).unwrap(); worker_release.wait(); TerminalCompletion::PhysicallyStopped
+    }));
+    state.publish();
+    let context = Box::new(TerminalRuntimeContext { state: StdMutex::new(Some(state.clone())) });
+    let ptr = (&*context as *const TerminalRuntimeContext) as usize;
+    let caller = std::thread::spawn(move || unsafe { terminal_shutdown(ptr as *mut c_void, 3000) });
+    entered_rx.recv().unwrap();
+    flags.store(tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, Ordering::Release);
+    release.wait();
+    let code = caller.join().unwrap();
+    assert_eq!(code, TB_PANICKED, "actual native Fault cannot disappear behind local Stop");
+}
