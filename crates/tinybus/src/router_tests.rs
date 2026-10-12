@@ -70,6 +70,27 @@ fn parsing_rejects_unknown_keys_rather_than_ignoring_them() {
 }
 
 #[test]
+fn parses_directed_signal_rules_as_a_separate_message_kind() {
+    let rule = MatchRule::parse(
+        "type=directed_signal,interface=ai.tinyhumans.Storage,member=WatchChanged",
+    )
+    .unwrap();
+    let directed = Message::directed_signal(
+        BusName::new(":1.5").unwrap(),
+        ObjectPath::new("/storage/Documents").unwrap(),
+        InterfaceName::new("ai.tinyhumans.Storage").unwrap(),
+        MemberName::new("WatchChanged").unwrap(),
+        serde_json::Value::Null,
+    );
+    assert!(rule.matches(&directed));
+    assert!(MatchRule::parse("type=signal").unwrap().matches(&signal(
+        "ai.tinyhumans.Storage",
+        "WatchChanged",
+        "/storage/Documents"
+    )));
+}
+
+#[test]
 fn unique_names_are_minted_in_order_and_never_reused() {
     let mut router = Router::default();
     let (a, a_name) = router.attach(outbox());
