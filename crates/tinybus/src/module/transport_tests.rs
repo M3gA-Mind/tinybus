@@ -96,6 +96,29 @@ impl tracing::Subscriber for CaptureLevel {
 
 #[test]
 fn a_module_log_line_reaches_the_hosts_subscriber_with_its_level() {
+    // Tracing caches callsite interest process-wide. Run the scoped subscriber
+    // assertion apart from parallel fixtures that register the same callsite
+    // without a subscriber, so their registration cannot suppress this event.
+    const CHILD: &str = "TINYBUS_LOG_SUBSCRIBER_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "module::transport::tests::a_module_log_line_reaches_the_hosts_subscriber_with_its_level",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed;"),
+            "isolated subscriber assertion failed or was not selected: {}{}",
+            stdout,
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
     let (_transport, host) = ModuleTransport::new("logger".to_string(), Vec::new());
     let observed = Arc::new(AtomicBool::new(false));
     let bytes = b"module log line";
@@ -345,6 +368,9 @@ async fn a_pending_call_is_failed_when_the_module_closes_its_delivery_queue() {
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await;
+    let _release = ShutdownRelease;
+    SHUTDOWN_ENTERED.store(false, Ordering::Release);
+    SHUTDOWN_BLOCKED.store(true, Ordering::Release);
     DELIVERY_CODE.store(TB_CLOSED, Ordering::Release);
     let (transport, host) = ModuleTransport::new("closed".to_string(), Vec::new());
     transport.defer_initialize(initialize_ok, host);
@@ -355,10 +381,27 @@ async fn a_pending_call_is_failed_when_the_module_closes_its_delivery_queue() {
     // A failed receive may have no fault-owned cleanup job. Commit cleanup
     // before reporting the captured result; this does not clear an actual fault.
     transport.request_terminal(false);
+    let shutdown_entered = tokio::time::timeout(Duration::from_secs(2), async {
+        while !SHUTDOWN_ENTERED.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // Unblock the callback before observing physical completion, while the
+    // fixture lock still protects the callback flags and delivery result.
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    wait_physical_cleanup(&transport).await;
+    // The release guard also resets shared flags; drop it before giving the
+    // fixture lock to another test.
+    drop(_release);
     finish_closed_delivery_fixture(&transport, lock).await;
     let reply = reply.unwrap().unwrap().unwrap();
     assert_eq!(reply.header.kind, MessageKind::Error);
     assert!(faulted);
+    assert!(
+        shutdown_entered.is_ok(),
+        "fault cleanup must enter shutdown"
+    );
 }
 
 // Keep the shared vtable fixture serialized through its final global writes.
@@ -367,6 +410,10 @@ async fn finish_closed_delivery_fixture(
     lock: tokio::sync::MutexGuard<'_, ()>,
 ) {
     wait_physical_cleanup(transport).await;
+    assert!(
+        transport.is_stopped(),
+        "a failed-delivery fixture must finish shutdown before reusing callback flags"
+    );
     DELIVERY_CODE.store(TB_OK, Ordering::Release);
     drop(lock);
 }
@@ -1145,6 +1192,11 @@ async fn queued_readiness_and_backpressure_retire_before_actual_shutdown_returns
     transport.send(call()).await.expect("A12");
     let stopping = tokio::spawn(transport.clone().stop(Duration::from_secs(2)));
     shutdown_entry().await;
+    assert_eq!(
+        transport.context.physical.lock().unwrap().cleanup,
+        CleanupState::Executing,
+        "shutdown_entry must observe this transport, not a preceding fixture"
+    );
     tokio::time::timeout(Duration::from_millis(100), transport.wait_ready())
         .await
         .expect("A13");
