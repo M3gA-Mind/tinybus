@@ -57,6 +57,36 @@ impl NativeInstanceLiveness {
     pub fn is_live(&self) -> bool {
         self.inner.is_live()
     }
+    #[doc(hidden)]
+    #[cfg(feature = "__native-fixture-support")]
+    pub fn __fixture_owner_is_current(&self) -> bool {
+        self.inner.owner.as_ref().is_some_and(ExecutionOwner::is_current_for_fixture)
+    }
+    #[doc(hidden)]
+    #[cfg(feature = "__native-fixture-support")]
+    pub fn __fixture_owner_is_stopped(&self) -> bool {
+        self.inner.owner.as_ref().is_some_and(ExecutionOwner::is_stopped_for_fixture)
+    }
+    #[doc(hidden)]
+    #[cfg(feature = "__native-fixture-support")]
+    pub fn __fixture_request_done(&self) -> bool {
+        self.inner.request_done_for_test()
+    }
+    #[doc(hidden)]
+    #[cfg(feature = "__native-fixture-support")]
+    pub fn __fixture_sdk_owners(&self) -> usize {
+        self.inner.sdk_owner_count_for_test()
+    }
+    #[doc(hidden)]
+    #[cfg(feature = "__native-fixture-support")]
+    pub fn __fixture_reject_worker_spawn(&self) {
+        self.inner.reject_worker_spawn_for_test();
+    }
+    #[doc(hidden)]
+    #[cfg(feature = "__native-fixture-support")]
+    pub fn __fixture_reject_startup(&self, stage: u8) {
+        self.inner.reject_startup_for_test(stage);
+    }
     /// Persist genuine fault and close independent native admission first.
     pub fn request_fault(&self) {
         self.inner.signal(TerminalReason::Fault);
@@ -225,9 +255,9 @@ pub(super) struct TerminalState {
     pub resources: StdMutex<StartupResources>,
     sdk_owners: AtomicUsize,
     vtable_published: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "__native-fixture-support"))]
     reject_worker_spawn: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "__native-fixture-support"))]
     startup_failure_stage: AtomicU8,
     #[cfg(test)]
     transport_drop_thread: StdMutex<Option<String>>,
@@ -325,9 +355,9 @@ impl TerminalState {
             resources: StdMutex::new(StartupResources::default()),
             sdk_owners: AtomicUsize::new(0),
             vtable_published: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "__native-fixture-support"))]
             reject_worker_spawn: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "__native-fixture-support"))]
             startup_failure_stage: AtomicU8::new(0),
             #[cfg(test)]
             transport_drop_thread: StdMutex::new(None),
@@ -596,29 +626,29 @@ impl TerminalState {
     pub(super) fn transport_drop_thread_for_test(&self) -> Option<String> {
         self.transport_drop_thread.lock().unwrap().clone()
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "__native-fixture-support"))]
     pub(super) fn reject_startup_for_test(&self, stage: u8) {
         self.startup_failure_stage.store(stage, Ordering::Release);
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "__native-fixture-support"))]
     pub(super) fn hold_initial_before_transfer_for_test(&self) -> bool {
         matches!(self.startup_failure_stage.load(Ordering::Acquire), 7 | 8)
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "__native-fixture-support"))]
     pub(super) fn startup_checkpoint_for_test(&self, stage: u8) {
         if self.startup_failure_stage.load(Ordering::Acquire) == stage {
             panic!("controlled startup failure after transfer stage {stage}");
         }
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "__native-fixture-support"))]
     pub(super) fn reject_worker_spawn_for_test(&self) {
         self.reject_worker_spawn.store(true, Ordering::Release);
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "__native-fixture-support"))]
     pub(super) fn sdk_owner_count_for_test(&self) -> usize {
         self.sdk_owners.load(Ordering::Acquire)
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "__native-fixture-support"))]
     pub(super) fn request_done_for_test(&self) -> bool {
         matches!(
             self.lock().request_state,
@@ -641,9 +671,9 @@ impl TerminalState {
         let state = job.state.upgrade().expect("anchored terminal state");
         // Private per-instance rejection exercises the real submitted-job ownership
         // path without changing process-wide thread creation or public authority.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "__native-fixture-support"))]
         let rejected = self.reject_worker_spawn.load(Ordering::Acquire);
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "__native-fixture-support")))]
         let rejected = false;
         let submitted = if rejected {
             Err(std::io::Error::other(

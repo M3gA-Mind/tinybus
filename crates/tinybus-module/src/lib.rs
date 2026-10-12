@@ -1536,7 +1536,7 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retained_factory = Some(Box::new(setup.clone()));
         state.register(hooks);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "__native-fixture-support"))]
         state.startup_checkpoint_for_test(1);
         if !state.is_live() {
             return TB_CLOSED;
@@ -1559,7 +1559,7 @@ where
             .setup = Some(Box::new(move |connection| {
             Box::pin(initial_setup(connection, config))
         }));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "__native-fixture-support"))]
         state.startup_checkpoint_for_test(2);
         let weak = Arc::downgrade(&state);
         let reinitializer: ReinitializeFactory = Box::new(move |handle, connection_slot| {
@@ -1666,7 +1666,7 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .reinitializer_factory = Some(reinitializer);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "__native-fixture-support"))]
         state.startup_checkpoint_for_test(3);
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         if let Some(owner) = &state.owner {
@@ -1685,7 +1685,7 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .runtime = Some(runtime);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "__native-fixture-support"))]
         state.startup_checkpoint_for_test(4);
         let (inbound_tx, inbound_rx) = mpsc::channel(MODULE_QUEUE_CAPACITY);
         state
@@ -1709,7 +1709,7 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .transport = Some(transport.clone());
-        #[cfg(test)]
+        #[cfg(any(test, feature = "__native-fixture-support"))]
         state.startup_checkpoint_for_test(5);
         let (handle, connection_slot, factory) = {
             let mut resources = state
@@ -1739,11 +1739,11 @@ where
         *callback_slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = callback;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "__native-fixture-support"))]
         state.startup_checkpoint_for_test(6);
         let task_state = state.clone();
         let task = handle.spawn(async move {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "__native-fixture-support"))]
             if task_state.hold_initial_before_transfer_for_test() {
                 // Deterministic startup-failure fixture: retain SDK-owned C/F
                 // before trusted setup consumes them, with a real cancellable task.
@@ -1817,10 +1817,10 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .initial = Some(task);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "__native-fixture-support"))]
         state.startup_checkpoint_for_test(7);
         let context = state.context();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "__native-fixture-support"))]
         state.startup_checkpoint_for_test(8);
         state.mark_vtable_published();
         if capacity >= size_of::<TbModuleVtable>() as u32 {
