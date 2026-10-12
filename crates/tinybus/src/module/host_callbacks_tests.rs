@@ -1270,6 +1270,7 @@ impl Drop for DestructionObserved {
     }
 }
 struct PendingUntilDestroyed {
+    complete: bool,
     entered: Arc<Notify>,
     guard: HostCallbackGuard,
     observed: Arc<AtomicUsize>,
@@ -1296,7 +1297,11 @@ impl Interface for PendingUntilDestroyed {
             observed: self.observed.clone(),
         };
         self.entered.notify_one();
-        std::future::pending().await
+        if self.complete {
+            Ok(serde_json::Value::Null)
+        } else {
+            std::future::pending().await
+        }
     }
 }
 
@@ -1310,33 +1315,52 @@ fn runtime_drop_destroys_provider_future_before_offruntime_native_cleanup() {
     let account = state(":1.1".parse().unwrap(), ":1.2".parse().unwrap());
     let observed = Arc::new(AtomicUsize::new(0));
     let entered = Arc::new(Notify::new());
-    let (transport, view, barrier) = runtime.block_on(async {
-        let (transport, view, init, barrier) = crate::module::transport::tests::native_fixture();
-        barrier.state.lock().unwrap().1 = true;
-        transport.bind_host_callbacks(account.clone()).unwrap();
-        transport.defer_initialize(init, view);
-        transport.ensure_initialized().await.unwrap();
-        barrier.entered.notified().await;
-        let guarded = GuardedInterface {
-            interface: PendingUntilDestroyed {
-                entered: entered.clone(),
-                guard: HostCallbackGuard(account.clone()),
-                observed: observed.clone(),
-            },
-            endpoint: endpoint(),
-            state: account.clone(),
-        };
-        let context = CallContext::brokered(account.module_peer().as_ref(), true);
-        tokio::spawn(async move {
-            guarded
-                .call_with_context(&endpoint().members[0], serde_json::json!([]), &context)
+    let (transport, view, barrier, user_entered, wait_entered, replacement_rejected) = runtime
+        .block_on(async {
+            let (transport, view, init, barrier) =
+                crate::module::transport::tests::native_fixture();
+            barrier.state.lock().unwrap().1 = true;
+            transport.bind_host_callbacks(account.clone()).unwrap();
+            transport.defer_initialize(init, view);
+            transport.ensure_initialized().await.unwrap();
+            barrier.entered.notified().await;
+            let guarded = GuardedInterface {
+                interface: PendingUntilDestroyed {
+                    complete: false,
+                    entered: entered.clone(),
+                    guard: HostCallbackGuard(account.clone()),
+                    observed: observed.clone(),
+                },
+                endpoint: endpoint(),
+                state: account.clone(),
+            };
+            let context = CallContext::brokered(account.module_peer().as_ref(), true);
+            tokio::spawn(async move {
+                guarded
+                    .call_with_context(&endpoint().members[0], serde_json::json!([]), &context)
+                    .await
+            });
+            let user_entered = tokio::time::timeout(Duration::from_secs(2), entered.notified())
                 .await
+                .is_ok();
+            let replacement = state(":1.3".parse().unwrap(), ":1.4".parse().unwrap());
+            let replacement_rejected = transport.bind_host_callbacks(replacement).is_err();
+            transport.request_terminal(false);
+            let wait_entered = tokio::time::timeout(
+                Duration::from_secs(2),
+                account.physical_wait_started.notified(),
+            )
+            .await
+            .is_ok();
+            (
+                transport,
+                view,
+                barrier,
+                user_entered,
+                wait_entered,
+                replacement_rejected,
+            )
         });
-        entered.notified().await;
-        transport.request_terminal(false);
-        account.physical_wait_started.notified().await;
-        (transport, view, barrier)
-    });
     let count_before_drop = HostCallbackGuard(account.clone()).running();
     let terminal_before_drop = unsafe { view.native_terminal_state.unwrap()(view.host_ctx) };
     let lifecycle_free = !transport.lifecycle_is_owned_for_test();
@@ -1356,6 +1380,7 @@ fn runtime_drop_destroys_provider_future_before_offruntime_native_cleanup() {
         std::thread::yield_now();
     };
     assert!(completed, "actual native callback return remains pending");
+    assert!(user_entered && wait_entered && replacement_rejected);
     assert_eq!(count_before_drop, 1);
     assert_eq!(
         terminal_before_drop,
@@ -1370,4 +1395,27 @@ fn runtime_drop_destroys_provider_future_before_offruntime_native_cleanup() {
     assert_eq!(HostCallbackGuard(account).running(), 0);
     assert!(barrier.state.lock().unwrap().2);
     assert!(!transport.is_faulted());
+}
+
+#[tokio::test]
+async fn completing_provider_future_is_destroyed_before_its_running_account() {
+    let account = state(":1.1".parse().unwrap(), ":1.2".parse().unwrap());
+    let observed = Arc::new(AtomicUsize::new(0));
+    let guarded = GuardedInterface {
+        interface: PendingUntilDestroyed {
+            complete: true,
+            entered: Arc::new(Notify::new()),
+            guard: HostCallbackGuard(account.clone()),
+            observed: observed.clone(),
+        },
+        endpoint: endpoint(),
+        state: account.clone(),
+    };
+    let context = CallContext::brokered(account.module_peer().as_ref(), true);
+    let result = guarded
+        .call_with_context(&endpoint().members[0], serde_json::json!([]), &context)
+        .await;
+    assert!(result.is_ok());
+    assert_eq!(observed.load(Ordering::Acquire), 1);
+    assert_eq!(HostCallbackGuard(account).running(), 0);
 }

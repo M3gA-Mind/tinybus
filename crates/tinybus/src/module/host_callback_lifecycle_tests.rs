@@ -143,6 +143,9 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
         )
     })
     .await;
+    if matches!(mode, DrainStop::Timeout) && early.is_none() {
+        early = Some(stopping.take().unwrap().await);
+    }
     if !matches!(mode, DrainStop::Complete) {
         drop(stopping.take());
     }
@@ -197,13 +200,14 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
         .await;
         let _outcome = request.await;
         assert!(completed.is_ok());
+        assert_eq!(
+            terminal_after_drop,
+            crate::module::abi::TB_NATIVE_TERMINAL_STOP_INTENT,
+            "opaque shutdown returned while provider work was still admitted"
+        );
         assert!(entered.is_ok());
         assert!(host_owner.upgrade().is_none());
         assert_eq!(still_counted, 1);
-        assert_eq!(
-            terminal_after_drop,
-            crate::module::abi::TB_NATIVE_TERMINAL_STOP_INTENT
-        );
         assert!(lifecycle_free && authority_denied && new_call_denied);
         assert_eq!(committed.load(Ordering::Acquire), 1);
         assert!(!transport.is_faulted());
