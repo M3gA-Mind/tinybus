@@ -1864,6 +1864,9 @@ fn module_host_helpers_preserve_safe_names_states_and_allowlist_decisions() {
     let _ = ModuleHost::new(Broker::new()).load_search_paths();
 
     let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    // Files inherit the private DACL, so these assertions exercise content gates.
+    #[cfg(windows)]
+    crate::module::cache::secure_release_cache(directory.path(), directory.path());
     let module = directory.path().join(if cfg!(windows) {
         "clock.dll"
     } else if cfg!(target_os = "macos") {
@@ -1923,6 +1926,9 @@ fn module_host_helpers_preserve_safe_names_states_and_allowlist_decisions() {
 #[test]
 fn an_allowlist_with_a_mismatched_hash_refuses_the_file() {
     let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    // Files inherit the private DACL, so these assertions exercise content gates.
+    #[cfg(windows)]
+    crate::module::cache::secure_release_cache(directory.path(), directory.path());
     let extension = if cfg!(windows) {
         "dll"
     } else if cfg!(target_os = "macos") {
