@@ -1,0 +1,42 @@
+[graph]
+all-features = true
+
+[advisories]
+
+[licenses]
+# GPL applies to the owned TinyBus crates; third-party dependencies stay permissive.
+allow = [
+    # Public CA root data and permissive dependency code licenses.
+    "CDLA-Permissive-2.0",
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+confidence-threshold = 0.9
+exceptions = [
+    { name = "tinybus", allow = ["GPL-3.0-only"] },
+    { name = "tinybus-macros", allow = ["GPL-3.0-only"] },
+    { name = "tinybus-module", allow = ["GPL-3.0-only"] },
+]
+
+[bans]
+# Duplicate versions bloat build times; review them rather than ignoring them.
+multiple-versions = "warn"
+wildcards = "deny"
+# Local unpublished workspace packages are resolved by path, never a registry wildcard.
+allow-wildcard-paths = true
+# Crates that must never enter the dependency graph.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
