@@ -1428,6 +1428,7 @@ pub(crate) struct NativeBarrier {
     pub(crate) changed: Condvar,
     pub(crate) entered: tokio::sync::Notify,
     pub(crate) joined: tokio::sync::Notify,
+    pub(crate) finish_gate: StdMutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 unsafe impl Send for NativeBarrier {}
 unsafe impl Sync for NativeBarrier {}
@@ -1444,13 +1445,16 @@ unsafe extern "C" fn native_joined(ctx: *mut c_void) {
     assert!(!state.2, "one actual native shutdown/join");
     state.2 = true;
     barrier.joined.notify_one();
+    drop(state);
+    let gate = barrier.finish_gate.lock().unwrap().take();
+    if let Some(gate) = gate { gate.recv().unwrap(); }
 }
 pub(crate) fn native_fixture() -> (Arc<ModuleTransport>, TbHostVtable, crate::module::abi::TbModuleInit, Arc<NativeBarrier>) {
     let path = std::env::var_os("TINYBUS_TEST_CONTROLLED_INIT_MODULE").expect("controlled native fixture path");
     let artifact = crate::module::loader::load(std::path::Path::new(&path), false).unwrap();
     let barrier = Arc::new(NativeBarrier {
         state: StdMutex::new((None, false, false)), changed: Condvar::new(),
-        entered: Notify::new(), joined: Notify::new(),
+        entered: Notify::new(), joined: Notify::new(), finish_gate: StdMutex::new(None),
     });
     let controls = NativeControls { ctx: Arc::as_ptr(&barrier).cast_mut().cast(), entered: native_entered, joined: native_joined };
     let config = unsafe { std::slice::from_raw_parts(std::ptr::from_ref(&controls).cast::<u8>(), size_of::<NativeControls>()) }.to_vec();

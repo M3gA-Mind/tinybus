@@ -3056,3 +3056,90 @@ async fn ordinary_stop_never_fabricates_faulted_before_or_after_callback_complet
     );
     broker_task.abort();
 }
+
+async fn controlled_native_transport() -> (
+    Arc<ModuleTransport>, crate::module::abi::TbHostVtable,
+    Arc<super::super::transport::tests::NativeBarrier>, LoadedArtifact, PathBuf,
+) {
+    let (transport, view, init, barrier) = super::super::transport::tests::native_fixture();
+    barrier.state.lock().unwrap().1 = true;
+    transport.defer_initialize(init, view);
+    transport.ensure_initialized().await.unwrap();
+    barrier.entered.notified().await;
+    let path = PathBuf::from(std::env::var_os("TINYBUS_TEST_CONTROLLED_INIT_MODULE").unwrap());
+    let artifact = loader::load(&path, false).unwrap();
+    (transport, view, barrier, artifact, path)
+}
+
+fn attach_controlled_native(host: &ModuleHost, transport: Arc<ModuleTransport>, artifact: LoadedArtifact, path: &Path) -> Result<ModuleInfo> {
+    let mut admitted = host.validate(path, &artifact.descriptor, &artifact.manifest)?;
+    admitted.state = ModuleState::Initializing;
+    host.attach_transport(path, admitted, artifact.manifest, transport, Activation {
+        lazy_init: false, lazy_load: false, descriptor_info: None, pinned_sha256: None,
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_host_drop_keeps_terminal_tombstone_and_other_instance_live() {
+    let (transport, view, barrier, artifact, path) = controlled_native_transport().await;
+    let (other, other_view, other_barrier, _, _) = controlled_native_transport().await;
+    let host = ModuleHost::new(Broker::new());
+    attach_controlled_native(&host, transport.clone(), artifact, &path).unwrap();
+    drop(host);
+    assert_ne!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 1);
+    assert_eq!(unsafe { other_view.native_terminal_state.unwrap()(other_view.host_ctx) }, 1);
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified()).await.unwrap();
+    let stopped = transport.clone().stop(Duration::from_secs(2)).await;
+    assert!(matches!(stopped, Err(StopError::NotStarted(_))));
+    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 10);
+    drop(transport);
+    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 10);
+    other.request_terminal(false);
+    tokio::time::timeout(Duration::from_secs(2), other_barrier.joined.notified()).await.unwrap();
+    assert!(barrier.state.lock().unwrap().2);
+    assert!(other_barrier.state.lock().unwrap().2);
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_reservation_rollback_retains_one_cleanup_and_fault_tombstone() {
+    let (first, first_view, first_barrier, artifact, path) = controlled_native_transport().await;
+    let (rejected, view, barrier, other_artifact, _) = controlled_native_transport().await;
+    let host = ModuleHost::new(Broker::new());
+    attach_controlled_native(&host, first, artifact, &path).unwrap();
+    assert!(attach_controlled_native(&host, rejected.clone(), other_artifact, &path).is_err());
+    assert_ne!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 1);
+    assert_eq!(unsafe { first_view.native_terminal_state.unwrap()(first_view.host_ctx) }, 1);
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified()).await.unwrap();
+    let _observed = rejected.clone().stop(Duration::from_secs(2)).await;
+    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 14);
+    assert!(rejected.ensure_initialized().await.is_err());
+    drop(rejected);
+    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 14);
+    drop(host);
+    tokio::time::timeout(Duration::from_secs(2), first_barrier.joined.notified()).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_fault_during_ordinary_stop_keeps_fault_state_and_single_join() {
+    let (transport, view, barrier, artifact, path) = controlled_native_transport().await;
+    let host = ModuleHost::new(Broker::new());
+    let info = attach_controlled_native(&host, transport.clone(), artifact, &path).unwrap();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    *barrier.finish_gate.lock().unwrap() = Some(release_rx);
+    let stopping = tokio::spawn({
+        let host = host.clone(); async move { host.stop(info.name, Duration::from_secs(2)).await }
+    });
+    barrier.joined.notified().await;
+    assert!(transport.stop_task_spawned());
+    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 2, "joined worker is not yet successful opaque return");
+    unsafe { (view.fault)(view.host_ctx, std::ptr::null(), 0); }
+    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 6);
+    release.send(()).unwrap();
+    let result = stopping.await.unwrap().unwrap();
+    assert!(matches!(result.state, ModuleState::Faulted { .. }), "late ordinary completion cannot replace actual fault");
+    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 14);
+    assert!(barrier.state.lock().unwrap().2);
+}

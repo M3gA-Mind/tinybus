@@ -586,6 +586,7 @@ impl ModuleHost {
             false
         };
         if !ready {
+            transport.commit_terminal(true);
             binding.revoke();
             transport.request_terminal(true);
             let _ = transport.close().await;
@@ -638,6 +639,7 @@ impl Drop for LoadRollback<'_> {
         if self.committed {
             return;
         }
+        if let Some(transport) = &self.transport { transport.commit_terminal(true); }
         self.binding.revoke();
         self.binding.transport.close_outbound();
         self.binding

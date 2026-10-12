@@ -1137,6 +1137,7 @@ impl ModuleHost {
         {
             Ok(change) => change,
             Err(_) => {
+                transport.commit_terminal(true);
                 self.inner
                     .broker
                     .router
