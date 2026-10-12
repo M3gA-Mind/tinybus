@@ -97,6 +97,8 @@ struct LoadedModule {
     descriptor_info: Option<DescriptorInfo>,
     lifecycle_busy: bool,
     callback_config: Option<[u8; 32]>,
+    // Keep operation accounting after routing revocation removes the binding.
+    callback_state: Option<Arc<callbacks::CallbackState>>,
 }
 
 /// Fingerprints only bytes produced by serde_json::to_vec, never arbitrary JSON.
@@ -1248,6 +1250,7 @@ impl ModuleHost {
                 descriptor_info,
                 lifecycle_busy: false,
                 callback_config: None,
+                callback_state: None,
             });
         Ok(admitted)
     }
@@ -1470,7 +1473,8 @@ impl ModuleControl for ModuleHostInner {
     }
 
     async fn stop_inner(&self, name: &str, deadline: Duration) -> Result<ModuleInfo> {
-        let transport = {
+        let started = std::time::Instant::now();
+        let (transport, callbacks) = {
             let mut loaded = self.loaded.lock().expect("module list lock");
             let module = loaded
                 .iter_mut()
@@ -1501,10 +1505,19 @@ impl ModuleControl for ModuleHostInner {
                 .revoke_callbacks_for_peer(&module.unique_name);
             module.transition_from = Some(old);
             module.lifecycle_busy = true;
-            module.transport.clone()
+            (module.transport.clone(), module.callback_state.clone())
         };
         let _lifecycle_busy = LifecycleBusyGuard::for_stop(self, name, transport.clone());
-        let stopped = transport.stop(deadline).await;
+        if let Some(callbacks) = callbacks {
+            if let Err(error) = callbacks.drain(deadline.saturating_sub(started.elapsed())).await {
+                let mut loaded = self.loaded.lock().expect("module list lock");
+                if let Some(module) = loaded.iter_mut().find(|module| module.info.name == name) {
+                    module.transition_from = None;
+                }
+                return Err(error);
+            }
+        }
+        let stopped = transport.stop(deadline.saturating_sub(started.elapsed())).await;
         let mut loaded = self.loaded.lock().expect("module list lock");
         let module = loaded
             .iter_mut()
@@ -1575,6 +1588,11 @@ impl ModuleControl for ModuleHostInner {
             .iter_mut()
             .find(|module| module.info.name == name)
             .ok_or_else(|| Error::failed("module is not known"))?;
+        // Held through this synchronous mutation, atomic with lifecycle
+        // reservation. The public waiter can end before its native task.
+        if module.lifecycle_busy || module.transport.native_lifecycle_pending() {
+            return Err(Error::failed("module lifecycle operation is already running"));
+        }
         let old = module.snapshot().state;
         if matches!(
             &old,
