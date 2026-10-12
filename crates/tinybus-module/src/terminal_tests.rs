@@ -16,7 +16,7 @@ fn host() -> HostCalls {
 #[test]
 fn observed_native_terminal_never_reopens_a_retained_view() {
     FLAGS.store(TB_NATIVE_TERMINAL_LIVE, Ordering::Release);
-    let view = NativeInstanceLiveness { inner: Arc::new(TerminalState { host: host() }) };
+    let view = NativeInstanceLiveness { inner: Arc::new(TerminalState { host: host(), closed: AtomicBool::new(false) }) };
     assert!(view.is_live());
     FLAGS.store(TB_NATIVE_TERMINAL_STOP_INTENT, Ordering::Release);
     assert!(!view.is_live());

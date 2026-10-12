@@ -30,14 +30,17 @@ pub struct NativeInstanceLiveness { inner: Arc<TerminalState> }
 impl NativeInstanceLiveness {
     /// Only a supported, exactly-live native query allows new admission.
     pub fn is_live(&self) -> bool {
-        self.inner.host.0.native_terminal_state.is_some_and(|query| unsafe {
+        if self.inner.closed.load(Ordering::Acquire) { return false; }
+        let live = self.inner.host.0.native_terminal_state.is_some_and(|query| unsafe {
             query(self.inner.host.0.host_ctx) == TB_NATIVE_TERMINAL_LIVE
-        })
+        });
+        if !live { self.inner.closed.store(true, Ordering::Release); }
+        live && !self.inner.closed.load(Ordering::Acquire)
     }
     /// Persist genuine fault and close independent native admission first.
-    pub fn request_fault(&self) { self.inner.host.fault(); }
+    pub fn request_fault(&self) { self.inner.host.fault(); self.inner.closed.store(true, Ordering::Release); }
 }
-struct TerminalState { host: HostCalls }
+struct TerminalState { host: HostCalls, closed: AtomicBool }
 #[cfg(test)]
 #[path = "terminal_tests.rs"]
 mod tests;
