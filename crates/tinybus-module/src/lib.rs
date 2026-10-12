@@ -1672,7 +1672,15 @@ where
         if let Some(owner) = &state.owner {
             owner.configure(&mut builder);
         }
-        let runtime = match builder.worker_threads(worker_threads).enable_all().build() {
+        #[cfg(feature = "__native-fixture-support")]
+        let build = if state.view().__fixture_runtime_builder_error() {
+            Err(std::io::Error::other("controlled runtime Builder error"))
+        } else {
+            builder.worker_threads(worker_threads).enable_all().build()
+        };
+        #[cfg(not(feature = "__native-fixture-support"))]
+        let build = builder.worker_threads(worker_threads).enable_all().build();
+        let runtime = match build {
             Ok(runtime) => runtime,
             Err(_) => {
                 state.signal(TerminalReason::SetupFailed);
