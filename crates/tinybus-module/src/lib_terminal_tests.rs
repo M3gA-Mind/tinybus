@@ -133,6 +133,7 @@ mod controlled {
         pub joins: AtomicUsize,
         pub drop_off_lock: AtomicBool,
         pub request_off_lock: AtomicBool,
+        pub future_drop_control: StdMutex<Option<(Arc<std::sync::Barrier>, bool)>>,
     }
     static NEXT: StdMutex<Option<Arc<Fixture>>> = StdMutex::new(None);
     pub static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -147,6 +148,7 @@ mod controlled {
             joins: AtomicUsize::new(0),
             drop_off_lock: AtomicBool::new(true),
             request_off_lock: AtomicBool::new(true),
+            future_drop_control: StdMutex::new(None),
         });
         *NEXT.lock().unwrap() = Some(fixture.clone());
         (fixture, receiver)
@@ -196,6 +198,11 @@ mod controlled {
                     .unwrap_or("unnamed")
                     .to_owned(),
             ));
+            let control = self.fixture.future_drop_control.lock().unwrap().take();
+            if let Some((release, panic)) = control {
+                release.wait();
+                if panic { panic!("controlled prior reinit future Drop"); }
+            }
         }
     }
     fn factory(
@@ -864,4 +871,58 @@ async fn actual_reinit_source_error_and_panic_request_outside_callback_exclusion
         assert_eq!(fixture.joins.load(Ordering::SeqCst), 1);
         assert!(fixture.request_off_lock.load(Ordering::Acquire), "source fault request held reinitializer mutex in mode {mode}");
     }
+}
+
+async fn controlled_prior_reinit_drop(panic: bool) {
+    let _serial = controlled::TEST_LOCK.lock().await;
+    let (fixture, events) = controlled::fixture();
+    let broker = tinybus::broker::Broker::new();
+    broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+    let host = Arc::new(tinybus::module::ModuleHost::new(broker));
+    host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":0})).unwrap();
+    events.recv_timeout(Duration::from_secs(3)).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !host.list().iter().any(|info| matches!(info.state, tinybus::module::ModuleState::Ready)) {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    host.reinitialize("tinybus-module", serde_json::json!({"mode":0})).await.unwrap();
+    let _ = events.try_iter().count();
+    let release = Arc::new(std::sync::Barrier::new(2));
+    *fixture.future_drop_control.lock().unwrap() = Some((release.clone(), panic));
+    let caller_host = host.clone();
+    let caller = tokio::spawn(async move { caller_host.reinitialize("tinybus-module", serde_json::json!({"mode":0})).await });
+    let entered = events.recv_timeout(Duration::from_secs(3)).unwrap();
+    let view = fixture.view.lock().unwrap().as_ref().unwrap().clone();
+    view.inner.signal(TerminalReason::Stop);
+    let not_finished_while_blocked = fixture.joins.load(Ordering::SeqCst) == 0;
+    let no_next_setup = !events.try_iter().any(|event| matches!(event, controlled::Event::Poll(_)));
+    release.wait();
+    let result = caller.await.unwrap();
+    loop {
+        if matches!(events.recv_timeout(Duration::from_secs(5)).unwrap(), controlled::Event::Finish) { break; }
+    }
+    host.shutdown(Duration::from_secs(8)).await;
+    let completion = view.inner.wait(Duration::from_secs(5));
+    assert!(matches!(entered, controlled::Event::FutureDrop(name) if name == "tinybus-terminal"));
+    assert!(not_finished_while_blocked && no_next_setup);
+    assert!(result.is_err());
+    assert_eq!(fixture.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.joins.load(Ordering::SeqCst), 1);
+    assert!(fixture.drop_off_lock.load(Ordering::Acquire));
+    assert!(fixture.request_off_lock.load(Ordering::Acquire));
+    if panic {
+        assert_eq!(completion, TerminalCompletion::Uncertain);
+        assert!(view.inner.has_fault());
+        assert!(terminal::TerminalState::lookup(view.inner.context()).is_some());
+        assert!(!events.try_iter().any(|event| matches!(event, controlled::Event::FactoryDrop(_))), "remaining foreign captures must stay anchored after first cleanup panic");
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_prior_reinit_drop_blocks_next_setup_then_stop_settles_same_job() {
+    controlled_prior_reinit_drop(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_prior_reinit_drop_panic_retains_resources_but_attempts_finish_once() {
+    controlled_prior_reinit_drop(true).await;
 }
