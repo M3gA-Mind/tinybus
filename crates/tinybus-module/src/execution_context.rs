@@ -55,19 +55,11 @@ impl ExecutionOwner {
     }
     pub(super) fn install_panic_hook() {
         PANIC_HOOK.call_once(|| {
-            let previous = std::panic::take_hook();
             std::panic::set_hook(Box::new(move |panic| {
                 let owner = OWNER
                     .try_with(|slot| slot.try_borrow().ok().and_then(|owner| owner.clone()))
                     .ok()
                     .flatten();
-                let Some(owner) = owner else {
-                    previous(panic);
-                    return;
-                };
-                if !owner.live.load(Ordering::Acquire) {
-                    return;
-                }
                 let location = panic.location().map_or_else(
                     || "module panicked at an unknown location".to_string(),
                     |location| {
@@ -83,6 +75,16 @@ impl ExecutionOwner {
                         )
                     },
                 );
+                let Some(owner) = owner else {
+                    // Unowned module-created threads have no callback authority.
+                    // Preserve payload sanitization without selecting a host.
+                    use std::io::Write;
+                    let _ = writeln!(std::io::stderr().lock(), "{location}");
+                    return;
+                };
+                if !owner.live.load(Ordering::Acquire) {
+                    return;
+                }
                 if let Ok(mut slot) = owner.panic_location.try_lock() {
                     *slot = Some(location.clone());
                 }

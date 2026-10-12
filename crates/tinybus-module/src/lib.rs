@@ -359,6 +359,7 @@ unsafe extern "C" fn deliver(ctx: *mut c_void, ptr: *const u8, len: usize) -> i3
             return TB_BAD_ARGUMENT;
         }
         let state = unsafe { &*(ctx.cast::<RuntimeState>()) };
+        let _caller = state.owner.as_ref().map(ExecutionOwner::enter);
         let brokered = state.host.is_broker_routed();
         let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
         let sender = state.inbound.lock().expect("module inbound lock").clone();
