@@ -2732,3 +2732,245 @@ async fn compiled_native_method_payload_and_whole_connection_drop_retain_actual_
         }
     }
 }
+
+type NativeConfigure =
+    unsafe extern "C" fn(usize, *mut c_void, unsafe extern "C" fn(*mut c_void, u32, u32));
+type NativeReinit = unsafe extern "C" fn(usize, *const u8, usize) -> i32;
+struct NativeNestedControls {
+    events: std::sync::mpsc::Sender<(u32, u32)>,
+    path: std::path::PathBuf,
+    host: Arc<tinybus::module::ModuleHost>,
+    other: NativeControls,
+    configure: NativeConfigure,
+    reinit: NativeReinit,
+    context: extern "C" fn() -> usize,
+    token: std::sync::atomic::AtomicUsize,
+    phase: std::sync::atomic::AtomicUsize,
+}
+unsafe extern "C" fn native_nested_event(ctx: *mut c_void, event: u32, value: u32) {
+    let controls = unsafe { &*ctx.cast::<NativeNestedControls>() };
+    let _ = controls.events.send((event, value));
+    if event == 10 {
+        unsafe {
+            (controls.configure)(46, controls.other.ctx, controls.other.event);
+        }
+        let loaded = controls
+            .host
+            .load_file_with_config(&controls.path, native_controls_config(0, &controls.other));
+        controls
+            .token
+            .store((controls.context)(), Ordering::Release);
+        let _ = controls.events.send((36, u32::from(loaded.is_ok())));
+    }
+    if event == 26 && controls.phase.load(Ordering::Acquire) == 1 {
+        let bytes = serde_json::to_vec(&native_controls_config(0, &controls.other)).unwrap();
+        let result = unsafe {
+            (controls.reinit)(
+                controls.token.load(Ordering::Acquire),
+                bytes.as_ptr(),
+                bytes.len(),
+            )
+        };
+        let _ = controls.events.send((37, u32::from(result == TB_OK)));
+    }
+}
+struct NativeLogCount(Arc<std::sync::atomic::AtomicUsize>);
+impl tracing::Subscriber for NativeLogCount {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        if event.metadata().target() == "tinybus_module" {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a fresh-process privately pinned __native-fixture-support eight-artifact cohort"]
+async fn compiled_native_nested_factory_reinit_restore_exact_owner_and_suppress_captured_dispatch()
+{
+    let path = std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_TERMINAL_MODULE").unwrap());
+    let warm = native_fixture_host();
+    let (events, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
+    let events = Box::into_raw(Box::new(events));
+    let controls = NativeControls {
+        ctx: events.cast(),
+        event: native_event,
+    };
+    warm.load_file_with_config(&path, native_controls_config(0, &controls))
+        .unwrap();
+    let configure: NativeConfigure =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_factory_mode") };
+    let reinit: NativeReinit = unsafe { native_fixture_symbol(&path, c"terminal_test_reinit") };
+    let dispatch: extern "C" fn(usize) -> bool =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_dispatch") };
+    let unowned: extern "C" fn() -> bool =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_unowned") };
+    let release_views: extern "C" fn() -> usize =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_release_views") };
+    let retained_live: extern "C" fn() -> usize =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_retained_live") };
+    let (context, old_probe, drops, _, _) = unsafe { terminal_fixture_symbols(&path) };
+    warm.shutdown(Duration::from_secs(5)).await;
+    while !matches!(receiver.recv_timeout(Duration::from_secs(5)), Ok((6, _))) {}
+    let (b_events, b_receiver) = std::sync::mpsc::channel::<(u32, u32)>();
+    let b_events = Box::into_raw(Box::new(b_events));
+    let b_controls = NativeControls {
+        ctx: b_events.cast(),
+        event: native_event,
+    };
+    let host_b = native_fixture_host();
+    let (a_events, a_receiver) = std::sync::mpsc::channel();
+    let nested = Box::into_raw(Box::new(NativeNestedControls {
+        events: a_events,
+        path: path.clone(),
+        host: host_b.clone(),
+        other: b_controls,
+        configure,
+        reinit,
+        context,
+        token: std::sync::atomic::AtomicUsize::new(0),
+        phase: std::sync::atomic::AtomicUsize::new(0),
+    }));
+    let a_controls = NativeControls {
+        ctx: nested.cast(),
+        event: native_nested_event,
+    };
+    unsafe {
+        configure(46, nested.cast(), native_nested_event);
+    }
+    let host_a = native_fixture_host();
+    host_a
+        .load_file_with_config(&path, native_controls_config(0, &a_controls))
+        .unwrap();
+    let token_a = context();
+    let token_b = unsafe { &*nested }.token.load(Ordering::Acquire);
+    let mut a_seen = Vec::new();
+    let mut b_seen = Vec::new();
+    while !a_seen.iter().any(|event: &(u32, u32)| event.0 == 2) {
+        a_seen.push(a_receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    while !b_seen.iter().any(|event: &(u32, u32)| event.0 == 2) {
+        b_seen.push(b_receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    unsafe { &*nested }.phase.store(1, Ordering::Release);
+    let bytes = serde_json::to_vec(&native_controls_config(0, &a_controls)).unwrap();
+    let first_reinit = unsafe { reinit(token_a, bytes.as_ptr(), bytes.len()) };
+    let restored_external = unowned();
+    let logs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let probe = |index| {
+        let before = logs.load(Ordering::Acquire);
+        let enabled =
+            tracing::subscriber::with_default(NativeLogCount(logs.clone()), || dispatch(index));
+        (enabled, logs.load(Ordering::Acquire) - before)
+    };
+    let a_live_probe = probe(0);
+    let b_live_probe = probe(1);
+    let before = drops();
+    host_a.shutdown(Duration::from_secs(5)).await;
+    while !a_seen.iter().any(|event| event.0 == 6) {
+        a_seen.push(a_receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while drops() == before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let a_stopped_probe = probe(0);
+    let b_after_a_probe = probe(1);
+    let live_after_a = retained_live();
+    let b_bytes = serde_json::to_vec(&native_controls_config(0, &b_controls)).unwrap();
+    let b_after_a_reinit = unsafe { reinit(token_b, b_bytes.as_ptr(), b_bytes.len()) };
+    host_b.shutdown(Duration::from_secs(5)).await;
+    while !b_seen.iter().any(|event| event.0 == 6) {
+        b_seen.push(b_receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    let b_stopped_probe = probe(1);
+    // A newly loaded third native instance has its own exact owner; retired
+    // opaque tokens cannot select it, and old factory dispatchers remain quiet.
+    let (c_events, c_receiver) = std::sync::mpsc::channel::<(u32, u32)>();
+    let c_events = Box::into_raw(Box::new(c_events));
+    let c_controls = NativeControls {
+        ctx: c_events.cast(),
+        event: native_event,
+    };
+    unsafe {
+        configure(46, c_events.cast(), native_event);
+    }
+    let host_c = native_fixture_host();
+    host_c
+        .load_file_with_config(&path, native_controls_config(0, &c_controls))
+        .unwrap();
+    let mut c_seen = Vec::new();
+    while !c_seen.iter().any(|event: &(u32, u32)| event.0 == 2) {
+        c_seen.push(c_receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    let c_live_probe = probe(2);
+    let old_a = old_probe(token_a);
+    let old_b = old_probe(token_b);
+    let old_dispatch_after_reload = [probe(0), probe(1)];
+    let before = drops();
+    host_c.shutdown(Duration::from_secs(5)).await;
+    while !c_seen.iter().any(|event| event.0 == 6) {
+        c_seen.push(c_receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while drops() == before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    a_seen.extend(a_receiver.try_iter());
+    b_seen.extend(b_receiver.try_iter());
+    c_seen.extend(c_receiver.try_iter());
+    let finally_unowned = unowned();
+    release_views();
+    drop(host_a);
+    drop(host_b);
+    drop(host_c);
+    // All real original finishes/joins and F/controller captures settled.
+    unsafe {
+        drop(Box::from_raw(nested));
+        drop(Box::from_raw(b_events));
+        drop(Box::from_raw(c_events));
+    }
+    assert_eq!(first_reinit, TB_OK);
+    assert_eq!(b_after_a_reinit, TB_OK);
+    assert!(restored_external && finally_unowned);
+    assert!(a_seen.contains(&(36, 1)) && a_seen.contains(&(37, 1)));
+    assert!(
+        a_seen.iter().any(|event| event.0 == 27 && event.1 & 3 == 1),
+        "factory B scope restores actual factory A"
+    );
+    assert!(
+        a_seen
+            .iter()
+            .filter(|event| event.0 == 28)
+            .all(|event| event.1 & 3 == 1),
+        "nested B reinit restores actual worker A"
+    );
+    assert_eq!(a_live_probe, (true, 1));
+    assert_eq!(b_live_probe, (true, 1));
+    assert_eq!(a_stopped_probe, (false, 0));
+    assert_eq!(b_after_a_probe, (true, 1));
+    assert_eq!(b_stopped_probe, (false, 0));
+    assert_eq!(c_live_probe, (true, 1));
+    assert_eq!(old_dispatch_after_reload, [(false, 0), (false, 0)]);
+    assert_eq!(live_after_a, 1);
+    assert_eq!((old_a, old_b), (TB_CLOSED, TB_CLOSED));
+    for seen in [a_seen, b_seen, c_seen] {
+        assert_eq!(seen.iter().filter(|event| **event == (5, 1)).count(), 1);
+        assert_eq!(seen.iter().filter(|event| **event == (7, 1)).count(), 1);
+        assert!(seen.iter().any(|event| event.0 == 13 && event.1 & 7 == 7));
+    }
+}

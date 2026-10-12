@@ -12,6 +12,7 @@ static DROPPED: AtomicUsize = AtomicUsize::new(0);
 static EARLY: Mutex<Option<Controls>> = Mutex::new(None);
 static NEXT_FACTORY_MODE: AtomicUsize = AtomicUsize::new(0);
 static FACTORIES: AtomicUsize = AtomicUsize::new(0);
+static FACTORY_DISPATCHES: Mutex<Vec<tracing::Dispatch>> = Mutex::new(Vec::new());
 static EXTERNAL_CONTROLLER: Mutex<Option<std::sync::Weak<Controller>>> = Mutex::new(None);
 static RETAINED_VIEWS: Mutex<Vec<NativeInstanceLiveness>> = Mutex::new(Vec::new());
 #[derive(Clone, Copy)]
@@ -149,8 +150,11 @@ impl Future for SetupFuture {
 }
 impl Drop for SetupFuture {
     fn drop(&mut self) {
-        if self.mode == 42 {
+        if self.mode == 42 || self.mode == 47 {
             self.controller.emit(25, 0);
+        }
+        if self.mode == 47 {
+            std::panic::panic_any(PrimaryPayload(*self.controller.controls.lock().unwrap()));
         }
         self.controller.observe(14);
         self.controller.emit(
@@ -164,6 +168,12 @@ type FixtureSetup = Box<dyn Fn(Connection, Config) -> FixtureFuture + Send + Syn
 fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)> {
     FACTORIES.fetch_add(1, Ordering::AcqRel);
     let factory_mode = NEXT_FACTORY_MODE.swap(0, Ordering::AcqRel);
+    if factory_mode == 46 {
+        FACTORY_DISPATCHES
+            .lock()
+            .unwrap()
+            .push(tracing::dispatcher::get_default(Clone::clone));
+    }
     if factory_mode == 3 || (20..=29).contains(&factory_mode) || factory_mode == 46 {
         RETAINED_VIEWS.lock().unwrap().push(view.clone());
     }
@@ -637,4 +647,18 @@ pub extern "C" fn terminal_test_sdk_owners() -> usize {
     {
         0
     }
+}
+
+/// Probe a dispatcher captured by the genuine factory's actual caller scope.
+/// It supplies no execution owner or native admission authority.
+#[unsafe(no_mangle)]
+pub extern "C" fn terminal_test_dispatch(index: usize) -> bool {
+    let dispatch = FACTORY_DISPATCHES.lock().unwrap().get(index).cloned();
+    dispatch.is_some_and(|dispatch| {
+        tracing::dispatcher::with_default(&dispatch, || {
+            let enabled = !tracing::info_span!("terminal_factory_dispatch").is_disabled();
+            tracing::info!("retained native factory dispatcher");
+            enabled
+        })
+    })
 }
