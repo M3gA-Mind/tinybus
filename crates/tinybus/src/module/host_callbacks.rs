@@ -146,7 +146,7 @@ pub struct HostCallbackBinding {
     #[cfg(test)]
     after_attach: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
-    before_load_decision: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    before_load_decision: Mutex<Option<(Arc<Notify>, tokio::sync::oneshot::Receiver<()>)>>,
 }
 
 /// Outgoing operations on the binding's private connection.
@@ -613,7 +613,10 @@ impl ModuleHost {
         #[cfg(test)]
         {
             let observer = binding.before_load_decision.lock().expect("test decision observer").take();
-            if let Some(observer) = observer { observer(); }
+            if let Some((entered, release)) = observer {
+                entered.notify_one();
+                release.await.expect("test decision observer released");
+            }
         }
         if let Some(cause) = failure {
             let fault = transport.commit_admission_termination(cause);

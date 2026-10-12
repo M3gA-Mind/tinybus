@@ -648,3 +648,101 @@ async fn actual_native_callback_load_drop_after_ordinary_stop_preserves_cause() 
 async fn actual_native_callback_gate_rejection_after_ordinary_stop_preserves_cause() {
     native_callback_load_after_ordinary_stop(false, true).await;
 }
+
+async fn served_native_binding(host: &ModuleHost) -> HostCallbackBinding {
+    let binding = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
+    let (entered, _) = tokio::sync::mpsc::channel(1);
+    binding.serve_at(endpoint().path, BlockingCallback {
+        entered,
+        release: Arc::new(tokio::sync::Semaphore::new(0)),
+        published: Arc::new(AtomicUsize::new(0)),
+        guard: binding.guard(),
+    }).await.unwrap();
+    binding
+}
+
+async fn native_callback_decision_race(ready: bool, native_fault: bool) {
+    use super::super::super::transport::tests::{native_fixture, native_fixture_json};
+    let (unused, _, _, barrier) = native_fixture();
+    let mut config = native_fixture_json(&unused);
+    config["test_ready"] = serde_json::json!(ready);
+    drop(unused);
+    let artifact = std::path::PathBuf::from(
+        std::env::var_os("TINYBUS_TEST_CONTROLLED_INIT_MODULE").unwrap());
+    let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
+    let (_dir, artifact) = super::super::tests::staged_module(&artifact, &hash);
+    let host = Arc::new(ModuleHost::new(Broker::new()));
+    let binding = Arc::new(served_native_binding(&host).await);
+    let decision = Arc::new(Notify::new());
+    let (resume, release) = tokio::sync::oneshot::channel();
+    *binding.before_load_decision.lock().unwrap() = Some((decision.clone(), release));
+    let loading_host = host.clone();
+    let loading_binding = binding.clone();
+    let load = tokio::spawn(async move {
+        loading_host.load_file_with_host_callbacks(artifact, config, &loading_binding).await
+    });
+    // Keep the paused runtime runnable until actual C entry/publication. This
+    // prevents virtual time from auto-advancing the initializer's deadline.
+    while barrier.state.lock().unwrap().0.is_none() { tokio::task::yield_now().await; }
+    let transport = host.inner.loaded.lock().unwrap()[0].transport.clone();
+    let view = barrier.state.lock().unwrap().0.unwrap();
+    barrier.state.lock().unwrap().1 = true;
+    barrier.changed.notify_all();
+    // Poll until native initialization is genuinely published, without an idle
+    // paused timer deciding the deadline before the native owner can run.
+    while !transport.init_started() { tokio::task::yield_now().await; }
+    // init_started precedes actual publication; the observer result is the proof.
+    let initialized = transport.ensure_initialized();
+    tokio::pin!(initialized);
+    std::future::poll_fn(|cx| {
+        match std::future::Future::poll(initialized.as_mut(), cx) {
+            std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
+            std::task::Poll::Pending => { cx.waker().wake_by_ref(); std::task::Poll::Pending }
+        }
+    }).await.unwrap();
+    if !ready {
+        // Real wait_ready deadline, not a fake readiness flag. Let the public
+        // future install its timer before advancing past the actual bound.
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+    }
+    decision.notified().await;
+    assert_eq!(transport.is_ready(), ready);
+    let (finish, receive) = std::sync::mpsc::channel();
+    *barrier.finish_gate.lock().unwrap() = Some(receive);
+    let stopping = transport.clone();
+    let stop = tokio::spawn(async move { stopping.stop(Duration::from_secs(2)).await });
+    while !barrier.state.lock().unwrap().2 { tokio::task::yield_now().await; }
+    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 2);
+    if native_fault {
+        unsafe { (view.fault)(view.host_ctx, std::ptr::null(), 0); }
+        assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 6);
+    }
+    resume.send(()).unwrap();
+    // Rollback revokes before awaiting physical close or returning failure.
+    while !binding.state.lifetime.lock().unwrap().revoked { tokio::task::yield_now().await; }
+    let held = unsafe { view.native_terminal_state.unwrap()(view.host_ctx) };
+    finish.send(()).unwrap();
+    assert!(stop.await.unwrap().is_ok());
+    assert!(load.await.unwrap().is_err());
+    assert_eq!(held, if ready && !native_fault { 2 } else { 6 });
+    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        if ready && !native_fault { 10 } else { 14 });
+    assert_eq!(transport.is_faulted(), !ready || native_fault);
+}
+
+#[tokio::test(start_paused = true)]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_ready_commit_cancellation_preserves_ordinary_cause() {
+    native_callback_decision_race(true, false).await;
+}
+#[tokio::test(start_paused = true)]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_readiness_deadline_still_faults_after_ordinary_stop() {
+    native_callback_decision_race(false, false).await;
+}
+#[tokio::test(start_paused = true)]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_fault_at_ready_commit_dominates_ordinary_stop() {
+    native_callback_decision_race(true, true).await;
+}
