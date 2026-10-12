@@ -206,7 +206,7 @@ unsafe extern "C" fn native_event(ctx: *mut c_void, event: u32, value: u32) {
 // Only fixture symbols are looked up; TinyBus itself verifies/adopts the pinned
 // private artifact through the actual ModuleHost loader first. It remains mapped.
 #[cfg(unix)]
-unsafe fn terminal_fixture_symbols(path: &std::path::Path) -> (extern "C" fn() -> usize, extern "C" fn(usize) -> i32, extern "C" fn() -> usize) {
+unsafe fn terminal_fixture_symbols(path: &std::path::Path) -> (extern "C" fn() -> usize, extern "C" fn(usize) -> i32, extern "C" fn() -> usize, unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void, u32, u32)), extern "C" fn() -> u32) {
     use std::os::unix::ffi::OsStrExt;
     #[cfg_attr(target_os = "linux", link(name = "dl"))]
     unsafe extern "C" { fn dlopen(path: *const std::ffi::c_char, flags: i32) -> *mut c_void; fn dlsym(handle: *mut c_void, name: *const std::ffi::c_char) -> *mut c_void; fn dlclose(handle: *mut c_void) -> i32; }
@@ -216,12 +216,14 @@ unsafe fn terminal_fixture_symbols(path: &std::path::Path) -> (extern "C" fn() -
     let context = unsafe { dlsym(handle, c"terminal_test_context".as_ptr()) };
     let probe = unsafe { dlsym(handle, c"terminal_test_old_context".as_ptr()) };
     let drops = unsafe { dlsym(handle, c"terminal_test_drops".as_ptr()) };
-    assert!(!context.is_null() && !probe.is_null() && !drops.is_null());
+    let early = unsafe { dlsym(handle, c"terminal_test_early".as_ptr()) };
+    let flags = unsafe { dlsym(handle, c"terminal_test_native_flags".as_ptr()) };
+    assert!(!context.is_null() && !probe.is_null() && !drops.is_null() && !early.is_null() && !flags.is_null());
     unsafe { dlclose(handle); }
-    unsafe { (std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(context), std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> i32>(probe), std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(drops)) }
+    unsafe { (std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(context), std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> i32>(probe), std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(drops), std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void, u32, u32))>(early), std::mem::transmute::<*mut c_void, extern "C" fn() -> u32>(flags)) }
 }
 #[cfg(windows)]
-unsafe fn terminal_fixture_symbols(path: &std::path::Path) -> (extern "C" fn() -> usize, extern "C" fn(usize) -> i32, extern "C" fn() -> usize) {
+unsafe fn terminal_fixture_symbols(path: &std::path::Path) -> (extern "C" fn() -> usize, extern "C" fn(usize) -> i32, extern "C" fn() -> usize, unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void, u32, u32)), extern "C" fn() -> u32) {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "kernel32")]
     unsafe extern "system" { fn LoadLibraryW(path: *const u16) -> *mut c_void; fn GetProcAddress(handle: *mut c_void, name: *const u8) -> *mut c_void; fn FreeLibrary(handle: *mut c_void) -> i32; }
@@ -231,9 +233,11 @@ unsafe fn terminal_fixture_symbols(path: &std::path::Path) -> (extern "C" fn() -
     let context = unsafe { GetProcAddress(handle, c"terminal_test_context".as_ptr().cast()) };
     let probe = unsafe { GetProcAddress(handle, c"terminal_test_old_context".as_ptr().cast()) };
     let drops = unsafe { GetProcAddress(handle, c"terminal_test_drops".as_ptr().cast()) };
-    assert!(!context.is_null() && !probe.is_null() && !drops.is_null());
+    let early = unsafe { GetProcAddress(handle, c"terminal_test_early".as_ptr().cast()) };
+    let flags = unsafe { GetProcAddress(handle, c"terminal_test_native_flags".as_ptr().cast()) };
+    assert!(!context.is_null() && !probe.is_null() && !drops.is_null() && !early.is_null() && !flags.is_null());
     unsafe { FreeLibrary(handle); }
-    unsafe { (std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(context), std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> i32>(probe), std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(drops)) }
+    unsafe { (std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(context), std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> i32>(probe), std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(drops), std::mem::transmute::<*mut c_void, unsafe extern "C" fn(*mut c_void, unsafe extern "C" fn(*mut c_void, u32, u32))>(early), std::mem::transmute::<*mut c_void, extern "C" fn() -> u32>(flags)) }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -257,7 +261,7 @@ async fn compiled_native_terminal_owns_initial_cancellation_panics_join_and_stal
         broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
         let host = Arc::new(tinybus::module::ModuleHost::new(broker));
         host.load_file_with_config(&path, serde_json::json!({"mode":mode,"test_controls":encoded})).unwrap();
-        let (context, old_probe, drops) = unsafe { terminal_fixture_symbols(&path) };
+        let (context, old_probe, drops, _, _) = unsafe { terminal_fixture_symbols(&path) };
         let dropped_before = dropped_total;
         let actual_context = context();
         let first = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -282,6 +286,73 @@ async fn compiled_native_terminal_owns_initial_cancellation_panics_join_and_stal
             assert!(drop < finish);
         }
         if mode == 1 { old_context = Some(actual_context); }
+    }
+
+    // The image was admitted by the real loader above. Symbol lookup releases
+    // its temporary OS handle: only the canonical loader pins the code now.
+    let (_, _, drops, early, native_flags) = unsafe { terminal_fixture_symbols(&path) };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let controls = Box::into_raw(Box::new(HeldNativeControls {
+        sender, release: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+    }));
+    unsafe { early(controls.cast(), held_native_event); }
+    let broker = tinybus::broker::Broker::new();
+    broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+    let host = tinybus::module::ModuleHost::new(broker);
+    let result = host.load_file_with_config(&path, serde_json::json!({"mode":0,"test_controls":[]}));
+    let mut seen = Vec::new();
+    let entered = loop {
+        match receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(event) => { seen.push(event); if event.0 == 8 { break true; } }
+            Err(_) => break false,
+        }
+    };
+    let flags_before_drop = native_flags();
+    drop(host);
+    let flags_after_host_drop = native_flags();
+    // Release the actual physical callback before any assertion, even if
+    // rejected admission or host bookkeeping disagrees with the contract.
+    unsafe {
+        *(*controls).release.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        (*controls).release.1.notify_all();
+    }
+    while !seen.iter().any(|event| event.0 == 6) {
+        match receiver.recv_timeout(Duration::from_secs(5)) {
+            Ok(event) => seen.push(event),
+            Err(_) => break,
+        }
+    }
+    let settled = tokio::time::timeout(Duration::from_secs(5), async {
+        while drops() == dropped_total { tokio::task::yield_now().await; }
+    }).await.is_ok();
+    let final_flags = native_flags();
+    // On an unresolved controlled failure retain this one callback context.
+    // Otherwise the Acquire fence proves its final foreign use returned.
+    if settled { unsafe { drop(Box::from_raw(controls)); } }
+    assert!(result.is_err(), "source Fault before vtable publication must reject init");
+    assert!(entered && settled, "actual SDK finish and resource Drop must settle independently");
+    for flags in [flags_before_drop, flags_after_host_drop, final_flags] {
+        assert_ne!(flags & TB_NATIVE_TERMINAL_FAULT, 0);
+        assert_eq!(flags & TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0,
+            "no accepted vtable means no host physical-worker evidence");
+    }
+    assert_eq!(seen.iter().filter(|event| event.0 == 3).count(), 1);
+    assert!(seen.iter().any(|event| *event == (5, 1)));
+    assert!(seen.iter().any(|event| *event == (6, 1)));
+}
+
+struct HeldNativeControls {
+    sender: std::sync::mpsc::Sender<(u32, u32)>,
+    release: (std::sync::Mutex<bool>, std::sync::Condvar),
+}
+unsafe extern "C" fn held_native_event(ctx: *mut c_void, event: u32, value: u32) {
+    let controls = unsafe { &*ctx.cast::<HeldNativeControls>() };
+    let _ = controls.sender.send((event, value));
+    if event == 8 {
+        let mut release = controls.release.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        while !*release {
+            release = controls.release.1.wait(release).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 }
 
