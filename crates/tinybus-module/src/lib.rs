@@ -269,7 +269,6 @@ struct ModuleTransport {
     inbound: Mutex<mpsc::Receiver<IncomingFrame>>,
     provenance: Arc<AtomicBool>,
     detach_on_panic: bool,
-    _terminal_owner: Option<terminal::SdkOwner>,
 }
 
 #[async_trait]
@@ -607,7 +606,6 @@ where
             inbound: Mutex::new(inbound_rx),
             provenance: Arc::new(AtomicBool::new(false)),
             detach_on_panic,
-            _terminal_owner: None,
         });
         let connection_slot = Arc::new(StdMutex::new(None));
         let task_connection_slot = connection_slot.clone();
@@ -1281,6 +1279,16 @@ where C: serde::de::DeserializeOwned + Send + 'static,
     unsafe { start_terminal_factory_mode(host, out, worker_threads, factory, true) }
 }
 
+// Legacy transport remains unchanged; only opted-in Connections retain State.
+struct TerminalTransport { inner: ModuleTransport, _owner: terminal::SdkOwner }
+#[async_trait]
+impl Transport for TerminalTransport {
+    async fn send(&self, message: Message) -> Result<()> { self.inner.send(message).await }
+    async fn recv(&self) -> Result<Option<Message>> { self.inner.recv().await }
+    async fn close(&self) -> Result<()> { self.inner.close().await }
+    fn describe(&self) -> String { self.inner.describe() }
+}
+
 // Process-lifetime C tombstone does not retain the actual State after proved
 // successful shutdown. Surviving liveness views retain their own slot permits.
 struct TerminalRuntimeContext { state: StdMutex<Option<Arc<terminal::TerminalState>>> }
@@ -1436,8 +1444,8 @@ where C: serde::de::DeserializeOwned + Send + 'static,
         state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).runtime = Some(runtime);
         let (inbound_tx, inbound_rx) = mpsc::channel(MODULE_QUEUE_CAPACITY);
         state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).inbound = Some(inbound_tx);
-        let transport = Arc::new(ModuleTransport { host: state.host, inbound: Mutex::new(inbound_rx),
-            provenance: Arc::new(AtomicBool::new(false)), detach_on_panic: false, _terminal_owner: Some(state.sdk_owner()) });
+        let transport = Arc::new(TerminalTransport { inner: ModuleTransport { host: state.host, inbound: Mutex::new(inbound_rx),
+            provenance: Arc::new(AtomicBool::new(false)), detach_on_panic: false }, _owner: state.sdk_owner() });
         let (handle, connection_slot, factory) = {
             let mut resources = state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             (resources.runtime.as_ref().expect("attached runtime").handle().clone(), resources.connection.clone(), resources.reinitializer_factory.take())
@@ -1447,7 +1455,12 @@ where C: serde::de::DeserializeOwned + Send + 'static,
         *callback_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = callback;
         let task_state = state.clone();
         let task = handle.spawn(async move {
-            let connection = module_connection(transport);
+            let provenance = transport.inner.provenance.clone();
+            let brokered = transport.inner.host.0.broker_routing.is_some();
+            let connection = if brokered {
+                // SAFETY: same private per-frame provenance contract as module_connection.
+                unsafe { Connection::__attach_module_with_provenance(transport, provenance) }
+            } else { Connection::attach(transport) };
             if let Err(error) = connection.handshake().await { task_state.signal(TerminalReason::SetupFailed); return Err(error); }
             connection.__set_panic_handler(Arc::new(|| Error::MethodFailed {
                 name: MODULE_PANIC_ERROR.to_owned(), message: "a module method panicked".to_owned(),
