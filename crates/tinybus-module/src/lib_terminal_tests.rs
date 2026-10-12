@@ -1931,3 +1931,154 @@ async fn linked_reinit_synchronous_timer_uses_retained_runtime_on_same_worker() 
         3
     );
 }
+
+// The genuine ModuleHost loader must have pinned the artifact before this helper.
+// Temporary OS symbol handles are released; controls never grant product authority.
+unsafe fn native_fixture_symbol<T: Copy>(path: &std::path::Path, symbol: &std::ffi::CStr) -> T {
+    #[cfg(unix)]
+    let raw = {
+        use std::os::unix::ffi::OsStrExt;
+        #[cfg_attr(target_os = "linux", link(name = "dl"))]
+        unsafe extern "C" {
+            fn dlopen(path: *const std::ffi::c_char, flags: i32) -> *mut c_void;
+            fn dlsym(handle: *mut c_void, name: *const std::ffi::c_char) -> *mut c_void;
+            fn dlclose(handle: *mut c_void) -> i32;
+        }
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let handle = unsafe { dlopen(path.as_ptr(), 2) };
+        assert!(!handle.is_null());
+        let raw = unsafe { dlsym(handle, symbol.as_ptr()) };
+        unsafe {
+            dlclose(handle);
+        }
+        raw
+    };
+    #[cfg(windows)]
+    let raw = {
+        use std::os::windows::ffi::OsStrExt;
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn LoadLibraryW(path: *const u16) -> *mut c_void;
+            fn GetProcAddress(handle: *mut c_void, name: *const u8) -> *mut c_void;
+            fn FreeLibrary(handle: *mut c_void) -> i32;
+        }
+        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe { LoadLibraryW(path.as_ptr()) };
+        assert!(!handle.is_null());
+        let raw = unsafe { GetProcAddress(handle, symbol.as_ptr().cast()) };
+        unsafe {
+            FreeLibrary(handle);
+        }
+        raw
+    };
+    assert!(!raw.is_null());
+    assert_eq!(size_of::<T>(), size_of::<*mut c_void>());
+    unsafe { std::mem::transmute_copy(&raw) }
+}
+fn native_controls_config(mode: u8, controls: &NativeControls) -> serde_json::Value {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            (controls as *const NativeControls).cast::<u8>(),
+            size_of::<NativeControls>(),
+        )
+    };
+    serde_json::json!({"mode": mode, "test_controls": bytes})
+}
+fn native_fixture_host() -> Arc<tinybus::module::ModuleHost> {
+    let broker = tinybus::broker::Broker::new();
+    broker
+        .clone()
+        .spawn(tinybus::transport::memory::MemoryBus::new());
+    Arc::new(tinybus::module::ModuleHost::new(broker))
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the privately pinned __native-fixture-support eight-artifact cohort"]
+async fn compiled_native_factory_and_hook_failures_preserve_original_finish_and_fault() {
+    let path = std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_TERMINAL_MODULE").unwrap());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let sender = Box::into_raw(Box::new(sender));
+    let controls = NativeControls {
+        ctx: sender.cast(),
+        event: native_event,
+    };
+    let host = native_fixture_host();
+    host.load_file_with_config(&path, native_controls_config(0, &controls))
+        .unwrap();
+    let (_, _, drops, _, flags) = unsafe { terminal_fixture_symbols(&path) };
+    let before = drops();
+    host.shutdown(Duration::from_secs(5)).await;
+    while !matches!(receiver.recv_timeout(Duration::from_secs(5)), Ok((6, _))) {}
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while drops() == before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    unsafe {
+        drop(Box::from_raw(sender));
+    }
+    let configure: unsafe extern "C" fn(
+        usize,
+        *mut c_void,
+        unsafe extern "C" fn(*mut c_void, u32, u32),
+    ) = unsafe { native_fixture_symbol(&path, c"terminal_test_factory_mode") };
+    for mode in [1usize, 2, 10, 11, 12] {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        // Uncertain primary/control resources intentionally retain this bounded
+        // fixture context; a manual join is never substituted for SDK completion.
+        let sender = Box::into_raw(Box::new(sender));
+        let controls = NativeControls {
+            ctx: sender.cast(),
+            event: native_event,
+        };
+        unsafe {
+            configure(mode, sender.cast(), native_event);
+        }
+        let host = native_fixture_host();
+        let result =
+            host.load_file_with_config(&path, native_controls_config(mode as u8, &controls));
+        let mut seen = Vec::new();
+        let target = if mode < 3 { 19 } else { 2 };
+        loop {
+            let event = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            seen.push(event);
+            if event.0 == target {
+                break;
+            }
+        }
+        if mode >= 10 {
+            host.shutdown(Duration::from_secs(5)).await;
+            while !seen.iter().any(|event| event.0 == 5) {
+                seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+        }
+        drop(host);
+        let native = flags();
+        seen.extend(receiver.try_iter());
+        // All blocking controller work is joined by the original SDK finish
+        // before these assertions. Factory failures never launch a controller.
+        if mode < 3 {
+            assert!(result.is_err());
+            assert!(seen.iter().any(|event| *event == (19, 1)));
+            assert!(!seen.iter().any(|event| matches!(event.0, 2 | 3 | 5 | 7)));
+        } else {
+            assert!(result.is_ok());
+            assert_eq!(seen.iter().filter(|event| event.0 == 3).count(), 1);
+            assert_eq!(seen.iter().filter(|event| *event == (5, 1)).count(), 1);
+            assert_eq!(seen.iter().filter(|event| *event == (7, 1)).count(), 1);
+            assert!(seen.iter().any(|event| event.0 == 13 && event.1 & 7 == 7));
+        }
+        assert!(
+            !seen.iter().any(|event| event.0 == 17),
+            "primary payload must remain retained"
+        );
+        assert_eq!(
+            native & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+            0
+        );
+        if mode != 12 {
+            assert_ne!(native & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
+        }
+    }
+}

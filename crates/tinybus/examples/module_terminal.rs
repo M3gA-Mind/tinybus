@@ -30,8 +30,16 @@ struct Config {
 impl Drop for Config {
     fn drop(&mut self) {
         if self.test_controls.len() == size_of::<Controls>() {
-            let controls = unsafe { self.test_controls.as_ptr().cast::<Controls>().read_unaligned() };
-            controls.emit(19, u32::from(std::thread::current().name() == Some("tinybus-terminal")));
+            let controls = unsafe {
+                self.test_controls
+                    .as_ptr()
+                    .cast::<Controls>()
+                    .read_unaligned()
+            };
+            controls.emit(
+                19,
+                u32::from(std::thread::current().name() == Some("tinybus-terminal")),
+            );
         }
     }
 }
@@ -46,6 +54,14 @@ unsafe impl Sync for Controls {}
 impl Controls {
     fn emit(self, event: u32, value: u32) {
         unsafe { (self.event)(self.ctx, event, value) }
+    }
+}
+struct PrimaryPayload(Option<Controls>);
+impl Drop for PrimaryPayload {
+    fn drop(&mut self) {
+        if let Some(controls) = self.0 {
+            controls.emit(17, 1);
+        }
     }
 }
 struct Controller {
@@ -137,7 +153,7 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
         return Err(tinybus::Error::failed("controlled factory error"));
     }
     if factory_mode == 2 {
-        panic!("controlled factory panic");
+        std::panic::panic_any(PrimaryPayload(early));
     }
     let held_finish = early.is_some() && factory_mode == 0;
     let controller = Arc::new(Controller {
@@ -232,7 +248,7 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
             request.wake.1.notify_all();
             request.emit(3, 1);
             if request.mode.load(Ordering::Acquire) == 10 {
-                panic!("controlled native request panic");
+                std::panic::panic_any(PrimaryPayload(*request.controls.lock().unwrap()));
             }
         },
         move || {
@@ -296,13 +312,12 @@ pub unsafe extern "C" fn tinybus_module_init_v1(
         if !host.config.ptr.is_null() {
             let bytes = unsafe { std::slice::from_raw_parts(host.config.ptr, host.config.len) };
             if let Ok(config) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                if let Some(encoded) = config.get("test_controls").and_then(|value| serde_json::from_value::<Vec<u8>>(value.clone()).ok()).filter(|bytes| bytes.len() == size_of::<Controls>()) {
-                    let controls = unsafe {
-                        encoded
-                            .as_ptr()
-                            .cast::<Controls>()
-                            .read_unaligned()
-                    };
+                if let Some(encoded) = config
+                    .get("test_controls")
+                    .and_then(|value| serde_json::from_value::<Vec<u8>>(value.clone()).ok())
+                    .filter(|bytes| bytes.len() == size_of::<Controls>())
+                {
+                    let controls = unsafe { encoded.as_ptr().cast::<Controls>().read_unaligned() };
                     let mut early = EARLY
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
