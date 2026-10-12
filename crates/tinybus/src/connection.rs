@@ -1328,6 +1328,7 @@ fn rule_to_wire(rule: &MatchRule) -> String {
     if let Some(kind) = rule.kind {
         let name = match kind {
             MessageKind::Signal => "signal",
+            MessageKind::DirectedSignal => "directed_signal",
             MessageKind::MethodCall => "method_call",
             MessageKind::MethodReturn => "method_return",
             MessageKind::Error => "error",

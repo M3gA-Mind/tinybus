@@ -216,6 +216,23 @@ impl Proxy {
         self.connection.add_match(rule).await
     }
 
+    /// Subscribe only to this object's recipient-directed signals.
+    ///
+    /// Directed signals are delivered to the unique recipient selected by a
+    /// live SDK callback binding; they are never fanned out to ordinary signal
+    /// subscribers.
+    pub async fn receive_directed_signal(
+        &self,
+        member: &str,
+    ) -> Result<tokio::sync::broadcast::Receiver<crate::message::Message>> {
+        let rule = MatchRule::new()
+            .directed_signals()
+            .interface(self.interface.clone())
+            .member(MemberName::new(member)?)
+            .path_namespace(self.path.clone());
+        self.connection.add_match(rule).await
+    }
+
     /// The connection underneath, for the rare call that needs the raw surface.
     pub fn connection(&self) -> &Connection {
         &self.connection

@@ -68,6 +68,12 @@ impl MatchRule {
         self
     }
 
+    /// Restrict to recipient-directed signals emitted for a local callback.
+    pub fn directed_signals(mut self) -> Self {
+        self.kind = Some(MessageKind::DirectedSignal);
+        self
+    }
+
     /// Restrict to one interface.
     pub fn interface(mut self, interface: InterfaceName) -> Self {
         self.interface = Some(interface);
