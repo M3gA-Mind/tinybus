@@ -941,10 +941,17 @@ async fn compiled_native_terminal_owns_initial_cancellation_panics_join_and_stal
         let (context, old_probe, drops, _, _) = unsafe { terminal_fixture_symbols(&path) };
         let dropped_before = dropped_total;
         let actual_context = context();
-        let first = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut seen = Vec::new();
+        let actual_entered = if mode == 4 { 16 } else { 2 };
+        loop {
+            let event = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+            seen.push(event);
+            if event.0 == actual_entered {
+                break;
+            }
+        }
         let stale_result = old_context.map(|token| old_probe(token));
         host.shutdown(Duration::from_secs(5)).await;
-        let mut seen = vec![first];
         while !seen.iter().any(|(event, _)| *event == 6) {
             seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
         }
