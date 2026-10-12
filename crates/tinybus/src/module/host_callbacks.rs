@@ -175,6 +175,8 @@ pub struct HostCallbackBinding {
     fixture_controller: Mutex<Option<Arc<dyn Send + Sync>>>,
     #[cfg(test)]
     before_load_decision: Mutex<Option<(Arc<Notify>, tokio::sync::oneshot::Receiver<()>)>>,
+    #[cfg(test)]
+    after_load_termination: Mutex<Option<Arc<Notify>>>,
 }
 
 /// Outgoing operations on the binding's private connection.
@@ -482,6 +484,8 @@ impl ModuleHost {
             fixture_controller: Mutex::new(None),
             #[cfg(test)]
             before_load_decision: Mutex::new(None),
+            #[cfg(test)]
+            after_load_termination: Mutex::new(None),
             state: Arc::new(CallbackState {
                 destination,
                 endpoints,
@@ -690,6 +694,10 @@ impl ModuleHost {
             let fault = transport.commit_admission_termination(cause);
             binding.revoke();
             transport.request_terminal(fault);
+            #[cfg(test)]
+            if let Some(entered) = binding.after_load_termination.lock().unwrap().take() {
+                entered.notify_one();
+            }
             let _ = transport.close().await;
             self.inner
                 .loaded

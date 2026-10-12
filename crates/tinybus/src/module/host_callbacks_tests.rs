@@ -902,6 +902,8 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
     let binding = Arc::new(served_native_binding(&host).await);
     *binding.fixture_controller.lock().unwrap() = Some(barrier.clone());
     let decision = Arc::new(Notify::new());
+    let termination = Arc::new(Notify::new());
+    *binding.after_load_termination.lock().unwrap() = Some(termination.clone());
     let (resume, release) = tokio::sync::oneshot::channel();
     *binding.before_load_decision.lock().unwrap() = Some((decision.clone(), release));
     let mut cleanup = ControlledRelease::new(barrier.clone());
@@ -967,10 +969,13 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
         fault_flags = Some(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) });
     }
     let resumed = cleanup.resume.take().unwrap().send(());
-    // Rollback revokes before awaiting physical close or returning failure.
-    while !binding.state.lifetime.lock().unwrap().revoked && !load.is_finished() {
-        tokio::task::yield_now().await;
-    }
+    // The physical worker can revoke the account independently. Observe the
+    // loader's actual failure commit instead of treating revocation as proof.
+    let terminated = if !ready {
+        Some(tokio::time::timeout(Duration::from_secs(2), termination.notified()).await)
+    } else {
+        None
+    };
     let held = unsafe { view.native_terminal_state.unwrap()(view.host_ctx) };
     cleanup.release();
     // Keep virtual time runnable through the actual opaque return.
@@ -982,6 +987,7 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
     cleanup.transport = None;
     assert!(initialization.is_ok());
     assert!(resumed.is_ok());
+    assert!(terminated.is_none_or(|result| result.is_ok()));
     assert!(stopped.unwrap().is_ok());
     assert!(loaded.unwrap().is_err());
     assert_eq!(observed_ready, ready);
