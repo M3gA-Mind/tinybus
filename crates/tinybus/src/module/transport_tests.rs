@@ -1571,12 +1571,11 @@ async fn actual_native_controller_is_owned_until_shutdown_callback_returns() {
     // Observe ownership safely while the real native callback still borrows
     // the controller. Always release C before a regression assertion can panic.
     let retained = Arc::strong_count(&barrier) > 1;
-    assert_ne!(
-        transport.context.physical.lock().unwrap().cleanup,
-        CleanupState::Complete
-    );
+    let cleanup_incomplete =
+        transport.context.physical.lock().unwrap().cleanup != CleanupState::Complete;
     release.send(()).unwrap();
     assert_eq!(stopping.await.unwrap().unwrap(), TB_OK);
+    assert!(cleanup_incomplete);
     drop(barrier);
     let retained_through_transport = weak.upgrade().is_some();
     drop(transport);
