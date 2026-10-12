@@ -426,7 +426,12 @@ impl Message {
                 }
             }
             MessageKind::DirectedSignal => {
-                if self.header.destination.as_ref().is_none_or(|name| !name.is_unique()) {
+                if self
+                    .header
+                    .destination
+                    .as_ref()
+                    .is_none_or(|name| !name.is_unique())
+                {
                     return Err(Error::protocol(
                         "directed signal needs a unique destination",
                     ));
@@ -444,7 +449,9 @@ impl Message {
                     || self.header.expected_responder.is_some()
                     || self.header.stream_reply
                 {
-                    return Err(Error::protocol("directed signal has invalid routing fields"));
+                    return Err(Error::protocol(
+                        "directed signal has invalid routing fields",
+                    ));
                 }
             }
         }

@@ -40,13 +40,11 @@ fn state(source: BusName, destination: BusName) -> Arc<CallbackState> {
 fn directed_signals_target_only_the_live_bound_module_and_declared_member() {
     let mut router = Router::default();
     let (binding_id, binding_peer) = router.attach(tokio::sync::mpsc::channel(8).0);
-    let (module_id, module_peer) = router.attach(tokio::sync::mpsc::channel(8).0);
-    let (outsider_id, outsider_peer) = router.attach(tokio::sync::mpsc::channel(8).0);
     let (target_sender, mut target_receiver) = tokio::sync::mpsc::channel(8);
+    let (module_id, module_peer) = router.attach(target_sender);
     let (outsider_sender, mut outsider_receiver) = tokio::sync::mpsc::channel(8);
-    router.peers.get_mut(&module_id).unwrap().outbox = target_sender;
-    router.peers.get_mut(&outsider_id).unwrap().outbox = outsider_sender;
-    router.add_match(outsider_id, MatchRule::new().directed_signals()).unwrap();
+    let (outsider_id, outsider_peer) = router.attach(outsider_sender);
+    router.add_match(outsider_id, MatchRule::new().directed_signals());
     router.set_attestation_for_unique(
         &module_peer,
         crate::attest::Attestation {
@@ -77,22 +75,30 @@ fn directed_signals_target_only_the_live_bound_module_and_declared_member() {
 
     let mut forged = message.clone();
     forged.header.destination = Some(outsider_peer.clone());
-    assert!(router
-        .directed_signal_target(&binding_peer, &outsider_peer, &forged.header)
-        .is_err());
-    assert!(router
-        .directed_signal_target(&outsider_peer, &module_peer, &message.header)
-        .is_err());
+    assert!(
+        router
+            .directed_signal_target(&binding_peer, &outsider_peer, &forged.header)
+            .is_err()
+    );
+    assert!(
+        router
+            .directed_signal_target(&outsider_peer, &module_peer, &message.header)
+            .is_err()
+    );
     let mut wrong_member = message.clone();
     wrong_member.header.member = Some("Other".parse().unwrap());
-    assert!(router
-        .directed_signal_target(&binding_peer, &module_peer, &wrong_member.header)
-        .is_err());
+    assert!(
+        router
+            .directed_signal_target(&binding_peer, &module_peer, &wrong_member.header)
+            .is_err()
+    );
 
     router.revoke_host_callbacks(&capability);
-    assert!(router
-        .directed_signal_target(&binding_peer, &module_peer, &message.header)
-        .is_err());
+    assert!(
+        router
+            .directed_signal_target(&binding_peer, &module_peer, &message.header)
+            .is_err()
+    );
     router.detach(binding_id);
     assert!(router.owner_of(&module_peer).is_some());
 }

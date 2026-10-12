@@ -598,9 +598,11 @@ impl Router {
         {
             return Err(Error::failed("directed signal routing fields are invalid"));
         }
-        if !self.host_callbacks.iter().any(|capability| {
-            capability.matches_directed_signal(source, destination, header)
-        }) {
+        if !self
+            .host_callbacks
+            .iter()
+            .any(|capability| capability.matches_directed_signal(source, destination, header))
+        {
             return Err(Error::failed("directed signal authority is unavailable"));
         }
         self.resolve(destination)

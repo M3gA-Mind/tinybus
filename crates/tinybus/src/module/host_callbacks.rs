@@ -333,9 +333,7 @@ impl HostCallbackBinding {
         member: &MemberName,
         body: impl serde::Serialize,
     ) -> Result<()> {
-        let destination = self
-            .state
-            .signal_destination(path, interface, member)?;
+        let destination = self.state.signal_destination(path, interface, member)?;
         let message = crate::message::Message::directed_signal(
             destination,
             path.clone(),
@@ -536,9 +534,9 @@ impl ModuleHost {
                     .iter()
                     .enumerate()
                     .any(|(i, member)| signal.members[..i].contains(member))
-                || !endpoints
-                    .iter()
-                    .any(|endpoint| endpoint.path == signal.path && endpoint.interface == signal.interface)
+                || !endpoints.iter().any(|endpoint| {
+                    endpoint.path == signal.path && endpoint.interface == signal.interface
+                })
         }) || signals.iter().enumerate().any(|(i, signal)| {
             signals[..i].iter().any(|previous| {
                 previous.path == signal.path && previous.interface == signal.interface
