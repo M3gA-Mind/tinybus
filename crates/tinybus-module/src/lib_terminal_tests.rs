@@ -3054,3 +3054,123 @@ async fn compiled_native_first_foreign_cleanup_panic_keeps_later_resources_and_a
         0
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a fresh-process privately pinned __native-fixture-support eight-artifact cohort"]
+async fn compiled_native_prior_reinit_future_drop_uses_configured_handle_and_retains_settlement() {
+    let path = std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_TERMINAL_MODULE").unwrap());
+    let warm = native_fixture_host();
+    let (events, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
+    let events = Box::into_raw(Box::new(events));
+    let controls = NativeControls {
+        ctx: events.cast(),
+        event: native_event,
+    };
+    warm.load_file_with_config(&path, native_controls_config(0, &controls))
+        .unwrap();
+    let configure: NativeConfigure =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_factory_mode") };
+    let reinit: NativeReinit = unsafe { native_fixture_symbol(&path, c"terminal_test_reinit") };
+    let resources: extern "C" fn() -> u32 =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_resources") };
+    let release_views: extern "C" fn() -> usize =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_release_views") };
+    let (context, _, drops, _, flags) = unsafe { terminal_fixture_symbols(&path) };
+    warm.shutdown(Duration::from_secs(5)).await;
+    while !matches!(receiver.recv_timeout(Duration::from_secs(5)), Ok((6, _))) {}
+    for mode in [48u8, 49] {
+        let (events, receiver) = std::sync::mpsc::channel();
+        let barrier = Box::into_raw(Box::new(NativeBarrierControls {
+            events,
+            blocked_event: 25,
+            release: (StdMutex::new(false), std::sync::Condvar::new()),
+        }));
+        let controls = NativeControls {
+            ctx: barrier.cast(),
+            event: native_barrier_event,
+        };
+        unsafe {
+            configure(46, barrier.cast(), native_barrier_event);
+        }
+        let host = native_fixture_host();
+        let before = drops();
+        host.load_file_with_config(&path, native_controls_config(0, &controls))
+            .unwrap();
+        let mut seen = Vec::new();
+        while !seen.iter().any(|event: &(u32, u32)| event.0 == 2) {
+            seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        let token = context();
+        let bytes = serde_json::to_vec(&native_controls_config(mode, &controls)).unwrap();
+        let first_result = unsafe { reinit(token, bytes.as_ptr(), bytes.len()) };
+        let next_bytes = serde_json::to_vec(&native_controls_config(0, &controls)).unwrap();
+        let next = std::thread::spawn(move || unsafe {
+            reinit(token, next_bytes.as_ptr(), next_bytes.len())
+        });
+        while !seen.iter().any(|event| event.0 == 25) {
+            seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        host.shutdown(Duration::from_millis(30)).await;
+        let held_runtime = resources() & 8 != 0;
+        let held_native = flags();
+        seen.extend(receiver.try_iter());
+        let finish_before_release = seen.iter().any(|event| event.0 == 5);
+        // Real previous-future Drop owns the sole pending retirement operation.
+        // Release it and join real second ABI caller before asserting context.
+        unsafe { &*barrier }.release();
+        let second_result = next.join().unwrap();
+        host.shutdown(Duration::from_secs(5)).await;
+        while !seen
+            .iter()
+            .any(|event| event.0 == if mode == 48 { 6 } else { 5 })
+        {
+            seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        if mode == 48 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while drops() == before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let after = flags();
+        let later_resources = resources();
+        seen.extend(receiver.try_iter());
+        drop(host);
+        release_views();
+        if mode == 48 {
+            unsafe {
+                drop(Box::from_raw(barrier));
+            }
+        }
+        // Mode49 context stays conservatively retained with later resources.
+        assert_eq!(first_result, TB_OK);
+        assert_eq!(second_result, TB_CLOSED);
+        assert!(held_runtime && !finish_before_release);
+        assert_ne!(
+            held_native & tinybus::module::abi::TB_NATIVE_TERMINAL_STOP_INTENT,
+            0
+        );
+        assert_eq!(
+            held_native & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+            0
+        );
+        assert_eq!(seen.iter().filter(|event| **event == (5, 1)).count(), 1);
+        assert_eq!(seen.iter().filter(|event| **event == (7, 1)).count(), 1);
+        assert!(
+            seen.contains(&(38, 1)),
+            "actual previous future Drop requires its configured Tokio Handle: {seen:?}"
+        );
+        if mode == 49 {
+            assert_eq!(later_resources & (1 | 8 | 16 | 32), 1 | 8 | 16 | 32);
+            assert!(!seen.iter().any(|event| matches!(event.0, 6 | 17 | 20)));
+            assert_ne!(after & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
+            assert_eq!(
+                after & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+                0
+            );
+        }
+    }
+}

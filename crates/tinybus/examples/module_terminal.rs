@@ -141,7 +141,7 @@ impl Future for SetupFuture {
                 "ready native reinit source error",
             ))),
             45 => std::panic::panic_any(PrimaryPayload(*self.controller.controls.lock().unwrap())),
-            0 => Poll::Ready(Ok(())),
+            0 | 48 | 49 => Poll::Ready(Ok(())),
             2 => panic!("controlled native setup poll"),
             5 => Poll::Ready(Err(tinybus::Error::failed("controlled native setup error"))),
             _ => Poll::Pending,
@@ -150,10 +150,14 @@ impl Future for SetupFuture {
 }
 impl Drop for SetupFuture {
     fn drop(&mut self) {
-        if self.mode == 42 || self.mode == 47 {
+        if self.mode == 48 || self.mode == 49 {
+            self.controller
+                .emit(38, u32::from(tokio::runtime::Handle::try_current().is_ok()));
+        }
+        if self.mode == 42 || self.mode == 47 || self.mode == 48 || self.mode == 49 {
             self.controller.emit(25, 0);
         }
-        if self.mode == 47 {
+        if self.mode == 47 || self.mode == 49 {
             std::panic::panic_any(PrimaryPayload(*self.controller.controls.lock().unwrap()));
         }
         self.controller.observe(14);
