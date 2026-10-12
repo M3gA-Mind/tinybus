@@ -393,9 +393,7 @@ impl Message {
                 self.header.kind,
                 MessageKind::Signal | MessageKind::DirectedSignal
             ) {
-                return Err(Error::protocol(
-                    "a signal cannot carry a private body: it is a broadcast",
-                ));
+                return Err(Error::protocol("signals cannot carry a private body"));
             }
             if self.header.destination.is_none() {
                 return Err(Error::protocol("a private message needs a destination"));

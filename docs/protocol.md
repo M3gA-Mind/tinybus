@@ -1,6 +1,6 @@
 # The tinybus wire protocol
 
-Version 1. This document is the specification a non-Rust service is written
+Version 2. This document is the specification a non-Rust service is written
 against; the Rust types in `crates/tinybus/src/message/` are one implementation
 of it.
 
