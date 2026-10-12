@@ -283,6 +283,29 @@ pub unsafe extern "C" fn tinybus_module_init_v1(
     out: *mut TbModuleVtable,
 ) -> i32 {
     if let Some(host) = unsafe { TbHostVtable::read_compatible(host) } {
+        // The fixture needs its trusted callback before factory evaluation.
+        // Product authority still comes exclusively from the untouched host query.
+        if !host.config.ptr.is_null() {
+            let bytes = unsafe { std::slice::from_raw_parts(host.config.ptr, host.config.len) };
+            if let Ok(config) = serde_json::from_slice::<Config>(bytes) {
+                if config.test_controls.len() == size_of::<Controls>() {
+                    let controls = unsafe {
+                        config
+                            .test_controls
+                            .as_ptr()
+                            .cast::<Controls>()
+                            .read_unaligned()
+                    };
+                    let mut early = EARLY
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if early.is_none() {
+                        *early = Some(controls);
+                        NEXT_FACTORY_MODE.store(99, Ordering::Release);
+                    }
+                }
+            }
+        }
         if let Some(query) = host.native_terminal_state {
             *NATIVE_QUERY
                 .lock()
