@@ -2060,7 +2060,7 @@ async fn compiled_native_factory_and_hook_failures_preserve_original_finish_and_
         // before these assertions. Factory failures never launch a controller.
         if mode < 3 {
             assert!(result.is_err());
-            assert!(seen.iter().any(|event| *event == (19, 1)));
+            assert!(seen.contains(&(19, 1)));
             assert!(!seen.iter().any(|event| matches!(event.0, 2 | 3 | 5 | 7)));
         } else {
             assert!(result.is_ok());
