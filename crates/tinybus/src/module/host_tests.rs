@@ -2679,7 +2679,11 @@ async fn eager_native_setup_callbacks_are_bound_before_ready_and_failures_rollba
             )
             .await
             .unwrap();
-        let config = serde_json::json!({"host": binding.unique_name(), "fail": failed});
+        let config = serde_json::json!({
+            "host": binding.unique_name(), "fail": failed,
+            "credential": "callback-secret-must-not-be-retained",
+            "nested": [{"zero": -0.0, "literal": "\"-0.0\""}],
+        });
         let result = modules
             .load_file_with_host_callbacks(artifact, config.clone(), &binding)
             .await;
@@ -2712,8 +2716,25 @@ async fn eager_native_setup_callbacks_are_bound_before_ready_and_failures_rollba
                     .is_err()
             );
             assert_eq!(calls.load(Ordering::SeqCst), 1);
+            {
+                let loaded = modules.inner.loaded.lock().unwrap();
+                let retained = &loaded.iter().find(|m| m.info.name == info.name).unwrap().callback_config;
+                // Check the live retained representation, never freed memory after Drop.
+                let plaintext = (retained as &dyn std::any::Any)
+                    .downcast_ref::<Option<serde_json::Value>>();
+                assert!(plaintext.is_none_or(Option::is_none),
+                    "initialized callback module retains secret-bearing JSON");
+            }
+            let mut equivalent = config.clone();
+            equivalent["nested"][0]["zero"] = serde_json::json!(0.0);
+            assert_eq!(equivalent, config);
+            modules.reinitialize(&info.name, equivalent).await.unwrap();
+            let mut different = config.clone();
+            different["nested"][0]["zero"] = serde_json::json!(0);
+            assert_ne!(different, config);
+            assert!(modules.reinitialize(&info.name, different).await.is_err());
             modules.reinitialize(&info.name, config).await.unwrap();
-            assert_eq!(calls.load(Ordering::SeqCst), 2);
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
             drop(modules);
             assert!(!guard.authorizes(&crate::CallContext::brokered(
                 guard.module_peer().as_ref(),
