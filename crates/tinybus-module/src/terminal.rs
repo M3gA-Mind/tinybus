@@ -223,6 +223,8 @@ pub(super) struct TerminalState {
     pub resources: StdMutex<StartupResources>,
     sdk_owners: AtomicUsize,
     vtable_published: AtomicBool,
+    #[cfg(test)]
+    reject_worker_spawn: AtomicBool,
     lease: SlotLease,
     token: usize,
 }
@@ -308,6 +310,8 @@ impl TerminalState {
             resources: StdMutex::new(StartupResources::default()),
             sdk_owners: AtomicUsize::new(0),
             vtable_published: AtomicBool::new(false),
+            #[cfg(test)]
+            reject_worker_spawn: AtomicBool::new(false),
             lease: SlotLease {
                 admission: Arc::downgrade(admission),
                 index,
@@ -569,6 +573,14 @@ impl TerminalState {
             control.construction_code
         }
     }
+    #[cfg(test)]
+    pub(super) fn reject_worker_spawn_for_test(&self) {
+        self.reject_worker_spawn.store(true, Ordering::Release);
+    }
+    #[cfg(test)]
+    pub(super) fn request_done_for_test(&self) -> bool {
+        matches!(self.lock().request_state, RequestState::Done | RequestState::Panicked)
+    }
     fn schedule(self: &Arc<Self>) {
         let job = {
             let mut control = self.lock();
@@ -583,11 +595,20 @@ impl TerminalState {
             job
         };
         let state = job.state.upgrade().expect("anchored terminal state");
-        if std::thread::Builder::new()
-            .name("tinybus-terminal".into())
-            .spawn(move || job.run(state))
-            .is_err()
-        {
+        // Private per-instance rejection exercises the real submitted-job ownership
+        // path without changing process-wide thread creation or public authority.
+        #[cfg(test)]
+        let rejected = self.reject_worker_spawn.load(Ordering::Acquire);
+        #[cfg(not(test))]
+        let rejected = false;
+        let submitted = if rejected {
+            Err(std::io::Error::other("controlled terminal worker spawn failure"))
+        } else {
+            std::thread::Builder::new()
+                .name("tinybus-terminal".into())
+                .spawn(move || job.run(state))
+        };
+        if submitted.is_err() {
             self.uncertain.store(true, Ordering::Release);
             let mut control = self.lock();
             control.finish_state = FinishState::SpawnFailed;

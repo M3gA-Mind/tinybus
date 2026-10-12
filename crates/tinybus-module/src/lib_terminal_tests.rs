@@ -219,6 +219,9 @@ mod controlled {
         worker: StdMutex<Option<std::thread::JoinHandle<bool>>>,
         pub requests: AtomicUsize,
         pub joins: AtomicUsize,
+        pub finishes: AtomicUsize,
+        pub hook_failure: AtomicUsize,
+        pub payload_drops: AtomicUsize,
         pub config_drops: AtomicUsize,
         pub config_parse_control: StdMutex<Option<Arc<std::sync::Barrier>>>,
         pub drop_off_lock: AtomicBool,
@@ -236,6 +239,9 @@ mod controlled {
             worker: StdMutex::new(None),
             requests: AtomicUsize::new(0),
             joins: AtomicUsize::new(0),
+            finishes: AtomicUsize::new(0),
+            hook_failure: AtomicUsize::new(0),
+            payload_drops: AtomicUsize::new(0),
             config_drops: AtomicUsize::new(0),
             config_parse_control: StdMutex::new(None),
             drop_off_lock: AtomicBool::new(true),
@@ -245,6 +251,22 @@ mod controlled {
         *CONFIG_FIXTURE.lock().unwrap() = Arc::downgrade(&fixture);
         *NEXT.lock().unwrap() = Some(fixture.clone());
         (fixture, receiver)
+    }
+    struct HookPayload(Arc<Fixture>);
+    impl Drop for HookPayload {
+        fn drop(&mut self) {
+            self.0.payload_drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    impl Fixture {
+        pub fn settle_rejected_worker(&self) {
+            *self.wake.0.lock().unwrap() = true;
+            self.wake.1.notify_all();
+            if let Some(worker) = self.worker.lock().unwrap().take() {
+                let _ = worker.join().unwrap();
+                self.joins.fetch_add(1, Ordering::SeqCst);
+            }
+        }
     }
     struct Capture(Arc<Fixture>);
     impl Drop for Capture {
@@ -380,6 +402,9 @@ mod controlled {
                 *request.wake.0.lock().unwrap() = true;
                 request.wake.1.notify_all();
                 request.events.send(Event::Request).unwrap();
+                if request.hook_failure.load(Ordering::Acquire) == 1 {
+                    std::panic::panic_any(HookPayload(request.clone()));
+                }
             },
             move || {
                 let worker = finish.worker.lock().unwrap().take();
@@ -390,8 +415,13 @@ mod controlled {
                         return TerminalCompletion::Uncertain;
                     }
                 }
+                finish.finishes.fetch_add(1, Ordering::SeqCst);
                 finish.events.send(Event::Finish).unwrap();
-                TerminalCompletion::PhysicallyStopped
+                match finish.hook_failure.load(Ordering::Acquire) {
+                    2 => std::panic::panic_any(HookPayload(finish.clone())),
+                    3 => TerminalCompletion::Uncertain,
+                    _ => TerminalCompletion::PhysicallyStopped,
+                }
             },
         );
         Ok((Box::new(setup), hooks))
