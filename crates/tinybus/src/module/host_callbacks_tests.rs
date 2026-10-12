@@ -720,10 +720,15 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
     }
     resume.send(()).unwrap();
     // Rollback revokes before awaiting physical close or returning failure.
-    while !binding.state.lifetime.lock().unwrap().revoked { tokio::task::yield_now().await; }
+    while !binding.state.lifetime.lock().unwrap().revoked && !load.is_finished() {
+        tokio::task::yield_now().await;
+    }
     let held = unsafe { view.native_terminal_state.unwrap()(view.host_ctx) };
     finish.send(()).unwrap();
-    assert!(stop.await.unwrap().is_ok());
+    // Keep virtual time runnable through the actual opaque return.
+    while !stop.is_finished() { tokio::task::yield_now().await; }
+    let stopped = stop.await.unwrap();
+    assert!(stopped.is_ok(), "actual stop: {stopped:?}");
     assert!(load.await.unwrap().is_err());
     assert_eq!(held, if ready && !native_fault { 2 } else { 6 });
     assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
