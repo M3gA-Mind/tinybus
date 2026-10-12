@@ -488,9 +488,8 @@ fn configured_reinitializations_are_serialized_bounded_and_keep_the_runtime_aliv
     assert_eq!(unsafe { (out.shutdown)(out.module_ctx, 10) }, TB_OK);
     assert_eq!(unsafe { (out.shutdown)(out.module_ctx, 10) }, TB_CLOSED);
 
-    // The first start above installed this module copy's global subscriber, so
-    // a second dynamic start cannot replace it and refuses with `TB_CLOSED`
-    // rather than running a module with the wrong logging hook.
+    // A stopped instance does not own the next instance's execution context.
+    // Starting the same SDK again must succeed without retaining its log hook.
     let mut second = TbModuleVtable::default();
     let again = self::host(config);
     assert_eq!(
@@ -503,8 +502,9 @@ fn configured_reinitializations_are_serialized_bounded_and_keep_the_runtime_aliv
                 |_, _| async { Ok(()) },
             )
         },
-        TB_CLOSED
+        TB_OK
     );
+    assert_eq!(unsafe { (second.shutdown)(second.module_ctx, 1000) }, TB_OK);
 }
 
 /// Startup refuses a host vtable it cannot trust, before it builds anything.
