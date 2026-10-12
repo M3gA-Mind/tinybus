@@ -7,6 +7,9 @@ use crate::transport::memory::MemoryBus;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex as StdMutex, OnceLock};
 
+#[path = "host_callback_lifecycle_tests.rs"]
+mod callback_lifecycle_tests;
+
 static INIT_RAN: AtomicBool = AtomicBool::new(false);
 static LAZY_INIT_COUNT: AtomicUsize = AtomicUsize::new(0);
 static FAILED_INIT_COUNT: AtomicUsize = AtomicUsize::new(0);
