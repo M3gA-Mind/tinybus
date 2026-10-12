@@ -164,11 +164,16 @@ struct Control {
     completion: Option<TerminalCompletion>,
     job: Option<Arc<FinishJob>>,
     payloads: PrimaryPayloads,
+    active_reinit: bool,
+    prior_future: Option<SetupFuture>,
+    prior_pending: bool,
+    retirement_failed: bool,
 }
 pub(super) type Setup =
     Box<dyn FnOnce(Connection) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send>;
-pub(super) type SetupFutureSlot =
-    Arc<StdMutex<Option<Pin<Box<dyn Future<Output = Result<()>> + Send>>>>>;
+pub(super) type SetupFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+pub(super) type SetupFutureSlot = Arc<StdMutex<Option<SetupFuture>>>;
+pub(super) type TerminalReinitialize = Arc<dyn Fn(*const u8, usize) -> i32 + Send + Sync>;
 
 /// Resources are attached here before the next fallible startup boundary.
 /// Taking values is mechanical; all foreign destruction occurs off this lock.
@@ -178,7 +183,7 @@ pub(super) struct StartupResources {
     pub retained_factory: Option<Box<dyn Any + Send>>,
     pub config: Option<Box<dyn Any + Send>>,
     pub reinitializer_factory: Option<ReinitializeFactory>,
-    pub reinitialize: Arc<StdMutex<Option<Reinitialize>>>,
+    pub reinitialize: Arc<StdMutex<Option<TerminalReinitialize>>>,
     pub connection: Arc<StdMutex<Option<Connection>>>,
     pub inbound: Option<mpsc::Sender<IncomingFrame>>,
     pub initial: Option<tokio::task::JoinHandle<Result<()>>>,
@@ -287,6 +292,10 @@ impl TerminalState {
                 completion: None,
                 job: None,
                 payloads: PrimaryPayloads::default(),
+                active_reinit: false,
+                prior_future: None,
+                prior_pending: false,
+                retirement_failed: false,
             }),
             changed: Condvar::new(),
             terminal_notify: tokio::sync::Notify::new(),
@@ -497,6 +506,35 @@ impl TerminalState {
             self.schedule();
         }
     }
+    pub fn begin_reinit(&self) -> bool {
+        let mut control = self.lock();
+        if self.is_terminal() || control.active_reinit {
+            return false;
+        }
+        control.active_reinit = true;
+        true
+    }
+    pub fn end_reinit(&self) {
+        self.lock().active_reinit = false;
+        self.changed.notify_all();
+    }
+    pub fn retire_reinit(self: &Arc<Self>, future: Option<SetupFuture>) -> bool {
+        let Some(future) = future else { return true; };
+        {
+            let mut control = self.lock();
+            // active_reinit admits one caller. It cannot construct the next
+            // future until the worker has acknowledged this exact disposal.
+            control.prior_future = Some(future);
+            control.prior_pending = true;
+        }
+        self.schedule();
+        self.changed.notify_all();
+        let mut control = self.lock();
+        while control.prior_pending && control.finish_state != FinishState::SpawnFailed {
+            control = self.changed.wait(control).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        !control.retirement_failed && control.finish_state != FinishState::SpawnFailed
+    }
     fn schedule(self: &Arc<Self>) {
         let job = {
             let mut control = self.lock();
@@ -522,6 +560,9 @@ impl TerminalState {
             control.completion = Some(TerminalCompletion::Uncertain);
             drop(control);
             self.changed.notify_all();
+            self.host.fault();
+            self.commit(TerminalReason::Fault);
+            self.run_request();
         }
     }
     fn remove_anchor(&self) {
@@ -543,21 +584,34 @@ impl TerminalState {
     }
     fn run_finish(self: &Arc<Self>) {
         let _scope = self.owner.as_ref().map(ExecutionOwner::enter);
-        let finish = {
+        let finish = loop {
             let mut control = self.lock();
-            while !control.published
-                || matches!(
-                    control.request_state,
-                    RequestState::Idle | RequestState::Running
-                )
-            {
-                control = self
-                    .changed
-                    .wait(control)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Retirement takes precedence over waiting for active_reinit:
+            // that caller may itself be awaiting this worker's acknowledgment.
+            if let Some(future) = control.prior_future.take() {
+                drop(control);
+                let outcome = catch_unwind(AssertUnwindSafe(|| drop(future)));
+                let failed = match outcome {
+                    Ok(()) => false,
+                    Err(payload) => {
+                        self.source_panic(PayloadKind::Cleanup, payload);
+                        true
+                    }
+                };
+                let mut control = self.lock();
+                control.retirement_failed |= failed;
+                control.prior_pending = false;
+                drop(control);
+                self.changed.notify_all();
+                continue;
             }
-            control.finish_state = FinishState::Running;
-            control.finish.take()
+            if control.published && !control.active_reinit && !matches!(
+                control.request_state, RequestState::Idle | RequestState::Running
+            ) {
+                control.finish_state = FinishState::Running;
+                break control.finish.take();
+            }
+            drop(self.changed.wait(control).unwrap_or_else(std::sync::PoisonError::into_inner));
         };
         let cleanup = catch_unwind(AssertUnwindSafe(|| self.settle_setup()));
         let setup_settled = match cleanup {

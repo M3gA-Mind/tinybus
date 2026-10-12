@@ -1383,28 +1383,34 @@ unsafe extern "C" fn terminal_reinitialize(ctx: *mut c_void, ptr: *const u8, len
         return TB_CLOSED;
     }
     let _scope = state.owner.as_ref().map(ExecutionOwner::enter);
-    let callback = state
+    if !state.begin_reinit() {
+        return TB_CLOSED;
+    }
+    let callback_slot = state
         .resources
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .reinitialize
         .clone();
-    let callback = callback
+    // The authoritative Arc remains State-owned until active_reinit settles.
+    // No callback exclusion is held across foreign invocation or source faults.
+    let callback = callback_slot
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !state.is_live() {
-        return TB_CLOSED;
-    }
-    let Some(callback) = callback.as_ref() else {
-        return TB_CLOSED;
-    };
-    match catch_unwind(AssertUnwindSafe(|| callback(ptr, len))) {
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        callback.as_ref().map_or(TB_CLOSED, |callback| callback(ptr, len))
+    }));
+    drop(callback); // non-last: cleanup still waits active_reinit
+    let code = match outcome {
         Ok(code) => code,
         Err(payload) => {
             state.source_panic(terminal::PayloadKind::Reinit, payload);
             TB_PANICKED
         }
-    }
+    };
+    state.end_reinit();
+    code
 }
 
 // The task never owns the foreign future across a yield or on cancellation.
@@ -1577,7 +1583,9 @@ where
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take();
-                drop(previous);
+                if !state.retire_reinit(previous) {
+                    return TB_CLOSED;
+                }
                 if !state.is_live() {
                     return TB_CLOSED;
                 }
@@ -1650,7 +1658,9 @@ where
                 resources.reinitializer_factory.take(),
             )
         };
-        let callback = factory.map(|factory| factory(handle.clone(), connection_slot.clone()));
+        let callback = factory.map(|factory| {
+            terminal::TerminalReinitialize::from(factory(handle.clone(), connection_slot.clone()))
+        });
         let callback_slot = state
             .resources
             .lock()
