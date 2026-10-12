@@ -601,6 +601,10 @@ impl TerminalState {
         self.startup_failure_stage.store(stage, Ordering::Release);
     }
     #[cfg(test)]
+    pub(super) fn hold_initial_before_transfer_for_test(&self) -> bool {
+        matches!(self.startup_failure_stage.load(Ordering::Acquire), 7 | 8)
+    }
+    #[cfg(test)]
     pub(super) fn startup_checkpoint_for_test(&self, stage: u8) {
         if self.startup_failure_stage.load(Ordering::Acquire) == stage {
             panic!("controlled startup failure after transfer stage {stage}");

@@ -1743,6 +1743,13 @@ where
         state.startup_checkpoint_for_test(6);
         let task_state = state.clone();
         let task = handle.spawn(async move {
+            #[cfg(test)]
+            if task_state.hold_initial_before_transfer_for_test() {
+                // Deterministic startup-failure fixture: retain SDK-owned C/F
+                // before trusted setup consumes them, with a real cancellable task.
+                terminal_notification(&task_state).await;
+                return Ok(());
+            }
             let provenance = transport.inner.provenance.clone();
             let brokered = transport.inner.host.0.broker_routing.is_some();
             let connection = if brokered {
