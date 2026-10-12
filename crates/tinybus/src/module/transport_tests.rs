@@ -928,8 +928,18 @@ async fn an_actual_delivery_failure_overlapping_stop_is_retained() {
     })
     .await
     .expect("S64");
-    transport.stop_sync(Duration::ZERO);
+    SHUTDOWN_ENTERED.store(false, Ordering::Release);
+    let stopping = tokio::spawn(transport.clone().stop(Duration::from_secs(2)));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !transport.admission_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("A57");
+    assert!(!SHUTDOWN_ENTERED.load(Ordering::Acquire), "A58");
     DELIVERY_BLOCKED.store(false, Ordering::Release);
+    stopping.await.expect("A59").expect("A60");
     tokio::time::timeout(Duration::from_secs(2), async {
         while transport.drain_started.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
@@ -969,7 +979,10 @@ async fn lifecycle_waiters_do_not_reenter_a_transport_disposed_by_the_prior_shut
         "S74"
     );
     assert!(
-        std::future::Future::poll(reinitializing.as_mut(), &mut context).is_pending(),
+        matches!(
+            std::future::Future::poll(reinitializing.as_mut(), &mut context),
+            std::task::Poll::Ready(Err(Error::ConnectionClosed))
+        ),
         "S75"
     );
     SHUTDOWN_BLOCKED.store(false, Ordering::Release);
@@ -980,10 +993,7 @@ async fn lifecycle_waiters_do_not_reenter_a_transport_disposed_by_the_prior_shut
         ),
         "S76"
     );
-    assert!(
-        matches!(reinitializing.await, Err(Error::ConnectionClosed)),
-        "S77"
-    );
+
     assert_eq!(SHUTDOWN_CALLS.load(Ordering::Acquire), 1, "S78");
     assert!(transport.stop_task_spawned(), "S79");
     assert!(!transport.is_faulted(), "S80");

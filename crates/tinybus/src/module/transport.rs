@@ -38,6 +38,7 @@ struct HostContext {
     init_started: AtomicBool,
     init_notify: Notify,
     ready: AtomicBool,
+    ready_gate: StdMutex<()>,
     broker_routing: AtomicBool,
     ready_notify: Notify,
     inflight: AtomicUsize,
@@ -170,6 +171,7 @@ impl ModuleTransport {
             init_started: AtomicBool::new(false),
             init_notify: Notify::new(),
             ready: AtomicBool::new(false),
+            ready_gate: StdMutex::new(()),
             broker_routing: AtomicBool::new(false),
             ready_notify: Notify::new(),
             inflight: AtomicUsize::new(0),
@@ -286,6 +288,7 @@ impl ModuleTransport {
             let mut pending = self.pending.lock().expect("module pending lock");
             let mut callbacks = self.callbacks.state.lock().expect("module callback lock");
             callbacks.closed = true;
+            let _ready = self.context.ready_gate.lock().expect("module ready lock");
             self.context.admission_closed.store(true, Ordering::Release);
             std::mem::take(&mut *pending)
         };
@@ -930,6 +933,7 @@ unsafe extern "C" fn host_broker_routing(ctx: *mut c_void) -> u32 {
 unsafe extern "C" fn host_ready(ctx: *mut c_void) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Some(context) = unsafe { ctx.cast::<HostContext>().as_ref() } {
+            let _ready = context.ready_gate.lock().expect("module ready lock");
             if !context.admission_closed.load(Ordering::Acquire) {
                 context.ready.store(true, Ordering::Release);
                 context.ready_notify.notify_waiters();
