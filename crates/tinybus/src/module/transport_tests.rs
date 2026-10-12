@@ -360,12 +360,12 @@ async fn a_pending_call_is_failed_when_the_module_closes_its_delivery_queue() {
     finish_closed_delivery_fixture(&transport, lock).await;
 }
 
-
 // Keep the shared vtable fixture serialized through its final global writes.
 async fn finish_closed_delivery_fixture(
-    _transport: &ModuleTransport,
+    transport: &ModuleTransport,
     lock: tokio::sync::MutexGuard<'_, ()>,
 ) {
+    wait_physical_cleanup(transport).await;
     DELIVERY_CODE.store(TB_OK, Ordering::Release);
     drop(lock);
 }
@@ -387,7 +387,6 @@ async fn a_fault_reply_does_not_release_the_fixture_before_physical_cleanup() {
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await;
-    let _release = ShutdownRelease;
     SHUTDOWN_ENTERED.store(false, Ordering::Release);
     SHUTDOWN_CALLS.store(0, Ordering::Release);
     let (transport, host) = ModuleTransport::new("serialized-fault-cleanup".into(), vec![]);
@@ -413,28 +412,38 @@ async fn a_fault_reply_does_not_release_the_fixture_before_physical_cleanup() {
             CleanupState::Complete | CleanupState::Uncertain | CleanupState::NoCallbackRequired
         );
     let mut completion = Box::pin(finish_closed_delivery_fixture(&transport, lock));
-    let completed_early = std::future::poll_fn(|cx| {
-        std::task::Poll::Ready(completion.as_mut().poll(cx).is_ready())
-    })
-    .await;
+    let completed_early =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(completion.as_mut().poll(cx).is_ready()))
+            .await;
     let released_early = VTABLE_TEST_LOCK.get().unwrap().try_lock().is_ok();
 
     // Release and observe the real callback before any regression assertion.
     // The transport retains the actual context; cancelling an observer is not cleanup.
     drop(worker_release);
     wait_physical_cleanup(&transport).await;
+    let callback_entered = SHUTDOWN_ENTERED.load(Ordering::Acquire);
+    let callback_calls = SHUTDOWN_CALLS.load(Ordering::Acquire);
     if !completed_early {
         completion.await;
     }
-    let next_fixture_can_start = VTABLE_TEST_LOCK.get().unwrap().try_lock().is_ok();
+    // Another queued fixture can acquire first; await our turn rather than
+    // treating legitimate contention after release as a failure.
+    let next_fixture = tokio::time::timeout(
+        Duration::from_secs(2),
+        VTABLE_TEST_LOCK.get().unwrap().lock(),
+    )
+    .await;
     assert!(matches!(reply, Ok(Ok(Some(ref reply))) if reply.header.kind == MessageKind::Error));
     assert!(matches!(started, Ok(Ok(()))));
     assert!(faulted_before_cleanup && callback_pending);
-    assert!(SHUTDOWN_ENTERED.load(Ordering::Acquire));
-    assert_eq!(SHUTDOWN_CALLS.load(Ordering::Acquire), 1);
-    assert!(!completed_early, "fault reply is not physical fixture completion");
+    assert!(callback_entered);
+    assert_eq!(callback_calls, 1);
+    assert!(
+        !completed_early,
+        "fault reply is not physical fixture completion"
+    );
     assert!(!released_early, "next fixture must wait for actual cleanup");
-    assert!(next_fixture_can_start);
+    assert!(next_fixture.is_ok());
 }
 
 #[tokio::test]
@@ -845,11 +854,11 @@ async fn stopping_initialized_module_before_ready_releases_observers_and_queued_
 
 #[tokio::test]
 async fn ordinary_stop_wakes_backpressure_without_turning_closure_into_a_fault() {
-    let _release = ShutdownRelease;
     let _lock = VTABLE_TEST_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await;
+    let _release = ShutdownRelease;
     SHUTDOWN_BLOCKED.store(false, Ordering::Release);
     DELIVERY_CODE.store(TB_BACKPRESSURE, Ordering::Release);
     DELIVERIES.store(0, Ordering::Release);
