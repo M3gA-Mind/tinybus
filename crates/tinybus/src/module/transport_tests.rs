@@ -71,19 +71,6 @@ fn call() -> Message {
 struct CaptureLevel(Arc<AtomicBool>);
 
 impl tracing::Subscriber for CaptureLevel {
-    fn register_callsite(
-        &self,
-        _: &'static tracing::Metadata<'static>,
-    ) -> tracing::subscriber::Interest {
-        // Scoped subscribers coexist with logs from other test threads.
-        // Re-check the active dispatcher instead of caching global interest.
-        tracing::subscriber::Interest::sometimes()
-    }
-
-    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
-        Some(tracing::level_filters::LevelFilter::TRACE)
-    }
-
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
         true
     }
@@ -109,6 +96,28 @@ impl tracing::Subscriber for CaptureLevel {
 
 #[test]
 fn a_module_log_line_reaches_the_hosts_subscriber_with_its_level() {
+    // Tracing caches callsite interest process-wide. Run the scoped subscriber
+    // assertion apart from parallel fixtures that register the same callsite
+    // without a subscriber, so their registration cannot suppress this event.
+    const CHILD: &str = "TINYBUS_LOG_SUBSCRIBER_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "module::transport::tests::a_module_log_line_reaches_the_hosts_subscriber_with_its_level",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated subscriber assertion failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
     let (_transport, host) = ModuleTransport::new("logger".to_string(), Vec::new());
     let observed = Arc::new(AtomicBool::new(false));
     let bytes = b"module log line";
