@@ -207,12 +207,15 @@ async fn native_replacement_logs_and_sanitized_panics_use_only_its_original_host
 #[test]
 fn native_log_fixture_recovers_poison_without_unwinding_across_abi() {
     let storage = Mutex::new(HashMap::new());
+    let context = 0u8;
+    let key = std::ptr::from_ref(&context) as usize;
     let poisoned = std::panic::catch_unwind(|| {
         let _guard = storage.lock().unwrap();
         panic!("controlled Rust fixture poison");
     });
     // Exercise the callback's Rust body first, safely containing baseline RED.
     let recovered = std::panic::catch_unwind(|| record_log(Some(&storage), 1, "local".into()));
+    let unavailable = std::panic::catch_unwind(|| record_log(None, 1, "unavailable".into()));
     if recovered.is_ok() {
         let logs = LOGS.get_or_init(|| Mutex::new(HashMap::new()));
         let _ = std::panic::catch_unwind(|| {
@@ -234,10 +237,14 @@ fn native_log_fixture_recovers_poison_without_unwinding_across_abi() {
     let recorded = LOGS.get().and_then(|logs| {
         logs.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&1)
+            .get(&key)
             .cloned()
     });
     assert!(poisoned.is_err());
+    assert!(
+        unavailable.is_ok(),
+        "unavailable fixture storage must not unwind"
+    );
     assert!(
         recovered.is_ok(),
         "callback body must recover poisoned fixture storage"

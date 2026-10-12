@@ -557,6 +557,8 @@ unsafe fn validate_start_arguments(
     Some((out_capacity, host))
 }
 
+// Carry the validated entry caller's exact diagnostic owner into the runtime.
+// Captured factory/config dispatch and shutdown must share the same live bit.
 unsafe fn start_module_runtime<F, Fut>(
     host: *const TbHostVtable,
     out: *mut TbModuleVtable,
