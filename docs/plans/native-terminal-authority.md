@@ -106,79 +106,127 @@ ABI constants Live=1, StopIntent=2, Fault=4, PhysicallyStopped=8. Exactly 1 admi
 zero/unknown/combined/terminal flags deny. Terminal flags monotonic, never Live.
 Physical bit means successful opaque shutdown return, and for opted-in modules
 explicit finish proved worker join. It proves neither legacy worker completion
-nor receiver backing destruction. Fault/uncertain shutdown never earns this bit.
+nor receiver backing destruction. The generic host sets the bit only after an
+accepted opaque callback actually returns TB_OK; StopIntent and Fault remain
+monotonic and continue denying admission (a legacy fault cleanup can return
+flags 14). This is not opted-in hook acceptance. For new native terminal hooks,
+TB_OK additionally requires actual independent worker/SDK resource finish and
+no sticky uncertainty or fault, under the separate Task 4 protocol.
 
 Normalization independently checks offset_of(field) + sizeof(field type) for
 broker_routing and new callback; never sizeof enlarged whole vtable for old tail.
 Frozen prefix/base size and ABI version stay unchanged. Document stronger callback
 lifetime covering every retained view use. Run focused tests green.
 
-## Task 2: retain real deferred initialization before deadline abandonment
+## Task 2: retain initialization and publication independently of waiters
 
 Files: crates/tinybus/src/module/transport.rs and transport_tests.rs,
-host.rs/host_tests.rs, host_callbacks.rs/host_callbacks_tests.rs.
+host.rs/host_tests.rs, host_callbacks.rs/host_callbacks_tests.rs; declared
+module_controlled_init native fixture and its existing CI staging.
 
-Existing DeferredInitializer::run returns SendModuleVtable through spawn_blocking;
-ensure_initialized timeout drops JoinHandle, so eventual vtable can disappear
-before self.initialize validates/stores it. Current stop_sync rollback can also
-overlap opaque init. Necessary correction stays in these exact paths.
+Use one mutex-protected PhysicalState in the existing process-lifetime
+HostContext. InitState is Deferred, Scheduled, Entered, PublishedValid,
+PublishedRejected, CanceledBeforeEntry or ExternalValid. CleanupState is Idle,
+Requested, Executing, Complete, Uncertain or NoCallbackRequired. These are
+orthogonal states: Requested does not consume the shutdown invocation, and an
+empty vtable slot never proves physical success.
 
-First red test late_initialization_retains_real_vtable_for_cleanup: actual blocked
-initializer, controlled host future timeout/drop, retained native worker/query,
-release init returning valid vtable, exactly one real shutdown/join, no new phase.
-Add rollback_cannot_overlap_opaque_initialization and late_invalid_vtable_never_runs.
+Before thread submission, install one externally anchored Arc<PhysicalJob>
+owning Arc<ModuleTransport>, at most one initializer, and any acquired owned
+lifecycle guard. The context anchor survives rejected/dropped spawn closures,
+Host Drop and Tokio runtime teardown. Never retry failed submission or reset
+Uncertain. This is a finite per-instance ownership bound, not a global leak
+bound. Result predicates use Notify and Condvar loops, not notification counts.
 
-Retained blocking initializer owns Arc transport, actual owned lifecycle guard,
-DeferredInitializer (and config borrow), resident library assumptions and eventual
-vtable. Install via existing initialize validation before result publication to
-separate waiter channel; JoinHandle result carries no exclusive physical owner.
-Validate size/header/version/callback validity under existing initialize contract;
-never invoke invalid/missing callbacks or fabricate a controller from partial ABI.
-Failure with no usable returned vtable retains honest uncertainty for a foreign
-initializer that launched work without returning cleanup; native query still denies.
+The non-async scheduling helper takes initialization-gate then PhysicalState,
+rechecks terminal admission, takes the initializer once and records Scheduled
+before awaiting physical completion. OnceCell does not own initializer scheduling
+or eventual vtable publication. Only the initiating waiter has an armed Drop
+guard: deadline expiry or abandonment before publication immediately commits
+Fault and Requested. Observation waiters cannot cancel the physical owner.
+Already-committed ordinary cancellation does not invent Fault.
 
-Host deadline/drop does not drop result owner or borrow. Timeout commits native
-fault intent immediately, makes public failed/fault state terminal, and retains
-one eventual cleanup. Clear config only after actual C return. Publish validated
-vtable even when terminal, then release lifecycle guard and claim/schedule cleanup
-once. Terminal vtable storage is cleanup access, never public resurrection.
-No new initializer retries or unbounded spawn_blocking loops: one physical init,
-one claim for cleanup; caller retries only observe same result/tombstone.
-If init never returns, cleanup pending and real ownership survive indefinitely.
+The retained std thread acquires the actual owned lifecycle guard without
+holding host state locks. Before C entry it briefly checks PhysicalState:
+terminal Scheduled becomes CanceledBeforeEntry/NoCallbackRequired without any
+opaque call; live Scheduled becomes Entered. Entered retains config until real
+C return regardless of a host deadline or dropped waiter. After C return,
+validate only the existing contract: module size >= base size, non-null context,
+and Some(reinitialize) if the full module tail is declared. No fictitious
+header/version validation, null testing of mandatory Rust function pointers,
+or executable-address authentication is added. Non-OK output is ignored;
+structurally rejected output invokes no callbacks and retains Uncertain.
 
-## Task 3: actual host flags, fault cleanup and original stop invariants
+Store accepted vtables under lifecycle exclusion even after terminal intent,
+for cleanup-only access. Clear config after the real borrow ends and publish the
+immutable result. Under PhysicalState, Requested keeps the SAME initializer
+anchor for cleanup; live publication retires the anchor atomically before
+lifecycle release; rejection retains uncertainty. Requested cleanup releases
+then reacquires lifecycle, never waits for its own guard or submits a second
+cleanup worker. Reinit must recheck terminal after obtaining lifecycle.
 
-Same host files. Red tests fault_closes_native_phase_before_reinitializer_returns,
-unacquired_stop_keeps_native_instance_live, abandoned_stop_keeps_original_cleanup,
-host_drop_leaves_terminal_query_tombstone, and
-fault_during_stop_keeps_fault_transition_and_single_shutdown.
+Eager activation uses the same Entered/publication predicates. Its fresh,
+unexposed transport is demonstrably unlocked: try_lock_owned before opaque C
+entry, fail content-free/uncertain on unexpected contention, retain caller Arc,
+config and guard through actual return and validation/publication, then release
+exclusion. Cleanup waits both eager and deferred Entered publication before
+acquiring lifecycle. Late accepted eager output is cleanup only and cannot
+attach or reactivate. Failed cleanup submission remains Uncertain even if
+eager output is valid later; no refund or resubmission.
 
-HostContext adds AtomicU32 terminal flags; commit_terminal clears Live and sets
-StopIntent plus Fault when real fault. Query only Acquire loads leaked actual ctx,
-no locks/allocation/parsing/product code. Install callback in ModuleTransport::new.
-HostContext immutable Weak<ModuleTransport> from Arc::new_cyclic enables host_fault
-to schedule cleanup without retaining strong context cycle.
+Prove with controlled channels/Condvar barriers and an actual compiled fixture:
+blocked native init followed by initiating deadline/drop and late single join;
+fault while Scheduled (C never entered); fault after C return before publication
+(same owner, no empty-success claim); actual rejected closure/controller retention;
+invalid size/null context/missing declared reinit/non-OK misleading output with
+zero callbacks; eager fault while config remains borrowed and late single join.
 
-Separate physical cleanup claim from existing stop_task_spawned. Normal stop
-acquires lifecycle then claims/commits before spawn. Fault immediately commits,
-then private schedule_terminal_cleanup retains Arc and queues one serialized
-physical cleanup. Retained std thread using blocking_lock_owned permits Host Drop
-cleanup independent of dropped Tokio runtime; never recurse into C shutdown from
-host_fault, opaque callback, router/loaded lock or Tokio worker. Thread spawn failure
-keeps terminal/uncertain ownership; no successful completion/reopen/refund.
-Normal running task and fault share claim, never second join. stop_task_spawned
-still denotes actual ordinary stop task, preserving StopError Started/NotStarted.
+## Task 3: actual host flags and retained terminal cleanup
 
-Route host_fault, fault_pending, failed initialization/send, admission rollback
-and Host Drop through same intent/claim. Gather cloned transports under lock,
-commit intent before detach, release loaded/router/inbound locks before scheduling.
-Remove synchronous rollback shutdown under lifecycle-bypassing Drop path.
-Before-init rollback closes init gate without pretending worker joined.
+HostContext supplies the actual AtomicU32 query through the optional ABI tail:
+Live=1, StopIntent=2, Fault=4, PhysicallyStopped=8. Only exactly Live permits a
+phase. Query performs an Acquire load on the leaked context without locks,
+allocation, parsing or product logic. Weak<ModuleTransport> allows host_fault to
+upgrade the actual owner without an unconditional strong transport cycle.
 
-peer_detached checks actual fault before consuming normal transition_from;
-private fault cleanup never creates that origin. Late stop_inner success preserves
-actual Faulted/Failed precedence. Ordinary finish_stop stays non-fault. Keep every
-existing #57 callback lease/drain/cancel/retry/original marker assertion unchanged.
+Commit native StopIntent (and actual Fault) immediately before physical cleanup
+scheduling. Fault precedence is monotonic. host_fault releases inbound locks
+before scheduling and never invokes C recursively, joins or waits. Rollback and
+Host Drop commit all flags before revocation, release router/loaded locks and
+route through retained cleanup. No lifecycle-bypassing synchronous Drop cleanup.
+
+Normal stop remains deadline-bound while obtaining the actual owned lifecycle
+guard. Before acquisition it owns no ordinary intent, job or stop_task_spawned
+marker; cancellation/deadline is NotStarted and remains live absent real fault.
+After acquisition commit and install/adopt an actual owner synchronously before
+the next await. If an already-submitted initializer is Scheduled, ordinary stop
+adopts that SAME job, records the original handoff, releases its acquired guard,
+then observes completion; the existing worker obtains lifecycle, sees terminal
+and proves CanceledBeforeEntry. Never store the guard where that worker needs it
+or create a second worker. A running Entered initializer remains excluded; an
+ordinary lock deadline does not cancel it or fabricate Fault.
+
+Fault-owned jobs are observed rather than claimed as new ordinary handoffs.
+Original stop_task_spawned and transition_from.get_or_insert(old) survive retry
+and caller cancellation. Preserve Started/NotStarted distinctions and ordinary
+non-Fault behavior, including an actual non-OK shutdown return. Failed ordinary
+submission retains the actual acquired guard in the external anchor and explicit
+Uncertain without inventing module Fault or silently retrying.
+
+Cleanup waits initialization publication before lifecycle acquisition, then
+rechecks terminal/cleanup state, closes the actual callback gate and drains its
+physical leases. Only accepted cleanup access can claim Requested -> Executing.
+Hold physical exclusion and retained job until the one opaque shutdown returns.
+Only actual TB_OK permits Complete and the physical-success bit; failed return
+or panic is Uncertain. Legacy public Stopped is separate bookkeeping and never
+proves join or backing destruction. Successful cleanup can release the anchor;
+uncertainty remains inspectable, with no reset/restart.
+
+peer_detached checks actual Fault before consuming ordinary transition_from.
+Late stop_inner completion preserves Faulted/Failed. Native tests cover blocked
+actual reinit fault/query denial before return, ordinary callback lease retention,
+Host Drop/rollback tombstones, instance isolation and one real join. Keep every
+original #57 callback drain, physical lock, retry and original marker assertion.
 
 ## Task 4: module-local hooks through runtime and fault paths
 
@@ -200,13 +248,24 @@ then runs finish synchronously on retained physical host cleanup worker before
 runtime.shutdown_timeout. Indefinite join outlives deadline without TB_OK.
 Uncertain/panic finish returns content-free failure, never physical completion.
 
-Caught method panic publishes host fault even if error-frame send fails, then
-bounded request outside registry lock. Determine actual send lock boundary before
-coding: if lock is held, retained controller task runs request after host intent.
-Setup failure publishes host intent before waiting callback disposal, request and
-finish run off runtime workers. Setup canceled by shutdown takes same once route.
-No joining/hooks in global panic hook (location logging only). setup/reinit reject
-terminal immediately and before activation. Never classify ordinary close as fault.
+Task 4 remains separate, unimplemented scope. Its startup guard owns returned
+hooks until runtime/output publication; factory Err/panic before return owns
+partial disposal itself. Request callback is an independent Arc and finish a
+separate take-once slot. Publish intent, claim bounded request outside locks,
+signal request completion even on panic; physical finish waits request-done
+off runtime, callback-gate and reinitializer locks. Pre-registration fault
+persists and invokes bounded request once at registration. Ordinary
+terminal-caused setup cancellation must remain non-Fault, while genuine
+Err/panic still upgrades Fault even racing ordinary stop.
+
+The accepted host prerequisite does not establish catch-time fault publication,
+module-local worker/resource finish, fixed retained job bounds or confidential
+payload/backing last-Drop. Task 4's own accepted specification must prove those
+contracts at the actual CatchUnwind boundary before payload destruction; no
+enqueue/send-success inference, extra panic task or global panic hook join.
+A caught registry-free callback boundary must publish fault/request before
+returning its error. New physical-success evidence remains distinct from legacy
+Stopped and receiver backing destruction.
 
 ## Task 5: actual compiled native proof and compatibility negatives
 

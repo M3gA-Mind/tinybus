@@ -3125,7 +3125,7 @@ async fn actual_native_reservation_rollback_retains_one_cleanup_and_fault_tombst
 #[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
 async fn actual_native_fault_during_ordinary_stop_keeps_fault_state_and_single_join() {
     let (transport, view, barrier, artifact, path) = controlled_native_transport().await;
-    let host = ModuleHost::new(Broker::new());
+    let host = Arc::new(ModuleHost::new(Broker::new()));
     let info = attach_controlled_native(&host, transport.clone(), artifact, &path).unwrap();
     let (release, release_rx) = std::sync::mpsc::channel();
     *barrier.finish_gate.lock().unwrap() = Some(release_rx);
