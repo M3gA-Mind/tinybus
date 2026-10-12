@@ -50,7 +50,7 @@ pub(crate) struct ModuleTransport {
     context: &'static HostContext,
     label: String,
     initializer: StdMutex<Option<DeferredInitializer>>,
-    init_result: OnceCell<std::result::Result<(), String>>,
+    init_result: OnceCell<std::result::Result<(), InitFailure>>,
     pending: StdMutex<VecDeque<Message>>,
     drain_started: AtomicBool,
     // Reconfiguration and shutdown both call into opaque module code. The
@@ -76,6 +76,13 @@ struct DeferredInitializer {
 }
 
 struct SendModuleVtable(TbModuleVtable);
+
+#[derive(Clone)]
+enum InitFailure {
+    Closed,
+    Failed(String),
+}
+
 
 // The opaque host context is process-lifetime state and every callback is
 // required by the ABI to be thread-safe.
@@ -270,7 +277,7 @@ impl ModuleTransport {
                         .lock()
                         .expect("initialization gate lock");
                     if self.is_stopped() {
-                        return Err("module transport is closed".to_string());
+                        return Err(InitFailure::Closed);
                     }
                     self.context.init_started.store(true, Ordering::Release);
                 }
@@ -284,7 +291,7 @@ impl ModuleTransport {
                     return if self.module.lock().expect("module vtable lock").is_some() {
                         Ok(())
                     } else {
-                        Err("module has no initializer".to_string())
+                        Err(InitFailure::Failed("module has no initializer".to_string()))
                     };
                 };
                 // Module init is opaque synchronous code. Keep it off Tokio's
@@ -300,18 +307,23 @@ impl ModuleTransport {
                     Ok(Ok(Ok(initialized))) => initialized,
                     Ok(Ok(Err(reason))) => {
                         self.clear_config();
-                        return Err(reason);
+                        return Err(InitFailure::Failed(reason));
                     }
-                    Ok(Err(_)) => return Err("module initialization panicked".to_string()),
-                    Err(_) => return Err("module initialization exceeded its deadline".to_string()),
+                    Ok(Err(_)) => return Err(InitFailure::Failed("module initialization panicked".to_string())),
+                    Err(_) => return Err(InitFailure::Failed("module initialization exceeded its deadline".to_string())),
                 };
                 self.clear_config();
                 self.initialize(module.0)
-                    .map_err(|_| "module returned an invalid vtable".to_string())?;
+                    .map_err(|_| InitFailure::Failed("module returned an invalid vtable".to_string()))?;
                 Ok(())
             })
             .await;
-        result.clone().map_err(Error::transport)
+        match result {
+            Ok(()) if self.is_stopped() => Err(Error::ConnectionClosed),
+            Ok(()) => Ok(()),
+            Err(InitFailure::Closed) => Err(Error::ConnectionClosed),
+            Err(InitFailure::Failed(reason)) => Err(Error::transport(reason.clone())),
+        }
     }
 
     pub(crate) async fn wait_ready(&self) {
@@ -640,10 +652,10 @@ impl Transport for ModuleTransport {
         if self.is_stopped() {
             return Err(Error::ConnectionClosed);
         }
-        if self.ensure_initialized().await.is_err() {
+        if let Err(error) = self.ensure_initialized().await {
             {
                 let _pending = self.pending.lock().expect("module pending lock");
-                if self.is_stopped() {
+                if self.is_stopped() && matches!(error, Error::ConnectionClosed) {
                     return Err(Error::ConnectionClosed);
                 }
                 self.context.init_failed.store(true, Ordering::Release);
