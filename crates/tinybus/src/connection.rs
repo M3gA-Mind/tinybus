@@ -1414,7 +1414,7 @@ async fn dispatch_loop(inner: Arc<Inner>) {
                     }
                 }
             }
-            MessageKind::Signal => {
+            MessageKind::Signal | MessageKind::DirectedSignal => {
                 // `send` fails only when nobody is subscribed, which is the
                 // common case for a service that emits but never listens.
                 let _ = inner

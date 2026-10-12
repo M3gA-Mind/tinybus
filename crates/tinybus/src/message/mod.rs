@@ -1,4 +1,4 @@
-//! The wire format: one [`Message`] type, four kinds, JSON bodies.
+//! The wire format: one [`Message`] type, five kinds, JSON bodies.
 //!
 //! # Why JSON and not a binary encoding
 //!
@@ -17,8 +17,8 @@
 //!
 //! Routing reads `destination` and nothing else. Keeping it a flat struct of
 //! `Option`s rather than an enum per kind means the broker can route a message
-//! without knowing what kind it is, which is what lets an unknown future kind
-//! pass through an old broker instead of being dropped.
+//! without reading the body. Directed signals add a destination-bound hint for
+//! a live local callback; older peers reject that new message kind safely.
 
 pub mod codec;
 
@@ -45,6 +45,9 @@ pub enum MessageKind {
     /// A broadcast. Has no reply and no destination; delivery is decided by
     /// each peer's [`crate::router::MatchRule`]s.
     Signal,
+    /// A one-recipient signal. The broker authorizes the exact callback binding
+    /// and routes only to its current module peer.
+    DirectedSignal,
 }
 
 /// Everything the router and the dispatcher need, and nothing else.
@@ -69,7 +72,8 @@ pub struct Header {
     /// `ResolveCallTarget` method before relying on this restriction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_responder: Option<BusName>,
-    /// Who the message is for. `None` on signals, which are broadcast.
+    /// Who the message is for. Broadcast signals omit this; directed signals
+    /// carry the unique peer selected by their live callback binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<BusName>,
     /// The object being addressed.
@@ -296,6 +300,38 @@ impl Message {
         }
     }
 
+    /// Build an exact-recipient signal for SDK-owned callback routing.
+    ///
+    /// The broker accepts this kind only for a currently live host callback
+    /// binding that declared the exact source, destination, path, interface,
+    /// and member. It is not a general unicast escape hatch.
+    pub(crate) fn directed_signal(
+        destination: BusName,
+        path: ObjectPath,
+        interface: InterfaceName,
+        member: MemberName,
+        body: Value,
+    ) -> Self {
+        Self {
+            header: Header {
+                kind: MessageKind::DirectedSignal,
+                serial: 0,
+                reply_serial: None,
+                sender: None,
+                expected_responder: None,
+                destination: Some(destination),
+                path: Some(path),
+                interface: Some(interface),
+                member: Some(member),
+                error_name: None,
+                confidential: false,
+                sensitive: false,
+                stream_reply: false,
+            },
+            body,
+        }
+    }
+
     /// Reconstruct the [`Error`] an [`MessageKind::Error`] message carries.
     ///
     /// The variant's structure does not survive the wire — only its name and
@@ -353,7 +389,10 @@ impl Message {
         // Refusing it here means no later stage has to ask whether a broadcast
         // might be a secret.
         if self.header.confidential || self.header.sensitive {
-            if self.header.kind == MessageKind::Signal {
+            if matches!(
+                self.header.kind,
+                MessageKind::Signal | MessageKind::DirectedSignal
+            ) {
                 return Err(Error::protocol(
                     "a signal cannot carry a private body: it is a broadcast",
                 ));
@@ -384,6 +423,28 @@ impl Message {
             MessageKind::Signal => {
                 if self.header.interface.is_none() || self.header.member.is_none() {
                     return Err(Error::protocol("signal needs an interface and a member"));
+                }
+            }
+            MessageKind::DirectedSignal => {
+                if self.header.destination.as_ref().is_none_or(|name| !name.is_unique()) {
+                    return Err(Error::protocol(
+                        "directed signal needs a unique destination",
+                    ));
+                }
+                if self.header.path.is_none()
+                    || self.header.interface.is_none()
+                    || self.header.member.is_none()
+                {
+                    return Err(Error::protocol(
+                        "directed signal needs a path, an interface and a member",
+                    ));
+                }
+                if self.header.reply_serial.is_some()
+                    || self.header.error_name.is_some()
+                    || self.header.expected_responder.is_some()
+                    || self.header.stream_reply
+                {
+                    return Err(Error::protocol("directed signal has invalid routing fields"));
                 }
             }
         }
