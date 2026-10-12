@@ -291,7 +291,10 @@ async fn actual_linked_reinit_terminal_cancellation_settles_before_worker_join()
     view.request_fault();
     let reinit_result = reinit.await.unwrap();
     host.shutdown(Duration::from_secs(5)).await;
-    let remainder: Vec<_> = events.try_iter().collect();
+    let mut remainder = Vec::new();
+    while !remainder.iter().any(|event| matches!(event, controlled::Event::FactoryDrop(_))) {
+        remainder.push(events.recv_timeout(Duration::from_secs(5)).unwrap());
+    }
     assert!(matches!(initial, controlled::Event::Poll(0)));
     assert!(matches!(entered, controlled::Event::Poll(1)));
     assert!(reinit_result.is_err());
