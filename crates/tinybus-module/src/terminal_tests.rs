@@ -108,3 +108,41 @@ fn surviving_sdk_owned_transport_keeps_cleanup_uncertain_and_permit_anchored() {
     drop(sdk_owner);
     assert!(admission.slots.lock().unwrap()[state.lease.index].anchor.is_some());
 }
+
+#[test]
+fn stale_context_never_selects_replacement_and_unknown_contexts_are_closed() {
+    let admission = Admission::new();
+    let state = TerminalState::admit_in(&admission, host(), None).unwrap();
+    let old = state.context().addr();
+    state.empty_factory_failure(); drop(state);
+    let replacement = TerminalState::admit_in(&admission, host(), None).unwrap();
+    assert_eq!(replacement.lease.index, old & 255);
+    assert_ne!(replacement.context().addr(), old);
+    assert!(TerminalState::lookup_in(&admission, old).is_none());
+    for invalid in [0, 1, 255, usize::MAX] { assert!(TerminalState::lookup_in(&admission, invalid).is_none()); }
+    assert!(Arc::ptr_eq(&TerminalState::lookup_in(&admission, replacement.token).unwrap(), &replacement));
+    replacement.empty_factory_failure();
+}
+#[test]
+fn exhausted_slot_generation_never_wraps_or_selects_old_context() {
+    let admission = Admission::new();
+    { let mut slots = admission.slots.lock().unwrap();
+        slots[0].generation = usize::MAX >> 8;
+        for slot in &mut slots[1..] { slot.exhausted = true; }
+    }
+    assert!(TerminalState::admit_in(&admission, host(), None).is_none());
+    assert!(admission.slots.lock().unwrap()[0].exhausted);
+    assert!(TerminalState::lookup_in(&admission, (usize::MAX >> 8) << 8).is_none());
+}
+#[test]
+fn callback_lookup_holds_exact_state_across_retirement_until_actual_last_drop() {
+    let admission = Admission::new();
+    let state = TerminalState::admit_in(&admission, host(), None).unwrap();
+    let admitted = TerminalState::lookup_in(&admission, state.token).unwrap();
+    let index = state.lease.index;
+    state.empty_factory_failure(); drop(state);
+    assert!(admission.slots.lock().unwrap()[index].reserved);
+    assert_eq!(admitted.lease.index, index);
+    drop(admitted);
+    assert!(!admission.slots.lock().unwrap()[index].reserved);
+}

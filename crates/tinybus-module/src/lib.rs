@@ -1308,18 +1308,11 @@ impl Transport for TerminalTransport {
     fn describe(&self) -> String { self.inner.describe() }
 }
 
-// Process-lifetime C tombstone does not retain the actual State after proved
-// successful shutdown. Surviving liveness views retain their own slot permits.
-struct TerminalRuntimeContext { state: StdMutex<Option<Arc<terminal::TerminalState>>> }
-impl TerminalRuntimeContext {
-    fn state(&self) -> Option<Arc<terminal::TerminalState>> {
-        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
-    }
-}
+// The existing opaque module_ctx field is a bounded slot/generation token,
+// never a dereferenced pointer. Retirement denies old callbacks permanently.
 unsafe extern "C" fn terminal_deliver(ctx: *mut c_void, ptr: *const u8, len: usize) -> i32 {
     if ctx.is_null() || ptr.is_null() || len > MAX_FRAME_LEN { return TB_BAD_ARGUMENT; }
-    let context = unsafe { &*ctx.cast::<TerminalRuntimeContext>() };
-    let Some(state) = context.state() else { return TB_CLOSED; };
+    let Some(state) = terminal::TerminalState::lookup(ctx) else { return TB_CLOSED; };
     if !state.is_live() { return TB_CLOSED; }
     let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
     let brokered = state.host.is_broker_routed();
@@ -1332,8 +1325,7 @@ unsafe extern "C" fn terminal_deliver(ctx: *mut c_void, ptr: *const u8, len: usi
 }
 unsafe extern "C" fn terminal_shutdown(ctx: *mut c_void, deadline_ms: u64) -> i32 {
     if ctx.is_null() { return TB_BAD_ARGUMENT; }
-    let context = unsafe { &*ctx.cast::<TerminalRuntimeContext>() };
-    let Some(state) = context.state() else { return TB_CLOSED; };
+    let Some(state) = terminal::TerminalState::lookup(ctx) else { return TB_CLOSED; };
     let _scope = state.owner.as_ref().map(ExecutionOwner::enter);
     state.observe_host(); // sample actual host Fault before selecting ordinary Stop
     state.signal(TerminalReason::Stop);
@@ -1341,14 +1333,11 @@ unsafe extern "C" fn terminal_shutdown(ctx: *mut c_void, deadline_ms: u64) -> i3
     // Genuine source/native Fault cannot earn accepted-vtable physical success.
     state.observe_host();
     if completion != TerminalCompletion::PhysicallyStopped || state.has_fault() { return TB_PANICKED; }
-    let retired = context.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-    drop(retired);
     TB_OK
 }
 unsafe extern "C" fn terminal_reinitialize(ctx: *mut c_void, ptr: *const u8, len: usize) -> i32 {
     if ctx.is_null() || len > 1024 * 1024 || (ptr.is_null() && len != 0) { return TB_BAD_ARGUMENT; }
-    let context = unsafe { &*ctx.cast::<TerminalRuntimeContext>() };
-    let Some(state) = context.state() else { return TB_CLOSED; };
+    let Some(state) = terminal::TerminalState::lookup(ctx) else { return TB_CLOSED; };
     if !state.is_live() { return TB_CLOSED; }
     let _scope = state.owner.as_ref().map(ExecutionOwner::enter);
     let callback = state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).reinitialize.clone();
@@ -1506,7 +1495,7 @@ where C: serde::de::DeserializeOwned + Send + 'static,
             result
         });
         state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).initial = Some(task);
-        let context = Box::into_raw(Box::new(TerminalRuntimeContext { state: StdMutex::new(Some(state.clone())) })).cast::<c_void>();
+        let context = state.context();
         if capacity >= size_of::<TbModuleVtable>() as u32 {
             unsafe { out.write(TbModuleVtable { size: size_of::<TbModuleVtable>() as u32, _reserved: 0,
                 module_ctx: context, deliver: terminal_deliver, shutdown: terminal_shutdown, reinitialize: Some(terminal_reinitialize) }); }

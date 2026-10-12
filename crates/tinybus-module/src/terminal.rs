@@ -43,7 +43,7 @@ impl NativeInstanceLiveness {
 }
 const INSTANCE_LIMIT: usize = 256;
 #[derive(Default)]
-struct Slot { reserved: bool, anchor: Option<Arc<TerminalState>> }
+struct Slot { reserved: bool, exhausted: bool, generation: usize, anchor: Option<Arc<TerminalState>> }
 struct Admission { slots: StdMutex<[Slot; INSTANCE_LIMIT]> }
 impl Admission {
     fn new() -> Arc<Self> {
@@ -127,6 +127,7 @@ pub(super) struct TerminalState {
     pub resources: StdMutex<StartupResources>,
     sdk_owners: AtomicUsize,
     lease: SlotLease,
+    token: usize,
 }
 /// Every surviving SDK transport/Connection/task retains this actual State.
 /// A pending runtime teardown may therefore never recycle its slot.
@@ -140,8 +141,16 @@ impl TerminalState {
     }
     fn admit_in(admission: &Arc<Admission>, host: HostCalls, owner: Option<ExecutionOwner>) -> Option<Arc<Self>> {
         let mut slots = admission.slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let index = slots.iter().position(|slot| !slot.reserved)?;
+        let index = slots.iter_mut().enumerate().find_map(|(index, slot)| {
+            if slot.reserved || slot.exhausted { return None; }
+            let generation = slot.generation.checked_add(1).filter(|generation| *generation <= usize::MAX >> 8);
+            match generation {
+                Some(generation) => { slot.generation = generation; Some(index) },
+                None => { slot.exhausted = true; None },
+            }
+        })?;
         slots[index].reserved = true;
+        let token = (slots[index].generation << 8) | index;
         let state = Arc::new(Self {
             host, owner, reason: AtomicU8::new(0), uncertain: AtomicBool::new(false),
             control: StdMutex::new(Control { request: None, finish: None,
@@ -149,10 +158,24 @@ impl TerminalState {
                 published: false, completion: None, job: None, payloads: PrimaryPayloads::default() }),
             changed: Condvar::new(), terminal_notify: tokio::sync::Notify::new(),
             resources: StdMutex::new(StartupResources::default()), sdk_owners: AtomicUsize::new(0),
-            lease: SlotLease { admission: Arc::downgrade(admission), index },
+            lease: SlotLease { admission: Arc::downgrade(admission), index }, token,
         });
         slots[index].anchor = Some(state.clone());
         Some(state)
+    }
+    /// Opaque address token only; no allocation or dereference occurs.
+    pub fn context(&self) -> *mut c_void { std::ptr::with_exposed_provenance_mut(self.token) }
+    pub fn lookup(context: *mut c_void) -> Option<Arc<Self>> {
+        Self::lookup_in(ADMISSION.get()?, context.addr())
+    }
+    fn lookup_in(admission: &Arc<Admission>, token: usize) -> Option<Arc<Self>> {
+        let generation = token >> 8;
+        if generation == 0 { return None; }
+        let slots = admission.slots.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let slot = &slots[token & (INSTANCE_LIMIT - 1)];
+        if slot.generation != generation { return None; }
+        // Strong exact State is acquired before releasing registry exclusion.
+        slot.anchor.as_ref().filter(|state| state.token == token).cloned()
     }
     pub fn view(self: &Arc<Self>) -> NativeInstanceLiveness { NativeInstanceLiveness { inner: self.clone() } }
     pub fn sdk_owner(self: &Arc<Self>) -> SdkOwner {
@@ -276,6 +299,7 @@ impl TerminalState {
             drop(anchor);
         }
     }
+    #[cfg(test)]
     pub fn empty_factory_failure(self: &Arc<Self>) {
         // No callable/controller was transferred. Retained views still hold the permit.
         self.commit(TerminalReason::SetupFailed); self.remove_anchor();

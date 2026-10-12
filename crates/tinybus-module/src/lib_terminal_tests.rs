@@ -44,8 +44,7 @@ fn shutdown_rechecks_actual_native_fault_after_local_stop_and_physical_finish() 
         entered_tx.send(()).unwrap(); worker_release.wait(); TerminalCompletion::PhysicallyStopped
     }));
     state.publish();
-    let context = Box::new(TerminalRuntimeContext { state: StdMutex::new(Some(state.clone())) });
-    let ptr = (&*context as *const TerminalRuntimeContext) as usize;
+    let ptr = state.context().addr();
     let caller = std::thread::spawn(move || unsafe { terminal_shutdown(ptr as *mut c_void, 3000) });
     entered_rx.recv().unwrap();
     flags.store(tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, Ordering::Release);
