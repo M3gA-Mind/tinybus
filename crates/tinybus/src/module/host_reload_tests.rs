@@ -248,3 +248,156 @@ fn native_log_fixture_recovers_poison_without_unwinding_across_abi() {
             .any(|line| line.contains("actual ABI callback"))
     }));
 }
+
+#[cfg(unix)]
+unsafe fn terminal_symbol<T: Copy>(path: &Path, name: &std::ffi::CStr) -> T {
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg_attr(target_os = "linux", link(name = "dl"))]
+    unsafe extern "C" {
+        fn dlopen(path: *const std::ffi::c_char, flags: i32) -> *mut std::ffi::c_void;
+        fn dlsym(
+            handle: *mut std::ffi::c_void,
+            name: *const std::ffi::c_char,
+        ) -> *mut std::ffi::c_void;
+        fn dlclose(handle: *mut std::ffi::c_void) -> i32;
+    }
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let handle = unsafe { dlopen(path.as_ptr(), 2) };
+    assert!(!handle.is_null());
+    let raw = unsafe { dlsym(handle, name.as_ptr()) };
+    unsafe {
+        dlclose(handle);
+    }
+    assert!(!raw.is_null());
+    assert_eq!(std::mem::size_of::<T>(), std::mem::size_of_val(&raw));
+    unsafe { std::mem::transmute_copy(&raw) }
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TerminalInitControls {
+    ctx: *mut std::ffi::c_void,
+    event: unsafe extern "C" fn(*mut std::ffi::c_void, u32, u32),
+}
+struct TerminalInitBarrier {
+    entered: std::sync::mpsc::Sender<()>,
+    release: (std::sync::Mutex<bool>, std::sync::Condvar),
+}
+unsafe extern "C" fn terminal_init_event(ctx: *mut std::ffi::c_void, event: u32, _: u32) {
+    if event != 18 {
+        return;
+    }
+    let control = unsafe { &*ctx.cast::<TerminalInitBarrier>() };
+    let _ = control.entered.send(());
+    let mut release = control.release.0.lock().unwrap();
+    while !*release {
+        release = control.release.1.wait(release).unwrap();
+    }
+}
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires the privately pinned __native-fixture-support eight-artifact cohort"]
+async fn compiled_native_host_stop_and_fault_deny_factory_after_entered_init_barrier() {
+    use crate::module::abi::*;
+    let path = PathBuf::from(std::env::var_os("TINYBUS_TEST_TERMINAL_MODULE").unwrap());
+    // Real loader admission pins the image before any test symbol resolution.
+    let artifact = loader::load(&path, false).unwrap();
+    let configure: unsafe extern "C" fn(
+        usize,
+        *mut std::ffi::c_void,
+        unsafe extern "C" fn(*mut std::ffi::c_void, u32, u32),
+    ) = unsafe { terminal_symbol(&path, c"terminal_test_factory_mode") };
+    let factories: extern "C" fn() -> usize =
+        unsafe { terminal_symbol(&path, c"terminal_test_factories") };
+    for fault in [false, true] {
+        let broker = Broker::new();
+        let broker_task = broker.clone().spawn(MemoryBus::new());
+        let host = ModuleHost::new(broker);
+        let admitted = host
+            .validate(&path, &artifact.descriptor, &artifact.manifest)
+            .unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let control = Box::into_raw(Box::new(TerminalInitBarrier {
+            entered: sender,
+            release: (std::sync::Mutex::new(false), std::sync::Condvar::new()),
+        }));
+        let controls = TerminalInitControls {
+            ctx: control.cast(),
+            event: terminal_init_event,
+        };
+        let encoded = unsafe {
+            std::slice::from_raw_parts(
+                (&controls as *const TerminalInitControls).cast::<u8>(),
+                std::mem::size_of::<TerminalInitControls>(),
+            )
+        };
+        let config =
+            serde_json::to_vec(&serde_json::json!({"mode": 0, "test_controls": encoded})).unwrap();
+        let (transport, calls) = ModuleTransport::new(admitted.name.clone(), config);
+        unsafe {
+            configure(30, control.cast(), terminal_init_event);
+        }
+        let before = factories();
+        transport.defer_initialize(artifact.init, calls);
+        // Attach the genuine loaded artifact and transport to the real host,
+        // matching the existing observed_native deferred-init fixture above.
+        host.attach_transport(
+            &path,
+            admitted,
+            artifact.manifest.clone(),
+            transport.clone(),
+            Activation {
+                lazy_init: true,
+                lazy_load: false,
+                descriptor_info: None,
+                pinned_sha256: None,
+            },
+        )
+        .unwrap();
+        let initialize = {
+            let transport = transport.clone();
+            tokio::spawn(async move { transport.ensure_initialized().await })
+        };
+        let entered = receiver.recv_timeout(Duration::from_secs(5)).is_ok();
+        if fault {
+            unsafe {
+                (calls.fault)(calls.host_ctx, std::ptr::null(), 0);
+            }
+        } else {
+            host.shutdown(Duration::from_millis(20)).await;
+        }
+        let flags = unsafe { calls.native_terminal_state.unwrap()(calls.host_ctx) };
+        // Release and await the actual opaque init worker before assertions.
+        unsafe {
+            *(*control).release.0.lock().unwrap() = true;
+            (*control).release.1.notify_all();
+        }
+        let initialized = tokio::time::timeout(Duration::from_secs(5), initialize)
+            .await
+            .unwrap();
+        host.shutdown(Duration::from_secs(5)).await;
+        drop(host);
+        let final_flags = unsafe { calls.native_terminal_state.unwrap()(calls.host_ctx) };
+        unsafe {
+            drop(Box::from_raw(control));
+        }
+        broker_task.abort();
+        let _ = broker_task.await;
+        assert!(entered);
+        assert!(initialized.is_ok_and(|result| result.is_err()));
+        assert_eq!(
+            factories(),
+            before,
+            "terminal authority must deny before the actual factory"
+        );
+        assert_ne!(
+            flags
+                & if fault {
+                    TB_NATIVE_TERMINAL_FAULT
+                } else {
+                    TB_NATIVE_TERMINAL_STOP_INTENT
+                },
+            0
+        );
+        assert_eq!(final_flags & TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0);
+    }
+}

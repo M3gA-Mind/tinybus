@@ -337,11 +337,27 @@ pub unsafe extern "C" fn tinybus_module_init_v1(
             });
         }
     }
+    if NEXT_FACTORY_MODE.load(Ordering::Acquire) == 30 {
+        let controls = *EARLY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(controls) = controls {
+            controls.emit(18, 0);
+        }
+    }
+    let factories_before = FACTORIES.load(Ordering::Acquire);
     let code = unsafe {
         tinybus_module::start_terminal_reconfigurable_module_with_factory::<Config, _, _>(
             host, out, 1, true, factory,
         )
     };
+    if FACTORIES.load(Ordering::Acquire) == factories_before {
+        EARLY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        NEXT_FACTORY_MODE.store(0, Ordering::Release);
+    }
     if code == TB_OK {
         *LATEST
             .lock()
