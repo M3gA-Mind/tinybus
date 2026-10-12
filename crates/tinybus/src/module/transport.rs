@@ -84,6 +84,8 @@ pub(crate) struct ModuleTransport {
     before_worker_lock: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     before_init_publication: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    after_cleanup_publication: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     // Native fixtures pass a borrowed controller through C config. Retain its
     // actual owner with the physical transport, including uncertain jobs.
     #[cfg(test)]
@@ -299,6 +301,8 @@ impl ModuleTransport {
             before_worker_lock: StdMutex::new(None),
             #[cfg(test)]
             before_init_publication: StdMutex::new(None),
+            #[cfg(test)]
+            after_cleanup_publication: StdMutex::new(None),
             #[cfg(test)]
             fixture_controller: StdMutex::new(None),
         });
@@ -1337,9 +1341,14 @@ impl PhysicalJob {
             }
             state.cleanup = CleanupState::Executing;
         }
+        let pending = NativeLifecyclePending::begin(&transport.native_lifecycle_pending);
         let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             transport.stop_sync(self.deadline)
         }));
+        // Completion is observable before this worker releases its lifecycle
+        // guard. Clear native activity first so a completed stop cannot leave
+        // enable/disable reporting that opaque work is still running.
+        drop(pending);
         let mut state = transport
             .context
             .physical
@@ -1356,6 +1365,17 @@ impl PhysicalJob {
         }
         drop(state);
         transport.notify_physical();
+        #[cfg(test)]
+        {
+            let hook = transport
+                .after_cleanup_publication
+                .lock()
+                .expect("cleanup publication test hook lock")
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         drop(guard);
     }
 }

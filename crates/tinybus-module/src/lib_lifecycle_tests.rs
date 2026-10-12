@@ -38,6 +38,7 @@ fn shutdown_releases_captured_callback_while_retaining_closed_tombstone() {
     let token = DropCounter(Arc::clone(&dropped));
     let runtime = tokio::runtime::Runtime::new().unwrap();
     let mut state = RuntimeState {
+        owner: None,
         inbound: StdMutex::new(None),
         host: HostCalls(host()),
         runtime: StdMutex::new(Some(runtime)),
@@ -110,6 +111,7 @@ fn shutdown_excludes_active_reinitializer_before_disposing_capture() {
     let (release, released) = std::sync::mpsc::channel();
     let released = StdMutex::new(released);
     let state = Arc::new(RuntimeState {
+        owner: None,
         inbound: StdMutex::new(None),
         host: HostCalls(host()),
         runtime: StdMutex::new(Some(tokio::runtime::Runtime::new().unwrap())),
@@ -153,6 +155,7 @@ fn shutdown_disposes_callback_even_after_reinitializer_panics() {
     let dropped = Arc::new(AtomicUsize::new(0));
     let token = DropCounter(Arc::clone(&dropped));
     let mut state = RuntimeState {
+        owner: None,
         inbound: StdMutex::new(None),
         host: HostCalls(host()),
         runtime: StdMutex::new(None),

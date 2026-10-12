@@ -1001,9 +1001,15 @@ async fn a_module_that_never_replies_times_out_the_caller_and_leaves_the_bus_usa
             "/ai/tinyhumans/module/Clock",
             "ai.tinyhumans.module.Clock",
         )
-        .unwrap()
-        .with_timeout(Duration::from_millis(20));
-    let error = proxy.call::<()>("Hang", ()).await.unwrap_err();
+        .unwrap();
+    // Only the deliberately unanswered call needs a short deadline. The
+    // recovery call crosses an OS thread and must tolerate CI scheduling.
+    let error = proxy
+        .clone()
+        .with_timeout(Duration::from_millis(20))
+        .call::<()>("Hang", ())
+        .await
+        .unwrap_err();
     assert!(matches!(error, Error::Timeout { .. }), "{error}");
     assert_eq!(
         proxy.call::<String>("Echo", ("usable",)).await.unwrap(),

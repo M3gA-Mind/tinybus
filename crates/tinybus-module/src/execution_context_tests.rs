@@ -1,0 +1,113 @@
+//! Execution-context ownership across callers, workers and blocking tasks.
+use super::*;
+use std::sync::atomic::AtomicUsize;
+
+unsafe extern "C" fn log(ctx: *mut c_void, _: u32, _: *const u8, _: usize) {
+    unsafe { &*ctx.cast::<AtomicUsize>() }.fetch_add(1, Ordering::SeqCst);
+}
+unsafe extern "C" fn send(_: *mut c_void, _: *const u8, _: usize) -> i32 {
+    TB_OK
+}
+unsafe extern "C" fn wake(_: *mut c_void) {}
+unsafe extern "C" fn fault(_: *mut c_void, _: *const u8, _: usize) {}
+unsafe extern "C" fn ready(_: *mut c_void) {}
+fn owner() -> (ExecutionOwner, &'static AtomicUsize) {
+    let count = Box::leak(Box::new(AtomicUsize::new(0)));
+    let host = HostCalls(TbHostVtable {
+        size: std::mem::size_of::<TbHostVtable>() as u32,
+        _reserved: 0,
+        host_ctx: std::ptr::from_mut(count).cast(),
+        send,
+        wake,
+        log,
+        fault,
+        config: tinybus::module::abi::TbSlice {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        ready,
+        broker_routing: None,
+        native_terminal_state: None,
+    });
+    (ExecutionOwner::new(host), count)
+}
+#[test]
+fn nested_caller_scopes_restore_owner_and_stopped_context_never_uses_replacement() {
+    ExecutionOwner::install_panic_hook();
+    let (first, first_count) = owner();
+    let (second, second_count) = owner();
+    let outer = first.enter();
+    let parent = tracing::info_span!("parent");
+    let child = tracing::info_span!("child", value = tracing::field::Empty);
+    child.record("value", 42);
+    child.follows_from(parent.id());
+    {
+        let _entered = child.enter();
+    }
+    tracing::info!("first caller");
+    {
+        let _inner = second.enter();
+        tracing::info!("second caller");
+        let _ = std::panic::catch_unwind(|| panic!("private payload"));
+        assert_eq!(first_count.load(Ordering::SeqCst), 1);
+        assert_eq!(second_count.load(Ordering::SeqCst), 2);
+        assert!(second.panic_location.lock().unwrap().is_some());
+        assert!(first.panic_location.lock().unwrap().is_none());
+        second.stop();
+        tracing::info!("stopped caller");
+        let _ = std::panic::catch_unwind(|| panic!("private late payload"));
+        assert_eq!(second_count.load(Ordering::SeqCst), 2);
+    }
+    tracing::info!("first restored");
+    assert_eq!(first_count.load(Ordering::SeqCst), 2);
+    drop(outer);
+    assert!(OWNER.with(|slot| slot.borrow().is_none()));
+    tracing::info!("outside any module");
+    assert_eq!(first_count.load(Ordering::SeqCst), 2);
+    assert_eq!(second_count.load(Ordering::SeqCst), 2);
+}
+#[test]
+fn worker_blocking_and_block_on_contexts_use_their_own_runtime_callbacks() {
+    for _ in 0..2 {
+        let (owner, count) = owner();
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        builder.worker_threads(1).enable_all();
+        owner.configure(&mut builder);
+        let runtime = builder.build().unwrap();
+        {
+            let _caller = owner.enter();
+            runtime.block_on(async {
+                tracing::info!("block on caller");
+                runtime
+                    .spawn(async {
+                        tracing::info!("worker");
+                        tokio::task::spawn_blocking(|| tracing::info!("blocking worker"))
+                            .await
+                            .unwrap();
+                    })
+                    .await
+                    .unwrap();
+            });
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 3);
+        owner.stop();
+        runtime.shutdown_timeout(Duration::from_secs(1));
+        assert!(OWNER.with(|slot| slot.borrow().is_none()));
+    }
+}
+
+#[test]
+fn unowned_and_reentrant_panic_contexts_never_select_a_host_callback() {
+    ExecutionOwner::install_panic_hook();
+    let (owner, count) = owner();
+    assert!(std::panic::catch_unwind(|| panic!("unowned secret payload")).is_err());
+    {
+        let _guard = owner.enter();
+        OWNER.with(|slot| {
+            let _borrowed = slot.borrow_mut();
+            assert!(std::panic::catch_unwind(|| panic!("reentrant secret payload")).is_err());
+        });
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert!(owner.panic_location.lock().unwrap().is_none());
+}

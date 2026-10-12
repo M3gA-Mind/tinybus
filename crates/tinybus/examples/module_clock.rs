@@ -15,6 +15,7 @@ struct Clock {
 #[tinybus::interface(name = "ai.tinyhumans.openhuman.Clock")]
 impl Clock {
     async fn now(&self) -> Result<String> {
+        tracing::info!("clock fixture served");
         Ok(format!("{}{:?}", self.prefix, std::time::SystemTime::now()))
     }
 
