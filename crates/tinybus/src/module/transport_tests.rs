@@ -1306,3 +1306,41 @@ async fn unanswered_method_calls_are_not_physical_callback_leases() {
     assert_eq!(transport.inflight(), 1, "A87");
     assert!(transport.is_stopped(), "A88");
 }
+
+#[tokio::test]
+async fn abandoning_initiating_waiter_faults_and_retains_late_initializer_cleanup() {
+    let _lock = VTABLE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    SHUTDOWN_CODE.store(TB_OK, Ordering::Release);
+    SHUTDOWN_CALLS.store(0, Ordering::Release);
+    let (transport, host) = ModuleTransport::new("abandoned-init".into(), b"secret".to_vec());
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    transport.defer_initializer(host, move |host| {
+        entered_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+        assert_eq!(unsafe { std::slice::from_raw_parts(host.config.ptr, host.config.len) }, b"secret");
+        let mut module = TbModuleVtable::default();
+        assert_eq!(unsafe { initialize_ok(&host, &mut module) }, TB_OK);
+        Ok(module)
+    });
+    let waiter = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.ensure_initialized().await }
+    });
+    entered_rx.await.unwrap();
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    // Always release foreign work even on the unfixed implementation.
+    let faulted = transport.is_faulted();
+    release_tx.send(()).unwrap();
+    assert!(faulted, "initiating waiter abandonment must publish fault immediately");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if transport.is_stopped() { break; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert_eq!(SHUTDOWN_CALLS.load(Ordering::Acquire), 1);
+    assert!(transport.ensure_initialized().await.is_err());
+}
