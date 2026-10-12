@@ -361,6 +361,8 @@ async fn a_pending_call_is_failed_when_the_module_closes_its_delivery_queue() {
     assert_eq!(reply.header.kind, MessageKind::Error);
     assert!(transport.is_faulted());
     shutdown_entry().await;
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    wait_physical_cleanup(&transport).await;
     assert!(
         transport.is_stopped(),
         "a failed-delivery fixture must finish shutdown before reusing callback flags"
