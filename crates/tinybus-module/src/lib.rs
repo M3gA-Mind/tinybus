@@ -1530,6 +1530,8 @@ where
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retained_factory = Some(Box::new(setup.clone()));
         state.register(hooks);
+        #[cfg(test)]
+        state.startup_checkpoint_for_test(1);
         if !state.is_live() {
             return TB_CLOSED;
         }
@@ -1551,6 +1553,8 @@ where
             .setup = Some(Box::new(move |connection| {
             Box::pin(initial_setup(connection, config))
         }));
+        #[cfg(test)]
+        state.startup_checkpoint_for_test(2);
         let weak = Arc::downgrade(&state);
         let reinitializer: ReinitializeFactory = Box::new(move |handle, connection_slot| {
             Box::new(move |ptr, len| {
@@ -1656,6 +1660,8 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .reinitializer_factory = Some(reinitializer);
+        #[cfg(test)]
+        state.startup_checkpoint_for_test(3);
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         if let Some(owner) = &state.owner {
             owner.configure(&mut builder);
@@ -1673,6 +1679,8 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .runtime = Some(runtime);
+        #[cfg(test)]
+        state.startup_checkpoint_for_test(4);
         let (inbound_tx, inbound_rx) = mpsc::channel(MODULE_QUEUE_CAPACITY);
         state
             .resources
@@ -1688,6 +1696,8 @@ where
             },
             _owner: state.sdk_owner(),
         });
+        #[cfg(test)]
+        state.startup_checkpoint_for_test(5);
         let (handle, connection_slot, factory) = {
             let mut resources = state
                 .resources
@@ -1716,6 +1726,8 @@ where
         *callback_slot
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = callback;
+        #[cfg(test)]
+        state.startup_checkpoint_for_test(6);
         let task_state = state.clone();
         let task = handle.spawn(async move {
             let provenance = transport.inner.provenance.clone();
@@ -1785,7 +1797,11 @@ where
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .initial = Some(task);
+        #[cfg(test)]
+        state.startup_checkpoint_for_test(7);
         let context = state.context();
+        #[cfg(test)]
+        state.startup_checkpoint_for_test(8);
         state.mark_vtable_published();
         if capacity >= size_of::<TbModuleVtable>() as u32 {
             unsafe {

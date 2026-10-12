@@ -225,6 +225,8 @@ pub(super) struct TerminalState {
     vtable_published: AtomicBool,
     #[cfg(test)]
     reject_worker_spawn: AtomicBool,
+    #[cfg(test)]
+    startup_failure_stage: AtomicU8,
     lease: SlotLease,
     token: usize,
 }
@@ -312,6 +314,8 @@ impl TerminalState {
             vtable_published: AtomicBool::new(false),
             #[cfg(test)]
             reject_worker_spawn: AtomicBool::new(false),
+            #[cfg(test)]
+            startup_failure_stage: AtomicU8::new(0),
             lease: SlotLease {
                 admission: Arc::downgrade(admission),
                 index,
@@ -571,6 +575,16 @@ impl TerminalState {
             TB_CLOSED
         } else {
             control.construction_code
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn reject_startup_for_test(&self, stage: u8) {
+        self.startup_failure_stage.store(stage, Ordering::Release);
+    }
+    #[cfg(test)]
+    pub(super) fn startup_checkpoint_for_test(&self, stage: u8) {
+        if self.startup_failure_stage.load(Ordering::Acquire) == stage {
+            panic!("controlled startup failure after transfer stage {stage}");
         }
     }
     #[cfg(test)]
