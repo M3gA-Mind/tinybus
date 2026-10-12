@@ -49,7 +49,6 @@ struct HostContext {
     inflight: AtomicUsize,
 }
 
-/// The broker-facing side of one loaded module.
 /// Admission errors remain faults; cancellation preserves an already committed
 /// ordinary stop. Neither classification can clear a real, sticky Fault.
 #[derive(Clone, Copy)]
@@ -58,6 +57,7 @@ pub(crate) enum AdmissionTermination {
     Canceled,
 }
 
+/// The broker-facing side of one loaded module.
 pub(crate) struct ModuleTransport {
     self_ref: Weak<ModuleTransport>,
     module: StdMutex<Option<TbModuleVtable>>,

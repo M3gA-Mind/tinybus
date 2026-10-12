@@ -142,6 +142,11 @@ pub struct HostCallbackBinding {
     connection: Connection,
     state: Arc<CallbackState>,
     transport: Arc<MemoryTransport>,
+    // Bounded test observers only; neither hook supplies production authority.
+    #[cfg(test)]
+    after_attach: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_load_decision: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Outgoing operations on the binding's private connection.
@@ -433,6 +438,10 @@ impl ModuleHost {
             broker: self.inner.broker.clone(),
             connection,
             transport,
+            #[cfg(test)]
+            after_attach: Mutex::new(None),
+            #[cfg(test)]
+            before_load_decision: Mutex::new(None),
             state: Arc::new(CallbackState {
                 destination,
                 endpoints,
@@ -546,6 +555,11 @@ impl ModuleHost {
                 },
             )?;
             rollback.transport = Some(transport.clone());
+            #[cfg(test)]
+            {
+                let observer = binding.after_attach.lock().expect("test attach observer").take();
+                if let Some(observer) = observer { observer(); }
+            }
             let mut loaded = self.inner.loaded.lock().expect("module list lock");
             let module = loaded
                 .iter_mut()
@@ -595,6 +609,13 @@ impl ModuleHost {
         };
         if let Some(cause) = failure {
             rollback.cause = cause;
+        }
+        #[cfg(test)]
+        {
+            let observer = binding.before_load_decision.lock().expect("test decision observer").take();
+            if let Some(observer) = observer { observer(); }
+        }
+        if let Some(cause) = failure {
             let fault = transport.commit_admission_termination(cause);
             binding.revoke();
             transport.request_terminal(fault);

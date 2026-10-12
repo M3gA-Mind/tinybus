@@ -72,12 +72,14 @@ pub unsafe extern "C" fn tinybus_module_init_v1(
     // The public loader serializes JSON. This declared test fixture accepts the
     // same finite Controls bytes in a JSON array, without product-side seams.
     let encoded;
+    let mut ready = false;
     let bytes = if copied_config.len() == size_of::<Controls>() {
         &copied_config
     } else {
         let Ok(value) = serde_json::from_slice::<serde_json::Value>(&copied_config) else {
             return TB_BAD_ARGUMENT;
         };
+        ready = value.get("test_ready").and_then(serde_json::Value::as_bool).unwrap_or(false);
         let Some(value) = value.get("test_controls") else {
             return TB_BAD_ARGUMENT;
         };
@@ -123,6 +125,10 @@ pub unsafe extern "C" fn tinybus_module_init_v1(
             shutdown,
             reinitialize: Some(reinitialize),
         };
+    }
+    if ready {
+        // Actual opaque initialization emits Ready; tests never fabricate it.
+        unsafe { (host.ready)(host.host_ctx); }
     }
     TB_OK
 }
