@@ -1073,7 +1073,7 @@ async fn queued_readiness_and_backpressure_retire_before_actual_shutdown_returns
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn actual_signal_callback_is_drained_despite_stop_timeout_and_cancellation() {
+async fn actual_signal_callback_is_drained_despite_stop_timeout() {
     let _lock = VTABLE_TEST_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
@@ -1202,4 +1202,107 @@ async fn backpressure_retry_closes_without_fault_while_actual_shutdown_is_blocke
     assert!(!transport.is_faulted(), "A54");
     SHUTDOWN_BLOCKED.store(false, Ordering::Release);
     stopping.await.expect("A55").expect("A56");
+}
+
+#[tokio::test]
+async fn a_reserved_native_entry_cannot_start_after_teardown_even_if_stop_caller_is_cancelled() {
+    let _lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let _release = ShutdownRelease;
+    SHUTDOWN_BLOCKED.store(true, Ordering::Release);
+    SHUTDOWN_ENTERED.store(false, Ordering::Release);
+    SHUTDOWN_CALLS.store(0, Ordering::Release);
+    DELIVERIES.store(0, Ordering::Release);
+    let (transport, host) = ModuleTransport::new("reserved-admission".into(), vec![]);
+    transport.defer_initialize(initialize_ok, host);
+    transport.ensure_initialized().await.expect("A61");
+    // Pause at the real check-to-native-entry boundary: the reservation already
+    // belongs to the callback caller, but native entry has not happened yet.
+    let lease = transport.callbacks.enter().expect("A62");
+    let stopping = tokio::spawn(transport.clone().stop(Duration::from_secs(2)));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !transport.admission_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("A63");
+    stopping.abort();
+    assert!(stopping.await.expect_err("A64").is_cancelled(), "A65");
+    assert!(!SHUTDOWN_ENTERED.load(Ordering::Acquire), "A66");
+    assert!(!transport.is_stopped(), "A67");
+    assert!(transport.callbacks.enter().is_err(), "A68");
+    assert!(
+        matches!(
+            transport.ensure_initialized().await,
+            Err(Error::ConnectionClosed)
+        ),
+        "A69"
+    );
+    assert!(
+        matches!(
+            transport.reinitialize(crate::Secret::new(vec![])).await,
+            Err(Error::ConnectionClosed)
+        ),
+        "A70"
+    );
+    assert!(
+        matches!(
+            transport.clone().stop(Duration::from_millis(10)).await,
+            Err(StopError::NotStarted(_))
+        ),
+        "A71"
+    );
+    // An admitted callback can still enter before teardown; shutdown must wait
+    // for its physical exit, even after the outer stop future disappears.
+    let module = *transport.module.lock().expect("A72");
+    let module = module.expect("A73");
+    let bytes = serde_json::to_vec(&call()).expect("A74");
+    assert_eq!(
+        unsafe { (module.deliver)(module.module_ctx, bytes.as_ptr(), bytes.len()) },
+        TB_OK,
+        "A75"
+    );
+    assert!(!SHUTDOWN_ENTERED.load(Ordering::Acquire), "A76");
+    drop(lease);
+    shutdown_entry().await;
+    assert_eq!(DELIVERIES.load(Ordering::Acquire), 1, "A77");
+    assert_eq!(SHUTDOWN_CALLS.load(Ordering::Acquire), 1, "A78");
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    let _completed = tokio::time::timeout(Duration::from_secs(2), transport.lifecycle.lock())
+        .await
+        .expect("A79");
+    assert!(transport.is_stopped(), "A80");
+    assert!(!transport.is_faulted(), "A81");
+}
+
+#[tokio::test]
+async fn unanswered_method_calls_are_not_physical_callback_leases() {
+    let _lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let _release = ShutdownRelease;
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    let (transport, host) = ModuleTransport::new("unanswered".into(), vec![]);
+    transport.defer_initialize(initialize_ok, host);
+    transport.ensure_initialized().await.expect("A82");
+    unsafe {
+        (host.ready)(host.host_ctx);
+    }
+    transport.send(call()).await.expect("A83");
+    assert_eq!(transport.inflight(), 1, "A84");
+    assert_eq!(
+        transport
+            .clone()
+            .stop(Duration::from_secs(2))
+            .await
+            .expect("A85"),
+        TB_OK,
+        "A86"
+    );
+    assert_eq!(transport.inflight(), 1, "A87");
+    assert!(transport.is_stopped(), "A88");
 }

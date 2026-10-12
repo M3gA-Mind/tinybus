@@ -64,6 +64,17 @@ separate copy of Tokio's thread-locals, so it cannot borrow the host runtime.
 The host-to-module `deliver` callback only performs a bounded `try_send` and
 never blocks a host thread. Queue capacity is reported as backpressure and the
 host retries after the module's `wake` callback.
+Before shutdown, the physical lifecycle owner closes initialization and delivery
+admission and discards queued messages. It then waits for every reserved
+`deliver` callback to return before entering the opaque shutdown callback.
+Each backpressure retry requires a new reservation. This barrier covers actual
+callback execution, including signals; it does not wait for unanswered method
+calls or detached module work. A caller timeout or cancellation retains the
+physical worker, callback reservations, and lifecycle lock. A callback that
+never returns prevents teardown rather than allowing shutdown underneath it.
+Ordinary admission closure is distinct from a module fault and from physical
+shutdown completion. An already reported Ready snapshot remains until physical
+completion; late `ready` callbacks cannot reopen admission.
 The symmetric module-to-host `send` callback applies bounded backpressure by
 blocking the calling module thread until host queue capacity is available.
 Modules must not call it from a thread that has to remain responsive.
