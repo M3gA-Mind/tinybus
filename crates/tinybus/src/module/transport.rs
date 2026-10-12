@@ -353,6 +353,7 @@ impl ModuleTransport {
     /// Publish physical completion only after the opaque shutdown returns.
     fn finish_stop(&self) {
         self.context.stopped.store(true, Ordering::Release);
+        self.context.inbound.lock().expect("host inbound lock").take();
         self.context.init_notify.notify_waiters();
         self.context.ready_notify.notify_waiters();
         self.context.wake.notify_waiters();
@@ -521,7 +522,7 @@ impl ModuleTransport {
         }
         self.notify_physical();
         drop(guard);
-        if result.is_err() { self.request_terminal(true); }
+        if result.is_err() { self.request_terminal(true); return result; }
         if self.is_faulted() || self.admission_closed() { return Err(Error::ConnectionClosed); }
         result
     }
@@ -673,7 +674,8 @@ impl ModuleTransport {
                         if self.admission_closed() {
                             return Err(Error::ConnectionClosed);
                         }
-                        self.context.faulted.store(true, Ordering::Release);
+                        drop(_pending);
+                        self.request_terminal(true);
                         self.context.ready_notify.notify_waiters();
                         self.context
                             .inbound
@@ -772,7 +774,7 @@ impl ModuleTransport {
                 }
             }
         }
-        self.context.faulted.store(true, Ordering::Release);
+        self.request_terminal(true);
         self.context.ready_notify.notify_waiters();
         self.context
             .inbound
@@ -998,6 +1000,7 @@ impl Transport for ModuleTransport {
                 self.context.init_failed.store(true, Ordering::Release);
                 self.context.faulted.store(true, Ordering::Release);
             }
+            self.request_terminal(true);
             self.context.ready_notify.notify_waiters();
             if message.header.kind == MessageKind::MethodCall {
                 let error = Error::ModuleUnavailable {

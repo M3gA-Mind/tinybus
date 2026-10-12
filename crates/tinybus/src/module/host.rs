@@ -1020,8 +1020,9 @@ impl ModuleHost {
             transport.defer_initialize(artifact.init, host_vtable);
         } else {
             admitted.state = ModuleState::Initializing;
-            if transport.eager_initialize(artifact.init, host_vtable).is_err() {
-                let error = Error::module_refused(path, "module initialization failed");
+            if let Err(failure) = transport.eager_initialize(artifact.init, host_vtable) {
+                let reason = if failure.to_string().contains("vtable") { "module returned an invalid vtable" } else { "module initialization failed" };
+                let error = Error::module_refused(path, reason);
                 self.record_manifest_rejection(&error, manifest, RefusalClass::Failed);
                 return Err(error);
             }
