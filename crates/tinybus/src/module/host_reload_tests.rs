@@ -225,14 +225,7 @@ fn native_log_fixture_recovers_poison_without_unwinding_across_abi() {
             panic!("controlled Rust fixture poison");
         });
         let line = b"actual ABI callback after fixture poison";
-        unsafe {
-            observe_log(
-                1usize as *mut std::ffi::c_void,
-                1,
-                line.as_ptr(),
-                line.len(),
-            )
-        };
+        unsafe { observe_log(key as *mut std::ffi::c_void, 1, line.as_ptr(), line.len()) };
     }
     let recorded = LOGS.get().and_then(|logs| {
         logs.lock()
