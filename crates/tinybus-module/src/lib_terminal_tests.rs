@@ -115,6 +115,9 @@ mod controlled {
     #[derive(serde::Deserialize)]
     pub struct Config {
         pub mode: u8,
+        #[serde(default, deserialize_with = "parse_gate")]
+        #[serde(rename = "parse_gate")]
+        _parse_gate: bool,
         #[serde(default)]
         record_drop: bool,
         #[serde(skip, default = "config_fixture")]
@@ -124,6 +127,18 @@ mod controlled {
         StdMutex::new(std::sync::Weak::new());
     fn config_fixture() -> std::sync::Weak<Fixture> {
         CONFIG_FIXTURE.lock().unwrap().clone()
+    }
+    fn parse_gate<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<bool, D::Error> {
+        let enabled = <bool as serde::Deserialize>::deserialize(deserializer)?;
+        if enabled {
+            let fixture = config_fixture().upgrade().unwrap();
+            let barrier = fixture.config_parse_control.lock().unwrap().take().unwrap();
+            fixture.events.send(Event::ConfigParsing).unwrap();
+            barrier.wait();
+        }
+        Ok(enabled)
     }
     impl Drop for Config {
         fn drop(&mut self) {
@@ -147,6 +162,7 @@ mod controlled {
         Request,
         FutureDrop(String),
         ConfigDrop(String),
+        ConfigParsing,
         Finish,
         FactoryDrop(String),
     }
@@ -158,6 +174,7 @@ mod controlled {
         pub requests: AtomicUsize,
         pub joins: AtomicUsize,
         pub config_drops: AtomicUsize,
+        pub config_parse_control: StdMutex<Option<Arc<std::sync::Barrier>>>,
         pub drop_off_lock: AtomicBool,
         pub request_off_lock: AtomicBool,
         pub future_drop_control: StdMutex<Option<(Arc<std::sync::Barrier>, bool)>>,
@@ -174,6 +191,7 @@ mod controlled {
             requests: AtomicUsize::new(0),
             joins: AtomicUsize::new(0),
             config_drops: AtomicUsize::new(0),
+            config_parse_control: StdMutex::new(None),
             drop_off_lock: AtomicBool::new(true),
             request_off_lock: AtomicBool::new(true),
             future_drop_control: StdMutex::new(None),
@@ -1187,4 +1205,76 @@ async fn accepted_reinit_config_is_destroyed_on_physical_worker_including_constr
         );
         assert_eq!(fixture.joins.load(Ordering::SeqCst), 1);
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_during_reinit_parse_retains_received_config_until_physical_cleanup() {
+    let _serial = controlled::TEST_LOCK.lock().await;
+    let (fixture, events) = controlled::fixture();
+    let broker = tinybus::broker::Broker::new();
+    broker
+        .clone()
+        .spawn(tinybus::transport::memory::MemoryBus::new());
+    let host = Arc::new(tinybus::module::ModuleHost::new(broker));
+    host.attach_linked_with_config(
+        controlled::linked_module().unwrap(),
+        serde_json::json!({"mode":0}),
+    )
+    .unwrap();
+    events.recv_timeout(Duration::from_secs(3)).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !host
+            .list()
+            .iter()
+            .any(|info| matches!(info.state, tinybus::module::ModuleState::Ready))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let release = Arc::new(std::sync::Barrier::new(2));
+    *fixture.config_parse_control.lock().unwrap() = Some(release.clone());
+    let caller_host = host.clone();
+    let caller = tokio::spawn(async move {
+        caller_host
+            .reinitialize(
+                "tinybus-module",
+                serde_json::json!({"mode":0,"record_drop":true,"parse_gate":true}),
+            )
+            .await
+    });
+    let entered = events.recv_timeout(Duration::from_secs(3)).unwrap();
+    let view = fixture.view.lock().unwrap().as_ref().unwrap().clone();
+    view.inner.signal(TerminalReason::Stop);
+    let drops_while_blocked = fixture.config_drops.load(Ordering::SeqCst);
+    let joins_while_blocked = fixture.joins.load(Ordering::SeqCst);
+    release.wait();
+    let result = caller.await.unwrap();
+    loop {
+        if matches!(
+            events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            controlled::Event::Finish
+        ) {
+            break;
+        }
+    }
+    host.shutdown(Duration::from_secs(8)).await;
+    let completion = view.inner.wait(Duration::from_secs(5));
+    let remainder: Vec<_> = events.try_iter().collect();
+    assert!(matches!(entered, controlled::Event::ConfigParsing));
+    assert_eq!(drops_while_blocked, 0);
+    assert_eq!(joins_while_blocked, 0);
+    assert!(result.is_err());
+    assert_eq!(completion, TerminalCompletion::PhysicallyStopped);
+    assert_eq!(fixture.config_drops.load(Ordering::SeqCst), 1);
+    assert!(remainder.iter().any(
+        |event| matches!(event, controlled::Event::ConfigDrop(name) if name == "tinybus-terminal")
+    ));
+    assert!(
+        !remainder
+            .iter()
+            .any(|event| matches!(event, controlled::Event::Poll(_)))
+    );
+    assert_eq!(fixture.joins.load(Ordering::SeqCst), 1);
 }
