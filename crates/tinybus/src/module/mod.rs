@@ -101,3 +101,9 @@ pub fn sha256_file(path: impl AsRef<std::path::Path>) -> crate::Result<String> {
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
+
+#[cfg(feature = "modules")]
+mod requirements;
+/// Host-selected activation requirements.
+#[cfg(feature = "modules")]
+pub use requirements::{ModuleRequirements, RequiredInterface};

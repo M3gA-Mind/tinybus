@@ -587,6 +587,56 @@ impl ModuleHost {
         self.load_file_pinned(path, config, None)
     }
 
+    /// Load an artifact only if its actual manifest satisfies host requirements.
+    ///
+    /// The actual loaded artifact is retained through activation. Lazy sidecars
+    /// are refused; an embedded lazy-init declaration remains supported and is
+    /// checked before its initializer is registered. This does not prevent
+    /// platform library constructors from running while loading trusted code.
+    ///
+    /// # Errors
+    ///
+    /// Returns a native admission error for unsafe files, provisional sidecars,
+    /// incompatible requirements, missing dependencies, or initialization failure.
+    /// No configuration callback runs on a requirements mismatch.
+    pub fn load_file_with_requirements(
+        &self,
+        path: impl AsRef<Path>,
+        config: serde_json::Value,
+        requirements: &super::ModuleRequirements,
+    ) -> Result<ModuleInfo> {
+        let path = path.as_ref();
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        check_directory(parent)?;
+        check_file(path)?;
+        // Sidecars are provisional declarations: this admission path needs the
+        // manifest and init pointer from the same actual loaded library.
+        if read_lazy_manifest(path)?.is_some() {
+            return Err(Error::module_refused(
+                path,
+                "required activation refuses lazy sidecars",
+            ));
+        }
+        let artifact = loader::load(path, self.inner.strict.load(Ordering::Acquire))?;
+        self.activate_required(path, artifact, config, requirements)
+    }
+
+    fn activate_required(
+        &self,
+        path: &Path,
+        artifact: LoadedArtifact,
+        config: serde_json::Value,
+        requirements: &super::ModuleRequirements,
+    ) -> Result<ModuleInfo> {
+        requirements.check(&artifact.manifest).map_err(|_| {
+            Error::module_refused(path, "artifact does not satisfy required module surface")
+        })?;
+        self.activate(path, artifact, config, None)
+    }
+
     /// [`ModuleHost::load_file_with_config`], carrying a digest the caller has
     /// already verified for an artifact that has no `modules.toml` beside it.
     ///
@@ -2649,3 +2699,7 @@ mod admission_tests;
 
 #[path = "host_callbacks.rs"]
 pub(crate) mod callbacks;
+
+#[cfg(test)]
+#[path = "host_required_tests.rs"]
+mod required_tests;
