@@ -74,6 +74,7 @@ fn host(config: &[u8]) -> TbHostVtable {
         },
         ready: host_ready,
         broker_routing: None,
+        native_terminal_state: None,
     }
 }
 
@@ -745,6 +746,7 @@ fn an_older_host_prefix_is_copied_without_reading_the_additive_tail() {
     let ptr = std::ptr::from_ref(&prefix).cast::<TbHostVtable>();
     let normalized = unsafe { TbHostVtable::read_compatible(ptr) }.unwrap();
     assert!(normalized.broker_routing.is_none());
+    assert!(normalized.native_terminal_state.is_none());
     assert_eq!(
         unsafe { parse_config::<serde_json::Value>(ptr) }.unwrap(),
         serde_json::json!({})
@@ -758,9 +760,12 @@ fn an_older_host_prefix_is_copied_without_reading_the_additive_tail() {
 #[test]
 fn an_incomplete_host_tail_never_reads_the_callback() {
     let mut current = host(b"{}");
-    current.size = size_of::<TbHostVtable>() as u32 - 1;
+    current.size = (std::mem::offset_of!(TbHostVtable, broker_routing)
+        + size_of::<Option<unsafe extern "C" fn(*mut c_void) -> u32>>()
+        - 1) as u32;
     let normalized = unsafe { TbHostVtable::read_compatible(&current) }.unwrap();
     assert!(normalized.broker_routing.is_none());
+    assert!(normalized.native_terminal_state.is_none());
     assert!(unsafe { TbHostVtable::read_compatible(std::ptr::null()) }.is_none());
     current.size = tinybus::module::abi::TB_HOST_VTABLE_BASE_SIZE - 1;
     assert!(unsafe { TbHostVtable::read_compatible(&current) }.is_none());

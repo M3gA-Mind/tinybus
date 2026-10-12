@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::message::Header;
+use crate::module::transport::AdmissionTermination;
 use crate::transport::memory::MemoryTransport;
 use crate::{CallContext, Connection, Interface, InterfaceName, MemberName, ObjectPath};
 use async_trait::async_trait;
@@ -146,6 +147,13 @@ pub struct HostCallbackBinding {
     connection: Connection,
     state: Arc<CallbackState>,
     transport: Arc<MemoryTransport>,
+    // Bounded test observers only; neither hook supplies production authority.
+    #[cfg(test)]
+    after_attach: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    fixture_controller: Mutex<Option<Arc<dyn Send + Sync>>>,
+    #[cfg(test)]
+    before_load_decision: Mutex<Option<(Arc<Notify>, tokio::sync::oneshot::Receiver<()>)>>,
 }
 
 /// Outgoing operations on the binding's private connection.
@@ -437,6 +445,12 @@ impl ModuleHost {
             broker: self.inner.broker.clone(),
             connection,
             transport,
+            #[cfg(test)]
+            after_attach: Mutex::new(None),
+            #[cfg(test)]
+            fixture_controller: Mutex::new(None),
+            #[cfg(test)]
+            before_load_decision: Mutex::new(None),
             state: Arc::new(CallbackState {
                 destination,
                 endpoints,
@@ -495,6 +509,7 @@ impl ModuleHost {
             host: self,
             transport: None,
             committed: false,
+            cause: AdmissionTermination::Failed,
         };
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -532,6 +547,19 @@ impl ModuleHost {
             let fingerprint = callback_config_fingerprint(&bytes);
             drop(config);
             let (transport, host) = ModuleTransport::new(admitted.name.clone(), bytes);
+            #[cfg(test)]
+            {
+                // Transfer the fixture config borrow before C can enter, so
+                // setup unwind and loader cancellation retain the same owner.
+                *transport
+                    .fixture_controller
+                    .lock()
+                    .expect("fixture controller lock") = binding
+                    .fixture_controller
+                    .lock()
+                    .expect("fixture controller lock")
+                    .take();
+            }
             transport.pause_initialization();
             transport.defer_initialize(artifact.init, host);
             let name = admitted.name.clone();
@@ -549,6 +577,17 @@ impl ModuleHost {
                 },
             )?;
             rollback.transport = Some(transport.clone());
+            #[cfg(test)]
+            {
+                let observer = binding
+                    .after_attach
+                    .lock()
+                    .expect("test attach observer")
+                    .take();
+                if let Some(observer) = observer {
+                    observer();
+                }
+            }
             let mut loaded = self.inner.loaded.lock().expect("module list lock");
             let module = loaded
                 .iter_mut()
@@ -582,18 +621,40 @@ impl ModuleHost {
             transport.release_initialization(true);
             transport
         };
+        // All setup operations above are genuine failures. From this point a
+        // dropped waiter is cancellation; actual init error/deadline is explicit.
+        rollback.cause = AdmissionTermination::Canceled;
         let initialized = transport.ensure_initialized().await;
-        let ready = if initialized.is_ok() {
-            tokio::time::timeout(Duration::from_secs(5), transport.wait_ready())
-                .await
-                .is_ok()
-                && transport.is_ready()
-        } else {
-            false
+        let failure = match initialized {
+            Err(Error::ConnectionClosed) => Some(AdmissionTermination::Canceled),
+            Err(_) => Some(AdmissionTermination::Failed),
+            Ok(()) => {
+                match tokio::time::timeout(Duration::from_secs(5), transport.wait_ready()).await {
+                    Err(_) => Some(AdmissionTermination::Failed),
+                    Ok(()) if !transport.is_ready() => Some(AdmissionTermination::Canceled),
+                    Ok(()) => None,
+                }
+            }
         };
-        if !ready {
+        if let Some(cause) = failure {
+            rollback.cause = cause;
+        }
+        #[cfg(test)]
+        {
+            let observer = binding
+                .before_load_decision
+                .lock()
+                .expect("test decision observer")
+                .take();
+            if let Some((entered, release)) = observer {
+                entered.notify_one();
+                release.await.expect("test decision observer released");
+            }
+        }
+        if let Some(cause) = failure {
+            let fault = transport.commit_admission_termination(cause);
             binding.revoke();
-            let _ = transport.stop_sync(Duration::ZERO);
+            transport.request_terminal(fault);
             let _ = transport.close().await;
             self.inner
                 .loaded
@@ -620,6 +681,7 @@ impl ModuleHost {
         // turn the returned successful snapshot into Faulted or Stopped.
         if lifetime.revoked
             || !lifetime.active
+            || transport.admission_closed()
             || !transport.is_ready()
             || !matches!(info.state, ModuleState::Ready)
         {
@@ -638,12 +700,17 @@ struct LoadRollback<'a> {
     host: &'a ModuleHost,
     transport: Option<Arc<ModuleTransport>>,
     committed: bool,
+    cause: AdmissionTermination,
 }
 impl Drop for LoadRollback<'_> {
     fn drop(&mut self) {
         if self.committed {
             return;
         }
+        let fault = self
+            .transport
+            .as_ref()
+            .map(|transport| transport.commit_admission_termination(self.cause));
         self.binding.revoke();
         self.binding.transport.close_outbound();
         self.binding
@@ -675,7 +742,7 @@ impl Drop for LoadRollback<'_> {
             }
             // A timed-out initializer may still run. Stop is best effort;
             // revocation/detach removes authority without claiming cessation.
-            let _ = transport.stop_sync(Duration::ZERO);
+            transport.request_terminal(fault.expect("rollback transport cause"));
             self.host
                 .inner
                 .loaded
@@ -688,12 +755,22 @@ impl Drop for LoadRollback<'_> {
 
 impl Drop for ModuleHostInner {
     fn drop(&mut self) {
-        for module in self.loaded.get_mut().expect("module list lock").iter() {
-            self.broker
-                .router
-                .lock()
-                .expect("router lock")
-                .revoke_callbacks_for_peer(&module.unique_name);
+        let modules = self.loaded.get_mut().expect("module list lock");
+        let transports: Vec<_> = modules
+            .iter()
+            .map(|module| module.transport.clone())
+            .collect();
+        for transport in &transports {
+            transport.commit_terminal(false);
+        }
+        {
+            let mut router = self.broker.router.lock().expect("router lock");
+            for module in modules.iter() {
+                router.revoke_callbacks_for_peer(&module.unique_name);
+            }
+        }
+        for transport in transports {
+            transport.request_terminal(false);
         }
     }
 }

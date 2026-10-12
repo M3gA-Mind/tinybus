@@ -3,6 +3,7 @@
 //! ABI revision one grows through optional vtable tails. Read the frozen prefix
 //! first and check its declared size before reading a tail; an older host has no
 //! broker-routing callback and therefore supplies no authenticated call context.
+//! Each optional field has its own complete-field size check.
 
 use std::ffi::c_void;
 
@@ -27,6 +28,22 @@ pub const TB_PANICKED: i32 = -3;
 pub const TB_TIMEOUT: i32 = -4;
 /// A pointer, length, or frame was invalid.
 pub const TB_BAD_ARGUMENT: i32 = -5;
+
+/// Exactly this value permits native per-instance admission. Zero, unknown
+/// bits, or any combination with terminal bits must deny admission. A sampled
+/// value is not a reusable permit for a later operation.
+pub const TB_NATIVE_TERMINAL_LIVE: u32 = 1;
+/// Terminal stop intent; once committed, the instance can never become live.
+pub const TB_NATIVE_TERMINAL_STOP_INTENT: u32 = 2;
+/// Actual fault intent, with public fault state taking precedence over stop.
+pub const TB_NATIVE_TERMINAL_FAULT: u32 = 4;
+/// An accepted opaque shutdown callback actually returned TB_OK. Fault and
+/// stop intent remain set and continue to deny admission even with this bit.
+/// A legacy callback's TB_OK alone proves neither independent worker completion
+/// nor receiver backing destruction. For native terminal hooks, TB_OK must
+/// additionally require actual worker/resource finish without sticky uncertainty
+/// or fault; that stronger module contract is separate from this host evidence.
+pub const TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED: u32 = 8;
 
 /// Revision-one module initialization entrypoint.
 pub type TbModuleInit = unsafe extern "C" fn(*const TbHostVtable, *mut TbModuleVtable) -> i32;
@@ -166,6 +183,25 @@ pub struct TbHostVtable {
     /// The SDK trusts this callback under the unsafe module-init host contract;
     /// it is not authentication of arbitrary user-provided C vtables.
     pub broker_routing: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+    /// Optional live query for this native module instance, read only when
+    /// `size` covers this entire field. Absence means unsupported and must deny
+    /// native admission. Only exactly [`TB_NATIVE_TERMINAL_LIVE`] permits it;
+    /// zero, unknown bits, combined values and terminal flags deny. Terminal
+    /// intent is monotonic and must never return to Live.
+    ///
+    /// Modules copy this callback and `host_ctx`, never retain the borrowed
+    /// vtable or config storage. The host must keep the copied callback and
+    /// context valid and thread-safe for every retained view use, including
+    /// independent workers after runtime shutdown and host destruction. A
+    /// destroyed host leaves a terminal tombstone, never recycles or reopens
+    /// this context. Custom unsafe hosts must truthfully uphold this contract;
+    /// the SDK cannot authenticate an arbitrary in-process C host.
+    ///
+    /// Query success linearizes admission only; it neither grants publication
+    /// authority nor cancels an operation already admitted before later intent.
+    /// The SDK's existing process-lifetime context retention is unbounded;
+    /// this optional callback adds no aggregate resource bound.
+    pub native_terminal_state: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
 }
 
 /// Size required from an older host before reading its frozen prefix.
@@ -176,12 +212,16 @@ impl TbHostVtable {
     ///
     /// Returns `None` for a null pointer or a size below
     /// [`TB_HOST_VTABLE_BASE_SIZE`]. A prefix-only or incomplete-tail host is
-    /// accepted with `broker_routing: None`; only a full tail is copied.
+    /// accepted. Each absent or incomplete optional callback normalizes to
+    /// `None`, independently of any later tail field.
     ///
     /// # Safety
     /// A non-null `host` must be aligned and readable for its first size field
     /// and every byte that size declares. Its callbacks must be valid and
-    /// thread-safe, and their context must outlive the module runtime. An
+    /// thread-safe, and their context must outlive the module runtime. If
+    /// `native_terminal_state` is supplied, its copied callback and context
+    /// must remain valid for every retained view use, even after runtime
+    /// shutdown or host destruction, as documented on that field. An
     /// affirmative routing callback (returning exactly 1) must truthfully
     /// guarantee exclusive broker delivery at the time each frame is queued.
     #[doc(hidden)]
@@ -190,8 +230,17 @@ impl TbHostVtable {
             return None;
         }
         let base = unsafe { host.cast::<TbHostVtableV1Prefix>().read() };
-        let broker_routing = if base.size as usize >= size_of::<Self>() {
-            unsafe { std::ptr::addr_of!((*host).broker_routing).read() }
+        let query_size = size_of::<Option<unsafe extern "C" fn(*mut c_void) -> u32>>();
+        let broker_routing =
+            if base.size as usize >= std::mem::offset_of!(Self, broker_routing) + query_size {
+                unsafe { std::ptr::addr_of!((*host).broker_routing).read() }
+            } else {
+                None
+            };
+        let native_terminal_state = if base.size as usize
+            >= std::mem::offset_of!(Self, native_terminal_state) + query_size
+        {
+            unsafe { std::ptr::addr_of!((*host).native_terminal_state).read() }
         } else {
             None
         };
@@ -206,6 +255,7 @@ impl TbHostVtable {
             config: base.config,
             ready: base.ready,
             broker_routing,
+            native_terminal_state,
         })
     }
 }

@@ -1870,6 +1870,9 @@ fn module_host_helpers_preserve_safe_names_states_and_allowlist_decisions() {
     let _ = ModuleHost::new(Broker::new()).load_search_paths();
 
     let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    // Files inherit the private DACL, so these assertions exercise content gates.
+    #[cfg(windows)]
+    crate::module::cache::secure_release_cache(directory.path(), directory.path());
     let module = directory.path().join(if cfg!(windows) {
         "clock.dll"
     } else if cfg!(target_os = "macos") {
@@ -1929,6 +1932,9 @@ fn module_host_helpers_preserve_safe_names_states_and_allowlist_decisions() {
 #[test]
 fn an_allowlist_with_a_mismatched_hash_refuses_the_file() {
     let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    // Files inherit the private DACL, so these assertions exercise content gates.
+    #[cfg(windows)]
+    crate::module::cache::secure_release_cache(directory.path(), directory.path());
     let extension = if cfg!(windows) {
         "dll"
     } else if cfg!(target_os = "macos") {
@@ -2197,7 +2203,7 @@ async fn one_refused_module_does_not_stop_the_others_in_the_directory_from_loadi
 /// tracing subscriber inside the library, so initializing the same DLL path
 /// twice shares state even across independent hosts. Windows staging uses the
 /// release-cache ACL repair so the real admission gate remains in force.
-fn staged_module(artifact: &Path, hash: &str) -> (tempfile::TempDir, PathBuf) {
+pub(super) fn staged_module(artifact: &Path, hash: &str) -> (tempfile::TempDir, PathBuf) {
     // Staged beside the artifact rather than in `/tmp`: the loader refuses a
     // directory another user could write to, and `/tmp` is exactly that. The
     // artifact's own directory is user-owned (CI builds into
@@ -2892,4 +2898,373 @@ impl crate::Interface for NativeBlockingCallback {
         self.published.fetch_add(1, Ordering::SeqCst);
         Ok(serde_json::json!(context.authenticated_sender().unwrap()))
     }
+}
+
+static BLOCKING_STOP_RECEIVER: OnceLock<StdMutex<Option<std::sync::mpsc::Receiver<()>>>> =
+    OnceLock::new();
+static BLOCKING_STOP_STARTED: AtomicBool = AtomicBool::new(false);
+static BLOCKING_STOP_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn blocking_shutdown(_: *mut std::ffi::c_void, _: u64) -> i32 {
+    BLOCKING_STOP_CALLS.fetch_add(1, Ordering::AcqRel);
+    BLOCKING_STOP_STARTED.store(true, Ordering::Release);
+    if let Some(receiver) = BLOCKING_STOP_RECEIVER
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .expect("H00")
+        .take()
+    {
+        let _ = receiver.recv();
+    }
+    TB_OK
+}
+unsafe extern "C" fn blocking_shutdown_init(
+    host: *const crate::module::abi::TbHostVtable,
+    out: *mut TbModuleVtable,
+) -> i32 {
+    let code = unsafe { lazy_echo_init(host, out) };
+    if code == TB_OK {
+        unsafe {
+            (*out).shutdown = blocking_shutdown;
+        }
+    }
+    code
+}
+struct StopRelease(Option<std::sync::mpsc::SyncSender<()>>);
+impl Drop for StopRelease {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+#[tokio::test]
+async fn ordinary_stop_never_fabricates_faulted_before_or_after_callback_completion() {
+    let _test_guard = FAKE_MODULE_TEST_LOCK.lock().await;
+    let bus = MemoryBus::new();
+    let broker = Broker::new();
+    let broker_task = broker.spawn(bus.clone());
+    let host = ModuleHost::new(broker);
+    let observer = Connection::connect(bus.connect().await.expect("H18"))
+        .await
+        .expect("H19");
+    let mut state_changes = observer
+        .add_match(
+            crate::router::MatchRule::parse(
+                "type=signal,interface=ai.tinyhumans.tinybus.Bus,member=ModuleStateChanged",
+            )
+            .expect("H20"),
+        )
+        .await
+        .expect("H21");
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let release = StopRelease(Some(sender));
+    *BLOCKING_STOP_RECEIVER
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .expect("H01") = Some(receiver);
+    BLOCKING_STOP_STARTED.store(false, Ordering::Release);
+    BLOCKING_STOP_CALLS.store(0, Ordering::Release);
+    unsafe {
+        host.attach_raw(
+            "clock.so",
+            TbAbiDescriptor::current("clock", "0.1.0"),
+            manifest(),
+            blocking_shutdown_init,
+        )
+    }
+    .expect("H02");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while host.list()[0].state != ModuleState::Ready {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("H03");
+    let inner = host.inner.clone();
+    let stopping =
+        tokio::spawn(async move { inner.stop("clock", Duration::from_millis(100)).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !BLOCKING_STOP_STARTED.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("H04");
+    assert!(stopping.await.expect("H05").is_err(), "H06");
+    assert_eq!(host.list()[0].state, ModuleState::Ready, "H07");
+    let retry = host.inner.stop("clock", Duration::from_millis(10)).await;
+    assert!(matches!(retry, Err(Error::MethodFailed { .. })), "H08");
+    assert_eq!(BLOCKING_STOP_CALLS.load(Ordering::Acquire), 1, "H09");
+    // Hold the host observer's lock while the blocking callback returns. The
+    // real broker cannot commit peer detach until this assertion is finished.
+    // No await occurs under this lock, and the opaque callback needs no host lock.
+    {
+        let loaded = host.inner.loaded.lock().expect("H10");
+        drop(release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while loaded[0].transport.is_ready() {
+            assert!(std::time::Instant::now() < deadline, "H11");
+            std::thread::yield_now();
+        }
+        assert!(!loaded[0].transport.is_faulted(), "H12");
+        // A disposed transport refuses a retry immediately, before any new
+        // physical task or marker change, even while detach is held back.
+        let mut retry = std::pin::pin!(loaded[0].transport.clone().stop(Duration::from_secs(1)));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            matches!(
+                std::future::Future::poll(retry.as_mut(), &mut context),
+                std::task::Poll::Ready(Err(StopError::NotStarted(Error::ConnectionClosed)))
+            ),
+            "H15"
+        );
+        assert!(loaded[0].transport.stop_task_spawned(), "H16");
+        assert_eq!(BLOCKING_STOP_CALLS.load(Ordering::Acquire), 1, "H17");
+        assert!(
+            !matches!(
+                loaded[0].snapshot().state,
+                ModuleState::Faulted { .. } | ModuleState::Failed { .. }
+            ),
+            "H13"
+        );
+    }
+    // This is a current-thread runtime. Without an await or yield after dropping
+    // the loaded lock, the broker cannot process its ready detach task before
+    // this real Host retry completes synchronously against the closed transport.
+    {
+        let mut retry = std::pin::pin!(host.inner.stop("clock", Duration::from_secs(1)));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            matches!(
+                std::future::Future::poll(retry.as_mut(), &mut context),
+                std::task::Poll::Ready(Err(Error::ConnectionClosed))
+            ),
+            "H22"
+        );
+    }
+    let origin = host.inner.loaded.lock().expect("H23")[0]
+        .transition_from
+        .clone();
+    assert!(matches!(origin, Some(ModuleState::Ready)), "H24");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while host.list()[0].state != ModuleState::Stopped {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("H14");
+    let stopped_event = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let message = state_changes.recv().await.expect("H25");
+            if message.body.get(2).and_then(serde_json::Value::as_str) == Some("stopped") {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("H26");
+    assert!(
+        stopped_event.body == serde_json::json!(["clock", "ready", "stopped", null]),
+        "H27"
+    );
+    broker_task.abort();
+}
+
+async fn controlled_native_transport() -> (
+    Arc<ModuleTransport>,
+    crate::module::abi::TbHostVtable,
+    Arc<super::super::transport::tests::NativeBarrier>,
+    LoadedArtifact,
+    PathBuf,
+) {
+    let (transport, view, init, barrier) = super::super::transport::tests::native_fixture();
+    barrier.state.lock().unwrap().1 = true;
+    transport.defer_initialize(init, view);
+    transport.ensure_initialized().await.unwrap();
+    barrier.entered.notified().await;
+    let path = PathBuf::from(std::env::var_os("TINYBUS_TEST_CONTROLLED_INIT_MODULE").unwrap());
+    let artifact = loader::load(&path, false).unwrap();
+    (transport, view, barrier, artifact, path)
+}
+
+fn attach_controlled_native(
+    host: &ModuleHost,
+    transport: Arc<ModuleTransport>,
+    artifact: LoadedArtifact,
+    path: &Path,
+) -> Result<ModuleInfo> {
+    let mut admitted = host.validate(path, &artifact.descriptor, &artifact.manifest)?;
+    admitted.state = ModuleState::Initializing;
+    host.attach_transport(
+        path,
+        admitted,
+        artifact.manifest,
+        transport,
+        Activation {
+            lazy_init: false,
+            lazy_load: false,
+            descriptor_info: None,
+            pinned_sha256: None,
+        },
+    )
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_host_drop_keeps_terminal_tombstone_and_other_instance_live() {
+    let (transport, view, barrier, artifact, path) = controlled_native_transport().await;
+    let (other, other_view, other_barrier, _, _) = controlled_native_transport().await;
+    let host = ModuleHost::new(Broker::new());
+    attach_controlled_native(&host, transport.clone(), artifact, &path).unwrap();
+    drop(host);
+    assert_ne!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        1
+    );
+    assert_eq!(
+        unsafe { other_view.native_terminal_state.unwrap()(other_view.host_ctx) },
+        1
+    );
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified())
+        .await
+        .unwrap();
+    let stopped = transport.clone().stop(Duration::from_secs(2)).await;
+    assert!(matches!(stopped, Err(StopError::NotStarted(_))));
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        10
+    );
+    drop(transport);
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        10
+    );
+    other.request_terminal(false);
+    tokio::time::timeout(Duration::from_secs(2), other_barrier.joined.notified())
+        .await
+        .unwrap();
+    assert!(barrier.state.lock().unwrap().2);
+    assert!(other_barrier.state.lock().unwrap().2);
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_reservation_rollback_retains_one_cleanup_and_fault_tombstone() {
+    let (first, first_view, first_barrier, artifact, path) = controlled_native_transport().await;
+    let (rejected, view, barrier, other_artifact, _) = controlled_native_transport().await;
+    let host = ModuleHost::new(Broker::new());
+    attach_controlled_native(&host, first, artifact, &path).unwrap();
+    assert!(attach_controlled_native(&host, rejected.clone(), other_artifact, &path).is_err());
+    assert_ne!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        1
+    );
+    assert_eq!(
+        unsafe { first_view.native_terminal_state.unwrap()(first_view.host_ctx) },
+        1
+    );
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified())
+        .await
+        .unwrap();
+    let _observed = rejected.clone().stop(Duration::from_secs(2)).await;
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        14
+    );
+    assert!(rejected.ensure_initialized().await.is_err());
+    drop(rejected);
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        14
+    );
+    drop(host);
+    tokio::time::timeout(Duration::from_secs(2), first_barrier.joined.notified())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_fault_during_ordinary_stop_keeps_fault_state_and_single_join() {
+    let (transport, view, barrier, artifact, path) = controlled_native_transport().await;
+    let host = Arc::new(ModuleHost::new(Broker::new()));
+    let info = attach_controlled_native(&host, transport.clone(), artifact, &path).unwrap();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    *barrier.finish_gate.lock().unwrap() = Some(release_rx);
+    let stopping = tokio::spawn({
+        let host = host.clone();
+        async move {
+            host.inner
+                .stop_inner(&info.name, Duration::from_secs(2))
+                .await
+        }
+    });
+    barrier.joined.notified().await;
+    assert!(transport.stop_task_spawned());
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        2,
+        "joined worker is not yet successful opaque return"
+    );
+    unsafe {
+        (view.fault)(view.host_ctx, std::ptr::null(), 0);
+    }
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        6
+    );
+    release.send(()).unwrap();
+    let result = stopping.await.unwrap().unwrap();
+    assert!(
+        matches!(result.state, ModuleState::Faulted { .. }),
+        "late ordinary completion cannot replace actual fault"
+    );
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        14
+    );
+    assert!(barrier.state.lock().unwrap().2);
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_rejected_stop_submission_retains_guard_through_host_drop() {
+    let (transport, view, barrier, artifact, path) = controlled_native_transport().await;
+    let host = ModuleHost::new(Broker::new());
+    attach_controlled_native(&host, transport.clone(), artifact, &path).unwrap();
+    transport.reject_worker_spawn.store(true, Ordering::Release);
+    assert!(matches!(
+        transport.clone().stop(Duration::from_secs(1)).await,
+        Err(StopError::Started(_))
+    ));
+    let weak = Arc::downgrade(&transport);
+    drop(host);
+    drop(transport);
+    let retained = weak
+        .upgrade()
+        .expect("external anchor retains physical owner through real Host Drop");
+    assert!(retained.lifecycle_is_owned_for_test());
+    assert!(retained.stop_task_spawned());
+    assert!(!retained.is_faulted());
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        2
+    );
+    assert!(
+        !barrier.state.lock().unwrap().2,
+        "rejected submission is not physical completion"
+    );
+    retained.reject_worker_spawn.store(false, Ordering::Release);
+    retained.request_terminal(false);
+    assert!(
+        !barrier.state.lock().unwrap().2,
+        "Host Drop cannot refund and resubmit an uncertain owner"
+    );
+    // This one uncertain physical owner retains its actual controller.
+    // It makes no process-wide leak or backing-Drop claim.
+    let controller = Arc::downgrade(&barrier);
+    drop(barrier);
+    assert!(controller.upgrade().is_some());
 }

@@ -23,6 +23,7 @@ fn host() -> TbHostVtable {
         },
         ready,
         broker_routing: None,
+        native_terminal_state: None,
     }
 }
 struct DropCounter(Arc<AtomicUsize>);

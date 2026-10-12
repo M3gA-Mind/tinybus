@@ -82,7 +82,7 @@ test-support = ["modules", "macros"]
 
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "test-util"] }
 tempfile = "3"
 
 [[bin]]
@@ -133,5 +133,10 @@ required-features = ["modules"]
 
 [[example]]
 name = "module_host_callback"
+crate-type = ["cdylib"]
+required-features = ["modules"]
+
+[[example]]
+name = "module_controlled_init"
 crate-type = ["cdylib"]
 required-features = ["modules"]
