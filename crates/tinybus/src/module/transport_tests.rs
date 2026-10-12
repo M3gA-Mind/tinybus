@@ -1543,6 +1543,41 @@ pub(crate) fn native_fixture() -> (
 
 #[tokio::test]
 #[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_controller_is_owned_until_shutdown_callback_returns() {
+    let (transport, host, init, barrier) = native_fixture();
+    barrier.state.lock().unwrap().1 = true;
+    transport.defer_initialize(init, host);
+    transport.ensure_initialized().await.unwrap();
+    barrier.entered.notified().await;
+    let weak = Arc::downgrade(&barrier);
+    let (release, gate) = std::sync::mpsc::channel();
+    *barrier.finish_gate.lock().unwrap() = Some(gate);
+    let stopping = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.stop(Duration::from_secs(2)).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified())
+        .await
+        .unwrap();
+    // Observe ownership safely while the real native callback still borrows
+    // the controller. Always release C before a regression assertion can panic.
+    let retained = Arc::strong_count(&barrier) > 1;
+    assert_ne!(
+        transport.context.physical.lock().unwrap().cleanup,
+        CleanupState::Complete
+    );
+    release.send(()).unwrap();
+    assert_eq!(stopping.await.unwrap().unwrap(), TB_OK);
+    drop(barrier);
+    let retained_through_transport = weak.upgrade().is_some();
+    drop(transport);
+    assert!(weak.upgrade().is_none(), "successful fixture owner is reclaimed");
+    assert!(retained, "physical owner must retain the borrowed native controller");
+    assert!(retained_through_transport);
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
 async fn actual_native_late_init_is_joined_after_initiator_abandonment() {
     let (transport, host, init, barrier) = native_fixture();
     transport.defer_initialize(init, host);
