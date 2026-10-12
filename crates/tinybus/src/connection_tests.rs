@@ -891,3 +891,35 @@ async fn weak_references_cannot_resurrect_dispatch_state_after_the_last_owner_dr
     assert!(format!("{weak:?}").contains("has_strong_owner: false"));
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn opted_in_method_fault_fences_before_primary_payload_drop() {
+    struct Payload {
+        fenced: Arc<AtomicBool>,
+        observed: Arc<AtomicBool>,
+    }
+    impl Drop for Payload {
+        fn drop(&mut self) {
+            self.observed.store(self.fenced.load(Ordering::Acquire), Ordering::Release);
+        }
+    }
+    struct PanicService(Arc<AtomicBool>, Arc<AtomicBool>);
+    #[async_trait]
+    impl Interface for PanicService {
+        fn name(&self) -> InterfaceName { "ai.tinyhumans.Test".parse().unwrap() }
+        fn members(&self) -> Vec<MemberName> { vec!["Panic".parse().unwrap()] }
+        async fn call(&self, _: &MemberName, _: Value) -> Result<Value> {
+            std::panic::panic_any(Payload { fenced: self.0.clone(), observed: self.1.clone() });
+        }
+    }
+    let fenced = Arc::new(AtomicBool::new(false));
+    let observed = Arc::new(AtomicBool::new(false));
+    let (client, service) = pair().await;
+    service.serve_at(path(), PanicService(fenced.clone(), observed.clone())).await.unwrap();
+    let fence = fenced.clone();
+    service.__set_catch_observer(Arc::new(move || { fence.store(true, Ordering::Release); }));
+    service.__set_panic_handler(Arc::new(|| Error::MethodFailed { name: "ai.tinyhumans.tinybus.Error.ModulePanicked".into(), message: "a module method panicked".into() }));
+    let error = client.call_raw(call("Panic", Value::Null), DEFAULT_TIMEOUT).await.unwrap_err();
+    assert_eq!(error.wire_name(), "ai.tinyhumans.tinybus.Error.ModulePanicked");
+    assert!(observed.load(Ordering::Acquire), "primary payload dropped before opted-in fault observer");
+}

@@ -192,6 +192,7 @@ struct Inner {
     signal_deliveries: broadcast::Sender<crate::SignalDelivery>,
     local_publisher: crate::LocalPublisherIdentity,
     panic_handler: std::sync::RwLock<Option<Arc<dyn Fn() -> Error + Send + Sync>>>,
+    catch_observer: std::sync::RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Bulk streams being received. On the connection rather than in the object
     /// tree because a chunk has to be checked against the header's stamped
     /// `sender`; interfaces receive only the verified subset in CallContext.
@@ -389,6 +390,7 @@ impl Connection {
             signal_deliveries,
             local_publisher: crate::LocalPublisherIdentity::new(),
             panic_handler: std::sync::RwLock::new(None),
+            catch_observer: std::sync::RwLock::new(None),
             streams: StreamRegistry::new(),
         });
         tokio::spawn(writer_loop(inner.transport.clone(), outbound));
@@ -1019,6 +1021,14 @@ impl Connection {
             .panic_handler
             .write()
             .expect("panic handler lock") = Some(handler);
+    }
+
+    /// Install SDK-local catch-time notification before a method panic payload drops.
+    /// The observer must be bounded, must not unwind, and must never join workers.
+    /// This plumbing does not grant native authority or replace the panic policy.
+    #[doc(hidden)]
+    pub fn __set_catch_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+        *self.inner.catch_observer.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
     }
 
     /// What this connection will accept from peers sending it bulk streams.
