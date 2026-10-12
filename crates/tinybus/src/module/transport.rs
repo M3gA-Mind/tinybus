@@ -458,13 +458,14 @@ impl ModuleTransport {
         let rejected = job.transport.reject_worker_spawn.load(Ordering::Acquire);
         #[cfg(not(test))]
         let rejected = false;
+        let worker = move || submitted.run();
         let spawn = if rejected {
             // Model Builder rejecting and dropping the submitted closure: only
             // the independent context anchor can preserve its physical owner.
-            drop(submitted);
+            drop(worker);
             Err(std::io::Error::other("controlled worker rejection"))
         } else {
-            std::thread::Builder::new().name("tinybus-physical".into()).spawn(move || submitted.run())
+            std::thread::Builder::new().name("tinybus-physical".into()).spawn(worker)
         };
         if spawn.is_err() {
             let transport = &job.transport;
@@ -861,24 +862,27 @@ impl ModuleTransport {
         }
         let remaining = deadline.saturating_sub(started.elapsed());
         self.commit_terminal(false);
-        let (existing, job, mut acquired) = {
+        let (_existing, job, mut acquired, ordinary_handoff) = {
         let mut state = self.context.physical.lock().expect("physical state lock");
         if state.cleanup == CleanupState::Idle { state.cleanup = CleanupState::Requested; }
         let existing = state.job.is_some();
         let mut acquired = Some(lifecycle);
-        let job = if existing { None } else {
+        let job = if existing || state.cleanup != CleanupState::Requested { None } else {
             let job = Arc::new(PhysicalJob { transport: self.clone(),
                 initializer: StdMutex::new(None), guard: StdMutex::new(acquired.take()),
                 deadline: remaining });
             state.job = Some(job.clone());
             Some(job)
         };
-        self.stop_task_spawned.store(true, Ordering::Release);
-        (existing, job, acquired)
+        let ordinary_handoff = !self.is_faulted() && state.cleanup == CleanupState::Requested
+            && (job.is_some() || (existing && state.init == InitState::Scheduled));
+        if ordinary_handoff { self.stop_task_spawned.store(true, Ordering::Release); }
+        (existing, job, acquired, ordinary_handoff)
         };
         // A Scheduled initializer must acquire the guard itself to prove no C entry.
-        if existing { drop(acquired.take()); }
+        drop(acquired.take());
         if let Some(job) = job { Self::submit_job(job); }
+        let classify = |error| if ordinary_handoff { StopError::Started(error) } else { StopError::NotStarted(error) };
         let wait = async {
             loop {
                 let changed = self.context.physical_notify.notified();
@@ -886,7 +890,10 @@ impl ModuleTransport {
                 let state = self.context.physical.lock().expect("physical state lock");
                 match state.cleanup {
                     CleanupState::Complete | CleanupState::NoCallbackRequired => Some(Ok(state.code.unwrap_or(TB_CLOSED))),
-                    CleanupState::Uncertain => Some(Err(StopError::Started(Error::transport("module cleanup is uncertain")))),
+                    CleanupState::Uncertain => Some(match state.code {
+                        Some(code) => Ok(code),
+                        None => Err(classify(Error::transport("module cleanup is uncertain"))),
+                    }),
                     _ => None,
                 }
                 };
@@ -894,7 +901,7 @@ impl ModuleTransport {
                 changed.await;
             }
         };
-        tokio::time::timeout(remaining, wait).await.map_err(|_| StopError::Started(Error::failed("module shutdown exceeded its deadline")))?
+        tokio::time::timeout(remaining, wait).await.map_err(|_| classify(Error::failed("module shutdown exceeded its deadline")))?
 
     }
 }
