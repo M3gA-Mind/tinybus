@@ -216,8 +216,8 @@ impl ModuleTransport {
         }
     }
 
-    // Terminal state is distinct from initialization: never fabricate READY or
-    // init_started to release observers during admission rollback or shutdown.
+    // Admission rejection is a genuine fault, unlike ordinary shutdown. Never
+    // fabricate READY or init_started to release a rejected observer.
     fn terminate_waiters(&self) {
         self.context.faulted.store(true, Ordering::Release);
         self.context.init_notify.notify_waiters();
@@ -499,8 +499,8 @@ impl ModuleTransport {
                 let Some(message) = message else {
                     break;
                 };
-                if self.deliver_now(message.clone()).await.is_err() {
-                    self.fault_pending(message).await;
+                if let Err(error) = self.deliver_now(message.clone()).await {
+                    self.fault_pending(message, error).await;
                     self.drain_started.store(false, Ordering::Release);
                     return;
                 }
@@ -533,10 +533,10 @@ impl ModuleTransport {
     /// Answer every still-queued call — and the one that just failed to
     /// deliver — with `ModuleUnavailable`, then fault the module, so callers
     /// learn the delivery failed instead of waiting out their deadline.
-    async fn fault_pending(&self, failed: Message) {
+    async fn fault_pending(&self, failed: Message, error: Error) {
         let cleared = {
             let mut pending = self.pending.lock().expect("module pending lock");
-            if self.is_stopped() {
+            if self.is_stopped() && matches!(error, Error::ConnectionClosed) {
                 pending.clear();
                 return;
             }
@@ -592,7 +592,7 @@ impl ModuleTransport {
                 .initialization_gate
                 .lock()
                 .expect("initialization gate lock");
-            if !self.init_started() {
+            if !self.init_started() && self.module.lock().expect("module vtable lock").is_none() {
                 self.finish_stop();
             }
         }
