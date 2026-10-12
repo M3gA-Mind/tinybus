@@ -1080,3 +1080,57 @@ async fn actual_signal_callback_is_drained_despite_stop_timeout_and_cancellation
     assert!(transport.is_stopped(), "A37");
     assert!(!transport.is_faulted(), "A38");
 }
+
+#[tokio::test]
+async fn installed_vtable_without_init_flag_closes_fresh_admission_before_teardown() {
+    let _lock = VTABLE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let _release = ShutdownRelease;
+    SHUTDOWN_BLOCKED.store(true, Ordering::Release);
+    SHUTDOWN_ENTERED.store(false, Ordering::Release);
+    SHUTDOWN_CALLS.store(0, Ordering::Release);
+    DELIVERIES.store(0, Ordering::Release);
+    let (transport, host) = ModuleTransport::new("installed-admission".into(), vec![]);
+    let mut module = TbModuleVtable::default();
+    unsafe { initialize_ok(&host, &mut module); }
+    transport.initialize(module).expect("A39");
+    assert!(!transport.init_started(), "A40");
+    let stopping = tokio::spawn(transport.clone().stop(Duration::from_secs(2)));
+    shutdown_entry().await;
+    let result = transport.send(call()).await;
+    assert!(matches!(result, Err(Error::ConnectionClosed)), "A41");
+    assert!(!transport.init_started(), "A42");
+    assert!(!transport.is_stopped(), "A43");
+    assert!(!transport.is_faulted(), "A44");
+    assert!(!transport.init_failed(), "A45");
+    assert_eq!(DELIVERIES.load(Ordering::Acquire), 0, "A46");
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    stopping.await.expect("A47").expect("A48");
+    assert_eq!(SHUTDOWN_CALLS.load(Ordering::Acquire), 1, "A49");
+}
+
+#[tokio::test]
+async fn backpressure_retry_closes_without_fault_while_actual_shutdown_is_blocked() {
+    let _lock = VTABLE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let _release = ShutdownRelease;
+    SHUTDOWN_BLOCKED.store(true, Ordering::Release);
+    SHUTDOWN_ENTERED.store(false, Ordering::Release);
+    DELIVERY_CODE.store(TB_BACKPRESSURE, Ordering::Release);
+    DELIVERIES.store(0, Ordering::Release);
+    let (transport, host) = ModuleTransport::new("pressure-admission".into(), vec![]);
+    transport.defer_initialize(initialize_ok, host);
+    transport.send(call()).await.expect("A50");
+    unsafe { (host.ready)(host.host_ctx); }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while DELIVERIES.load(Ordering::Acquire) == 0 { tokio::task::yield_now().await; }
+    }).await.expect("A51");
+    let stopping = tokio::spawn(transport.clone().stop(Duration::from_secs(2)));
+    shutdown_entry().await;
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while transport.drain_started.load(Ordering::Acquire) { tokio::task::yield_now().await; }
+    }).await.expect("A52");
+    unsafe { (host.wake)(host.host_ctx); }
+    assert_eq!(DELIVERIES.load(Ordering::Acquire), 1, "A53");
+    assert!(!transport.is_faulted(), "A54");
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    stopping.await.expect("A55").expect("A56");
+}
