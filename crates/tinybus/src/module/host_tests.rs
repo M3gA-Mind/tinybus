@@ -2182,24 +2182,12 @@ async fn one_refused_module_does_not_stop_the_others_in_the_directory_from_loadi
     );
 }
 
-/// Copy `artifact` into a fresh directory beside a `modules.toml` listing
-/// `hash` for it, so a load can be driven against a real allowlist.
+/// Copy `artifact` into a fresh, private directory with its hash allowlist.
 ///
-/// Unix-only, and the reason is the loader's own admission check rather than
-/// anything about the code under test. On Windows that check trusts exactly
-/// three SIDs on a module directory: its owner, `LocalSystem`, and
-/// `BUILTIN\Administrators`. A CI runner's account is an administrator, so a
-/// directory a *test* creates is owned by `BUILTIN\Administrators` while the
-/// ACE it inherits names the user SID — neither the owner nor well-known
-/// trusted — and the load is refused. That is why the Windows workflow calls
-/// `SetOwner` on the directories it provisions; a test cannot do the same
-/// without Win32 calls of its own.
-///
-/// Gating here costs little: what these two tests exercise is the hash
-/// comparison and the attestation record it produces, which is identical on
-/// every platform. The Windows-specific directory policy is covered by the
-/// existing loader tests that run against the CI-provisioned directories.
-#[cfg(unix)]
+/// Each native fixture needs a separate mapping: the SDK installs a global
+/// tracing subscriber inside the library, so initializing the same DLL path
+/// twice shares state even across independent hosts. Windows staging uses the
+/// release-cache ACL repair so the real admission gate remains in force.
 fn staged_module(artifact: &Path, hash: &str) -> (tempfile::TempDir, PathBuf) {
     // Staged beside the artifact rather than in `/tmp`: the loader refuses a
     // directory another user could write to, and `/tmp` is exactly that. The
@@ -2209,6 +2197,8 @@ fn staged_module(artifact: &Path, hash: &str) -> (tempfile::TempDir, PathBuf) {
     // route around.
     let root = artifact.parent().expect("artifact has a parent directory");
     let dir = tempfile::tempdir_in(root).unwrap();
+    #[cfg(windows)]
+    crate::module::cache::secure_release_cache(dir.path(), dir.path());
     let file_name = artifact.file_name().unwrap();
     let staged = dir.path().join(file_name);
     std::fs::copy(artifact, &staged).unwrap();
@@ -2410,7 +2400,6 @@ async fn an_eager_cdylib_authenticates_after_its_worker_runs_before_admission() 
 async fn authenticates_native_context(variable: &str) {
     let artifact = PathBuf::from(std::env::var_os(variable).expect(variable));
     let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
-    #[cfg(unix)]
     let (_dir, artifact) = staged_module(&artifact, &hash);
     let bus = MemoryBus::new();
     let broker = Broker::new();
@@ -2530,4 +2519,368 @@ async fn fixed_unique_module_calls_are_refused_in_terminal_states_before_detach(
         }
     }
     broker_task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TINYBUS_TEST_CONTEXT_MODULE to point at the built cdylib"]
+async fn a_verified_cdylib_can_deliver_a_confidential_host_callback() {
+    let artifact = PathBuf::from(std::env::var_os("TINYBUS_TEST_CONTEXT_MODULE").unwrap());
+    let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
+    let (_dir, artifact) = staged_module(&artifact, &hash);
+    let bus = MemoryBus::new();
+    let broker = Broker::new();
+    let task = broker.spawn(bus.clone());
+    let modules = ModuleHost::new(broker);
+    let binding = modules
+        .prepare_host_callbacks(vec![crate::module::HostCallbackEndpoint {
+            path: "/callback".parse().unwrap(),
+            interface: "org.example.Callback".parse().unwrap(),
+            members: vec!["Observe".parse().unwrap()],
+        }])
+        .await
+        .unwrap();
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    binding
+        .serve_at(
+            "/callback".parse().unwrap(),
+            CountingNativeCallback(calls.clone()),
+        )
+        .await
+        .unwrap();
+    modules
+        .load_file_with_host_callbacks(artifact, serde_json::json!({}), &binding)
+        .await
+        .unwrap();
+    let module = binding.guard().module_peer().unwrap();
+    let result = binding
+        .proxy(module.as_str(), "/context", "org.example.Context")
+        .unwrap()
+        .call_confidential::<(crate::BusName, crate::BusName)>("ConfidentialCallback", ())
+        .await;
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "confidential callback required"
+    );
+    assert_eq!(
+        result.unwrap(),
+        (binding.unique_name().clone(), module.clone())
+    );
+    let ordinary = binding
+        .proxy(module.as_str(), "/context", "org.example.Context")
+        .unwrap()
+        .call::<serde_json::Value>("Callback", ())
+        .await;
+    assert!(
+        ordinary.is_err(),
+        "scoped confidential endpoints refuse ordinary calls even from their module"
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let attacker = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let mut forged = crate::message::Message::method_call(
+        binding.unique_name().clone(),
+        "/callback".parse().unwrap(),
+        "org.example.Callback".parse().unwrap(),
+        "Observe".parse().unwrap(),
+        serde_json::json!([]),
+    );
+    forged.header.sender = Some(module.clone());
+    forged.header.confidential = true;
+    assert!(
+        attacker
+            .call_raw(forged, Duration::from_secs(2))
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    binding.revoke();
+    let revoked = binding
+        .proxy(module.as_str(), "/context", "org.example.Context")
+        .unwrap()
+        .call_confidential::<serde_json::Value>("ConfidentialCallback", ())
+        .await;
+    assert!(revoked.is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    task.abort();
+}
+
+struct CountingNativeCallback(Arc<std::sync::atomic::AtomicUsize>);
+#[async_trait::async_trait]
+impl crate::Interface for CountingNativeCallback {
+    fn name(&self) -> crate::InterfaceName {
+        "org.example.Callback".parse().unwrap()
+    }
+    fn members(&self) -> Vec<crate::MemberName> {
+        vec!["Observe".parse().unwrap()]
+    }
+    async fn call(
+        &self,
+        _: &crate::MemberName,
+        _: serde_json::Value,
+    ) -> crate::Result<serde_json::Value> {
+        Err(Error::failed("missing contextual dispatch"))
+    }
+    async fn call_with_context(
+        &self,
+        _: &crate::MemberName,
+        _: serde_json::Value,
+        context: &crate::CallContext,
+    ) -> crate::Result<serde_json::Value> {
+        let sender = context
+            .authenticated_sender()
+            .ok_or_else(|| Error::failed("unverified callback"))?;
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!(sender))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TINYBUS_TEST_HOST_CALLBACK_MODULE to point at the built cdylib"]
+async fn eager_native_setup_callbacks_are_bound_before_ready_and_failures_rollback() {
+    for failed in [false, true] {
+        let artifact =
+            PathBuf::from(std::env::var_os("TINYBUS_TEST_HOST_CALLBACK_MODULE").unwrap());
+        let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
+        let (_dir, artifact) = staged_module(&artifact, &hash);
+        let broker = Broker::new();
+        let modules = ModuleHost::new(broker.clone());
+        let binding = modules
+            .prepare_host_callbacks(vec![crate::module::HostCallbackEndpoint {
+                path: "/callback".parse().unwrap(),
+                interface: "org.example.Callback".parse().unwrap(),
+                members: vec!["Observe".parse().unwrap()],
+            }])
+            .await
+            .unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let guard = binding.guard();
+        binding
+            .serve_at(
+                "/callback".parse().unwrap(),
+                BoundNativeCallback {
+                    calls: calls.clone(),
+                    guard: guard.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let config = serde_json::json!({
+            "host": binding.unique_name(), "fail": failed,
+            "credential": "callback-secret-must-not-be-retained",
+            "nested": [{"zero": -0.0, "literal": "\"-0.0\""}],
+        });
+        let result = modules
+            .load_file_with_host_callbacks(artifact, config.clone(), &binding)
+            .await;
+        assert_eq!(calls.load(Ordering::SeqCst), usize::from(!failed));
+        if failed {
+            assert!(result.is_err());
+            assert!(modules.list().is_empty());
+            assert!(!guard.authorizes(&crate::CallContext::brokered(
+                guard.module_peer().as_ref(),
+                true
+            )));
+        } else {
+            let info = result.unwrap();
+            assert!(matches!(info.state, ModuleState::Ready));
+            assert_eq!(
+                Some(binding.unique_name().clone()),
+                broker
+                    .router
+                    .lock()
+                    .unwrap()
+                    .owner_of(binding.unique_name())
+            );
+            assert!(
+                modules
+                    .reinitialize(
+                        &info.name,
+                        serde_json::json!({"host": ":1.999", "fail": false})
+                    )
+                    .await
+                    .is_err()
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            let retains_plaintext = {
+                let loaded = modules.inner.loaded.lock().unwrap();
+                let retained = &loaded
+                    .iter()
+                    .find(|m| m.info.name == info.name)
+                    .unwrap()
+                    .callback_config;
+                // Check the live retained representation, never freed memory after Drop.
+                (retained as &dyn std::any::Any)
+                    .downcast_ref::<Option<serde_json::Value>>()
+                    .is_some_and(Option::is_some)
+            };
+            assert!(
+                !retains_plaintext,
+                "initialized callback module retains secret-bearing JSON"
+            );
+            let mut equivalent = config.clone();
+            equivalent["nested"][0]["zero"] = serde_json::json!(0.0);
+            assert_eq!(equivalent, config);
+            modules.reinitialize(&info.name, equivalent).await.unwrap();
+            let mut different = config.clone();
+            different["nested"][0]["zero"] = serde_json::json!(0);
+            assert_ne!(different, config);
+            assert!(modules.reinitialize(&info.name, different).await.is_err());
+            modules.reinitialize(&info.name, config).await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), 3);
+            drop(modules);
+            assert!(!guard.authorizes(&crate::CallContext::brokered(
+                guard.module_peer().as_ref(),
+                true
+            )));
+        }
+        binding.close().await.unwrap();
+    }
+}
+
+struct BoundNativeCallback {
+    calls: Arc<AtomicUsize>,
+    guard: crate::module::HostCallbackGuard,
+}
+#[async_trait::async_trait]
+impl crate::Interface for BoundNativeCallback {
+    fn name(&self) -> crate::InterfaceName {
+        "org.example.Callback".parse().unwrap()
+    }
+    fn members(&self) -> Vec<crate::MemberName> {
+        vec!["Observe".parse().unwrap()]
+    }
+    async fn call(
+        &self,
+        _: &crate::MemberName,
+        _: serde_json::Value,
+    ) -> crate::Result<serde_json::Value> {
+        Err(Error::failed("unverified"))
+    }
+    async fn call_with_context(
+        &self,
+        _: &crate::MemberName,
+        _: serde_json::Value,
+        context: &crate::CallContext,
+    ) -> crate::Result<serde_json::Value> {
+        assert_eq!(
+            context.authenticated_sender(),
+            self.guard.module_peer().as_ref()
+        );
+        assert!(
+            self.guard.authorizes(context),
+            "peer must be pinned before eager callback"
+        );
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!(context.authenticated_sender().unwrap()))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TINYBUS_TEST_CONTEXT_MODULE to point at the built cdylib"]
+async fn a_native_callback_timeout_and_revoke_do_not_claim_worker_completion() {
+    let artifact = PathBuf::from(std::env::var_os("TINYBUS_TEST_CONTEXT_MODULE").unwrap());
+    let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
+    let (_dir, artifact) = staged_module(&artifact, &hash);
+    let modules = ModuleHost::new(Broker::new());
+    let binding = modules
+        .prepare_host_callbacks(vec![crate::module::HostCallbackEndpoint {
+            path: "/callback".parse().unwrap(),
+            interface: "org.example.Callback".parse().unwrap(),
+            members: vec!["Observe".parse().unwrap()],
+        }])
+        .await
+        .unwrap();
+    let guard = binding.guard();
+    let (entered, mut receiver) = tokio::sync::mpsc::channel(1);
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let published = Arc::new(AtomicUsize::new(0));
+    binding
+        .serve_at(
+            "/callback".parse().unwrap(),
+            NativeBlockingCallback {
+                guard: guard.clone(),
+                entered,
+                release: release.clone(),
+                published: published.clone(),
+            },
+        )
+        .await
+        .unwrap();
+    modules
+        .load_file_with_host_callbacks(artifact, serde_json::json!({}), &binding)
+        .await
+        .unwrap();
+    let module = guard.module_peer().unwrap();
+    let proxy = binding
+        .proxy(module.as_str(), "/context", "org.example.Context")
+        .unwrap()
+        .with_timeout(Duration::from_millis(100));
+    let request = tokio::spawn(async move {
+        proxy
+            .call_confidential::<serde_json::Value>("ConfidentialCallback", ())
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(request.await.unwrap(), Err(Error::Timeout { .. })));
+    assert_eq!(
+        guard.running(),
+        1,
+        "caller timeout does not complete the host worker"
+    );
+    binding.revoke();
+    assert_eq!(
+        guard.running(),
+        1,
+        "revoke retains running admission charge"
+    );
+    release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(2), guard.drained())
+        .await
+        .unwrap();
+    assert_eq!(guard.running(), 0);
+    assert_eq!(published.load(Ordering::SeqCst), 0);
+    modules.shutdown(Duration::from_secs(2)).await;
+}
+
+struct NativeBlockingCallback {
+    guard: crate::module::HostCallbackGuard,
+    entered: tokio::sync::mpsc::Sender<()>,
+    release: Arc<tokio::sync::Semaphore>,
+    published: Arc<AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl crate::Interface for NativeBlockingCallback {
+    fn name(&self) -> crate::InterfaceName {
+        "org.example.Callback".parse().unwrap()
+    }
+    fn members(&self) -> Vec<crate::MemberName> {
+        vec!["Observe".parse().unwrap()]
+    }
+    async fn call(
+        &self,
+        _: &crate::MemberName,
+        _: serde_json::Value,
+    ) -> crate::Result<serde_json::Value> {
+        Err(Error::failed("unverified"))
+    }
+    async fn call_with_context(
+        &self,
+        _: &crate::MemberName,
+        _: serde_json::Value,
+        context: &crate::CallContext,
+    ) -> crate::Result<serde_json::Value> {
+        assert!(self.guard.authorizes(context));
+        self.entered.send(()).await.unwrap();
+        let _permit = self.release.acquire().await.unwrap();
+        if !self.guard.authorizes(context) {
+            return Err(Error::failed("revoked before publication"));
+        }
+        self.published.fetch_add(1, Ordering::SeqCst);
+        Ok(serde_json::json!(context.authenticated_sender().unwrap()))
+    }
 }

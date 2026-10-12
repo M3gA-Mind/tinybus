@@ -43,7 +43,7 @@ pub const PEER_QUEUE_CAPACITY: usize = 256;
 /// Cheap to clone; every clone shares one routing table.
 #[derive(Clone)]
 pub struct Broker {
-    router: Arc<Mutex<Router>>,
+    pub(crate) router: Arc<Mutex<Router>>,
     id: String,
     // `Weak`, not `Arc`: the module host owns this broker, so a strong
     // reference back would form a cycle and leak both. Callers tolerate a
@@ -212,7 +212,7 @@ impl Broker {
 
     /// Record that a loaded module's artifact matched the module allowlist.
     ///
-    /// This is the *only* way a peer becomes eligible to receive a confidential
+    /// This is how a module peer becomes eligible to receive a confidential
     /// message: the artifact was hashed against `modules.toml` before `dlopen`,
     /// and nothing reached across a transport to establish it.
     #[cfg(feature = "modules")]
@@ -292,6 +292,7 @@ impl Broker {
                     &destination,
                     message.header.expected_responder.as_ref(),
                     confidential_call,
+                    &message.header,
                 );
                 #[cfg(feature = "modules")]
                 let target = target.map_err(|error| {

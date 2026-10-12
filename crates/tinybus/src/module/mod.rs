@@ -37,6 +37,10 @@ pub use first_admitted::{ReleaseAsset, ReleasePlan, load_first_admitted};
 #[cfg(feature = "modules")]
 pub use github::CachedRelease;
 #[cfg(feature = "modules")]
+pub use host::callbacks::{
+    HostCallbackBinding, HostCallbackEndpoint, HostCallbackGuard, HostCallbackProxy,
+};
+#[cfg(feature = "modules")]
 pub use host::{ModuleHost, ModuleInfo, ModuleState};
 
 /// Entry points compiled into the host instead of loaded from a shared library.

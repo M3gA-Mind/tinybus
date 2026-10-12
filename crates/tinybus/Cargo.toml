@@ -130,3 +130,8 @@ required-features = ["modules"]
 name = "module_context_eager"
 crate-type = ["cdylib"]
 required-features = ["modules"]
+
+[[example]]
+name = "module_host_callback"
+crate-type = ["cdylib"]
+required-features = ["modules"]

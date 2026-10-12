@@ -122,7 +122,9 @@ async fn an_older_vtable_loads_but_reports_reinitialization_as_unsupported() {
     older.size = TB_MODULE_VTABLE_BASE_SIZE;
     transport.initialize(older).unwrap();
     let error = transport
-        .reinitialize(serde_json::json!({ "secret": "never printed" }))
+        .reinitialize(crate::Secret::new(
+            serde_json::to_vec(&serde_json::json!({ "secret": "never printed" })).unwrap(),
+        ))
         .await
         .unwrap_err();
     assert!(error.to_string().contains("does not support"));
@@ -151,7 +153,9 @@ async fn reinitialization_maps_callback_failures_without_exposing_configuration(
     let (uninitialized, _) = ModuleTransport::new("missing".to_string(), Vec::new());
     assert!(
         uninitialized
-            .reinitialize(serde_json::json!({}))
+            .reinitialize(crate::Secret::new(
+                serde_json::to_vec(&serde_json::json!({})).unwrap()
+            ))
             .await
             .unwrap_err()
             .to_string()
@@ -170,7 +174,9 @@ async fn reinitialization_maps_callback_failures_without_exposing_configuration(
     ] {
         REINITIALIZE_CODE.store(code, Ordering::Release);
         let error = transport
-            .reinitialize(serde_json::json!({ "secret": "never printed" }))
+            .reinitialize(crate::Secret::new(
+                serde_json::to_vec(&serde_json::json!({ "secret": "never printed" })).unwrap(),
+            ))
             .await
             .unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
@@ -178,7 +184,9 @@ async fn reinitialization_maps_callback_failures_without_exposing_configuration(
     }
     REINITIALIZE_CODE.store(TB_OK, Ordering::Release);
     transport
-        .reinitialize(serde_json::json!({ "replacement": true }))
+        .reinitialize(crate::Secret::new(
+            serde_json::to_vec(&serde_json::json!({ "replacement": true })).unwrap(),
+        ))
         .await
         .unwrap();
 }
@@ -201,7 +209,9 @@ async fn a_running_reinitialization_excludes_another_reinitialization_and_shutdo
     let first_transport = transport.clone();
     let first = tokio::spawn(async move {
         first_transport
-            .reinitialize(serde_json::json!({ "generation": 1 }))
+            .reinitialize(crate::Secret::new(
+                serde_json::to_vec(&serde_json::json!({ "generation": 1 })).unwrap(),
+            ))
             .await
     });
     tokio::time::timeout(Duration::from_secs(1), async {
@@ -215,7 +225,9 @@ async fn a_running_reinitialization_excludes_another_reinitialization_and_shutdo
     assert!(
         tokio::time::timeout(
             Duration::from_millis(20),
-            transport.reinitialize(serde_json::json!({ "generation": 2 })),
+            transport.reinitialize(crate::Secret::new(
+                serde_json::to_vec(&serde_json::json!({ "generation": 2 })).unwrap()
+            )),
         )
         .await
         .is_err()
@@ -438,7 +450,9 @@ async fn a_reinitialization_that_times_out_reports_a_timeout_without_the_configu
     transport.initialize(module).unwrap();
     REINITIALIZE_CODE.store(TB_TIMEOUT, Ordering::Release);
     let error = transport
-        .reinitialize(serde_json::json!({ "secret": "never printed" }))
+        .reinitialize(crate::Secret::new(
+            serde_json::to_vec(&serde_json::json!({ "secret": "never printed" })).unwrap(),
+        ))
         .await
         .unwrap_err();
     REINITIALIZE_CODE.store(TB_OK, Ordering::Release);
@@ -523,4 +537,57 @@ async fn a_new_host_keeps_the_frozen_prefix_readable_by_old_modules() {
         TB_OK
     );
     transport.initialize(module).unwrap();
+}
+
+#[tokio::test]
+async fn rejected_initialization_releases_observer_without_claiming_initializing() {
+    let (transport, _) = ModuleTransport::new("rejected".into(), vec![]);
+    transport.pause_initialization();
+    let weak = Arc::downgrade(&transport);
+    let observed = transport.clone();
+    let observer = tokio::spawn(async move { observed.wait_initializing().await });
+    tokio::task::yield_now().await;
+    transport.release_initialization(false);
+    assert!(transport.ensure_initialized().await.is_err());
+    assert!(!transport.init_started());
+    drop(transport);
+    tokio::time::timeout(Duration::from_millis(100), observer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(weak.upgrade().is_none());
+}
+
+#[tokio::test]
+async fn stop_before_initialization_terminates_all_waiters() {
+    let (transport, _) = ModuleTransport::new("stopped".into(), vec![]);
+    transport.pause_initialization();
+    transport.stop_sync(Duration::ZERO);
+    tokio::time::timeout(Duration::from_millis(100), transport.ensure_initialized())
+        .await
+        .unwrap()
+        .unwrap_err();
+    tokio::time::timeout(Duration::from_millis(100), transport.wait_initializing())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_millis(100), transport.wait_ready())
+        .await
+        .unwrap();
+    assert!(!transport.init_started());
+    assert!(!transport.is_ready());
+}
+
+#[tokio::test]
+async fn ready_followed_by_fault_is_not_successful_readiness() {
+    let (transport, host) = ModuleTransport::new("ready-fault".into(), vec![]);
+    unsafe {
+        (host.ready)(host.host_ctx);
+    }
+    assert!(transport.is_ready());
+    unsafe {
+        (host.fault)(host.host_ctx, std::ptr::null(), 0);
+    }
+    transport.wait_ready().await;
+    assert!(transport.is_faulted());
+    assert!(!transport.is_ready());
 }

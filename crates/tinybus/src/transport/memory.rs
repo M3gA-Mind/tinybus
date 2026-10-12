@@ -93,6 +93,11 @@ impl MemoryTransport {
             .map(|delivery| (delivery.message, delivery.brokered)))
     }
 
+    #[cfg(feature = "modules")]
+    pub(crate) fn close_outbound(&self) {
+        self.outbound.lock().expect("outbound lock").take();
+    }
+
     /// Take a clone of the sender without holding the lock across an await.
     fn sender(&self) -> Result<mpsc::Sender<Delivery>> {
         self.outbound

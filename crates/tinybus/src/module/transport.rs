@@ -57,6 +57,8 @@ pub(crate) struct ModuleTransport {
     // let a second lifecycle callback overlap the still-running first one.
     lifecycle: Arc<Mutex<()>>,
     stop_task_spawned: Arc<AtomicBool>,
+    initialization_gate: StdMutex<Option<bool>>,
+    initialization_gate_changed: Notify,
 }
 
 // `module_ctx` is opaque and all access to it goes through callbacks whose ABI
@@ -127,6 +129,8 @@ impl ModuleTransport {
             drain_started: AtomicBool::new(false),
             lifecycle: Arc::new(Mutex::new(())),
             stop_task_spawned: Arc::new(AtomicBool::new(false)),
+            initialization_gate: StdMutex::new(Some(true)),
+            initialization_gate_changed: Notify::new(),
         });
         let config = context.config.lock().expect("module config lock");
         let config_slice = crate::module::abi::TbSlice {
@@ -186,7 +190,54 @@ impl ModuleTransport {
         });
     }
 
-    async fn ensure_initialized(&self) -> Result<()> {
+    pub(crate) fn pause_initialization(&self) {
+        *self
+            .initialization_gate
+            .lock()
+            .expect("initialization gate lock") = None;
+    }
+
+    pub(crate) fn release_initialization(&self, allowed: bool) {
+        *self
+            .initialization_gate
+            .lock()
+            .expect("initialization gate lock") = Some(allowed);
+        self.initialization_gate_changed.notify_waiters();
+        if !allowed {
+            self.terminate_waiters();
+        }
+    }
+
+    // Terminal state is distinct from initialization: never fabricate READY or
+    // init_started to release observers during admission rollback or shutdown.
+    fn terminate_waiters(&self) {
+        self.context.faulted.store(true, Ordering::Release);
+        self.context.init_notify.notify_waiters();
+        self.context.ready_notify.notify_waiters();
+        self.initialization_gate_changed.notify_waiters();
+    }
+
+    pub(crate) async fn ensure_initialized(&self) -> Result<()> {
+        loop {
+            let changed = self.initialization_gate_changed.notified();
+            let terminal = self.context.init_notify.notified();
+            let allowed = *self
+                .initialization_gate
+                .lock()
+                .expect("initialization gate lock");
+            if self.is_faulted() {
+                return Err(Error::ConnectionClosed);
+            }
+            match allowed {
+                Some(true) => break,
+                Some(false) => return Err(Error::transport("module callback admission failed")),
+                None => tokio::select! {
+                    _ = changed => {},
+                    _ = terminal => {},
+                },
+            }
+        }
+
         let result = self
             .init_result
             .get_or_init(|| async {
@@ -244,7 +295,7 @@ impl ModuleTransport {
     }
 
     pub(crate) fn is_ready(&self) -> bool {
-        self.context.ready.load(Ordering::Acquire)
+        self.context.ready.load(Ordering::Acquire) && !self.is_faulted()
     }
 
     pub(crate) fn clear_config(&self) {
@@ -254,7 +305,7 @@ impl ModuleTransport {
         config.shrink_to_fit();
     }
 
-    pub(crate) async fn reinitialize(self: &Arc<Self>, config: serde_json::Value) -> Result<()> {
+    pub(crate) async fn reinitialize(self: &Arc<Self>, bytes: crate::Secret) -> Result<()> {
         let started = std::time::Instant::now();
         let lifecycle =
             tokio::time::timeout(MODULE_INIT_DEADLINE, self.lifecycle.clone().lock_owned())
@@ -276,10 +327,6 @@ impl ModuleTransport {
             .reinitialize
             .ok_or_else(|| Error::failed("module does not support reinitialization"))?;
         let module = SendModuleVtable(module);
-        let bytes = crate::Secret::new(
-            serde_json::to_vec(&config)
-                .map_err(|_| Error::failed("module configuration is invalid"))?,
-        );
         let remaining = MODULE_INIT_DEADLINE.saturating_sub(started.elapsed());
         let task = tokio::task::spawn_blocking(move || {
             let _lifecycle = lifecycle;
@@ -326,7 +373,7 @@ impl ModuleTransport {
     pub(crate) async fn wait_initializing(&self) {
         loop {
             let notified = self.context.init_notify.notified();
-            if self.init_started() {
+            if self.init_started() || self.is_faulted() {
                 return;
             }
             notified.await;
@@ -470,6 +517,7 @@ impl ModuleTransport {
     }
 
     pub(crate) fn stop_sync(&self, deadline: Duration) -> i32 {
+        self.terminate_waiters();
         let code = self.shutdown_sync(deadline);
         self.context
             .inbound
@@ -681,6 +729,7 @@ unsafe extern "C" fn host_fault(ctx: *mut c_void, _: *const u8, _: usize) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Some(context) = unsafe { ctx.cast::<HostContext>().as_ref() } {
             context.faulted.store(true, Ordering::Release);
+            context.init_notify.notify_waiters();
             context.ready_notify.notify_waiters();
             context.inbound.lock().expect("host inbound lock").take();
         }

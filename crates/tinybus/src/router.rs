@@ -24,6 +24,8 @@
 //! to discard a signal it never asked for is exactly that cost in miniature.
 
 use std::collections::HashMap;
+#[cfg(feature = "modules")]
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
@@ -204,6 +206,8 @@ pub(crate) struct Router {
     peers: HashMap<u64, Peer>,
     names: HashMap<BusName, u64>,
     next_id: u64,
+    #[cfg(feature = "modules")]
+    host_callbacks: Vec<Arc<crate::module::host::callbacks::CallbackState>>,
 }
 
 /// What changed when a name's owner changed, so the broker can announce it.
@@ -246,6 +250,15 @@ impl Router {
         let Some(peer) = self.peers.remove(&id) else {
             return Vec::new();
         };
+        #[cfg(feature = "modules")]
+        self.host_callbacks.retain(|capability| {
+            if capability.includes_peer(&peer.unique) {
+                capability.revoke();
+                false
+            } else {
+                true
+            }
+        });
         let owned: Vec<BusName> = self
             .names
             .iter()
@@ -264,6 +277,25 @@ impl Router {
             }
         }
         changes
+    }
+
+    #[cfg(feature = "modules")]
+    pub(crate) fn detach_unique(&mut self, unique: &BusName) {
+        if let Some(id) = self.names.get(unique).copied() {
+            self.detach(id);
+        }
+    }
+
+    #[cfg(feature = "modules")]
+    pub(crate) fn revoke_callbacks_for_peer(&mut self, peer: &BusName) {
+        self.host_callbacks.retain(|entry| {
+            if entry.includes_peer(peer) {
+                entry.revoke();
+                false
+            } else {
+                true
+            }
+        });
     }
 
     /// Claim a well-known name for `id`.
@@ -490,15 +522,61 @@ impl Router {
         destination: &BusName,
         expected: Option<&BusName>,
         confidential: bool,
+        #[cfg_attr(not(feature = "modules"), allow(unused_variables))]
+        header: &crate::message::Header,
     ) -> Result<mpsc::Sender<Message>> {
         if expected.is_some_and(|expected| self.owner_of(destination).as_ref() != Some(expected)) {
             return Err(Error::NameHasNoOwner(destination.clone()));
         }
         if confidential {
+            #[cfg(feature = "modules")]
+            if destination.is_unique()
+                && self
+                    .host_callbacks
+                    .iter()
+                    .any(|capability| capability.matches(header))
+            {
+                return self.resolve(destination);
+            }
             self.resolve_attested(destination)
         } else {
             self.resolve(destination)
         }
+    }
+
+    #[cfg(feature = "modules")]
+    pub(crate) fn add_host_callbacks(
+        &mut self,
+        capability: Arc<crate::module::host::callbacks::CallbackState>,
+    ) -> Result<()> {
+        if self.host_callbacks.iter().any(|entry| {
+            Arc::ptr_eq(entry, &capability) || entry.module_peer() == capability.module_peer()
+        }) {
+            return Err(Error::failed("callback scope is already registered"));
+        }
+        if self.host_callbacks.len() >= 128 {
+            return Err(Error::failed("callback scope limit reached"));
+        }
+        let source = capability
+            .module_peer()
+            .ok_or_else(|| Error::failed("callback module peer is absent"))?;
+        if self.attestation_of(&source).is_none()
+            || self.owner_of(&capability.destination).is_none()
+        {
+            return Err(Error::failed("callback peers are not admitted"));
+        }
+        self.host_callbacks.push(capability);
+        Ok(())
+    }
+
+    #[cfg(feature = "modules")]
+    pub(crate) fn revoke_host_callbacks(
+        &mut self,
+        capability: &Arc<crate::module::host::callbacks::CallbackState>,
+    ) {
+        capability.revoke();
+        self.host_callbacks
+            .retain(|entry| !Arc::ptr_eq(entry, capability));
     }
 
     /// The outbox of whoever owns `destination`.

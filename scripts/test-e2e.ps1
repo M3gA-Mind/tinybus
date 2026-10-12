@@ -18,10 +18,11 @@ Set-Acl -LiteralPath $private -AclObject $acl
 Copy-Item target/debug/examples/module_clock.dll $private
 Copy-Item target/debug/examples/module_context.dll $private
 Copy-Item target/debug/examples/module_context_eager.dll $private
+Copy-Item target/debug/examples/module_host_callback.dll $private
 Copy-Item target/debug/examples/module_wrong_target.dll $private
 # Admit every intentional fixture by its actual built bytes so later
 # checks, including the wrong-target gate, can exercise their contract.
-$fixtureAllowlist = @('module_clock.dll', 'module_context.dll', 'module_context_eager.dll', 'module_wrong_target.dll') | ForEach-Object {
+$fixtureAllowlist = @('module_clock.dll', 'module_context.dll', 'module_context_eager.dll', 'module_host_callback.dll', 'module_wrong_target.dll') | ForEach-Object {
   $digest = (Get-FileHash -LiteralPath (Join-Path $private $_) -Algorithm SHA256).Hash.ToLowerInvariant()
   '"' + $_ + '" = "' + $digest + '"'
 }
@@ -44,6 +45,7 @@ $env:TEMP = $private
 $env:TMP = $private
 $env:TINYBUS_TEST_CONTEXT_MODULE = (Get-Item "$private/module_context.dll").FullName
 $env:TINYBUS_TEST_CONTEXT_EAGER_MODULE = (Get-Item "$private/module_context_eager.dll").FullName
+$env:TINYBUS_TEST_HOST_CALLBACK_MODULE = (Get-Item "$private/module_host_callback.dll").FullName
 $env:TINYBUS_TEST_MODULE = $module
 $env:TINYBUS_TEST_MODULE_TWO = $moduleTwo
 $env:TINYBUS_TEST_WRONG_TARGET = $wrongTarget

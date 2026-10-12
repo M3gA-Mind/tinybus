@@ -6,8 +6,11 @@
 //! a recovery phrase, a bearer token. The recipient of one of those is a
 //! **module loaded into the host's address space**, whose artifact the host
 //! verified before `dlopen`, or whose code was linked into the host. A
-//! secret handed to such a module never crosses a transport, never reaches a
-//! separate process, and never touches a socket.
+//! secret handed to such a module never reaches a separate process or socket.
+//! An explicit `ModuleHost` capability also permits exact confidential callbacks
+//! from one verified loaded instance to an SDK-created local host connection.
+//! That scoped exception is not artifact attestation and grants no permission
+//! to aliases, ordinary connections, custom transports or other module instances.
 //!
 //! Everything else on the bus — services in their own processes, CLI clients,
 //! monitors — does not receive secrets. Not "receives them less safely":
@@ -38,8 +41,8 @@
 //!
 //! What attestation buys is therefore **admission control**, not isolation:
 //! only code whose hash an operator allowlisted is loaded at all, and only such
-//! code is handed a secret through the bus. The bus's job is to refuse to be
-//! the delivery mechanism for anything else. An integration whose compromise
+//! code or its explicitly scoped local host callback is handed a secret through
+//! the bus. The bus refuses all other recipient classes. An integration whose compromise
 //! must not reach the kernel's secrets belongs in a separate process — where it
 //! is, by this design, ineligible to receive them.
 //!
