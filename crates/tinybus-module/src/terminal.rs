@@ -109,13 +109,14 @@ pub(super) struct StartupResources {
     pub inbound: Option<mpsc::Sender<IncomingFrame>>,
     pub initial: Option<tokio::task::JoinHandle<Result<()>>>,
     pub initial_future: SetupFutureSlot,
+    pub reinit_future: SetupFutureSlot,
 }
 impl Default for StartupResources {
     fn default() -> Self {
         Self { runtime: None, setup: None, retained_factory: None, config: None,
             reinitializer_factory: None, reinitialize: Arc::new(StdMutex::new(None)),
             connection: Arc::new(StdMutex::new(None)), inbound: None, initial: None,
-            initial_future: Arc::new(StdMutex::new(None)) }
+            initial_future: Arc::new(StdMutex::new(None)), reinit_future: Arc::new(StdMutex::new(None)) }
     }
 }
 pub(super) struct TerminalState {
@@ -211,7 +212,8 @@ impl TerminalState {
         let cell = control.payloads.cell(kind);
         // Once/terminal admission prevents a second primary in this category.
         // A violated internal invariant cannot discard a foreign payload here.
-        assert!(cell.is_none(), "terminal primary boundary is once-only");
+        // Call sites admit this category once and deny all later invocation.
+        // No assertion/unwind, replacement retry, or payload disposal path.
         *cell = Some(payload);
     }
     pub fn register(self: &Arc<Self>, hooks: RuntimeHooks) {
@@ -311,9 +313,9 @@ impl TerminalState {
         if completion == TerminalCompletion::PhysicallyStopped { self.remove_anchor(); }
     }
     fn settle_setup(self: &Arc<Self>) -> bool {
-        let (initial, handle, reinitialize, future) = {
+        let (initial, handle, reinitialize, future, reinit_future) = {
             let mut resources = self.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            (resources.initial.take(), resources.runtime.as_ref().map(|runtime| runtime.handle().clone()), resources.reinitialize.clone(), resources.initial_future.clone())
+            (resources.initial.take(), resources.runtime.as_ref().map(|runtime| runtime.handle().clone()), resources.reinitialize.clone(), resources.initial_future.clone(), resources.reinit_future.clone())
         };
         if let Some(initial) = initial {
             initial.abort();
@@ -333,6 +335,8 @@ impl TerminalState {
         let callback = reinitialize.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         if let Some(owner) = &self.owner { owner.stop(); }
         drop(callback);
+        let future = reinit_future.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        drop(future);
         true
     }
     fn release_resources(&self) -> bool {

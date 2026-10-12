@@ -269,6 +269,7 @@ struct ModuleTransport {
     inbound: Mutex<mpsc::Receiver<IncomingFrame>>,
     provenance: Arc<AtomicBool>,
     detach_on_panic: bool,
+    _terminal_owner: Option<terminal::SdkOwner>,
 }
 
 #[async_trait]
@@ -606,6 +607,7 @@ where
             inbound: Mutex::new(inbound_rx),
             provenance: Arc::new(AtomicBool::new(false)),
             detach_on_panic,
+            _terminal_owner: None,
         });
         let connection_slot = Arc::new(StdMutex::new(None));
         let task_connection_slot = connection_slot.clone();
@@ -1259,11 +1261,239 @@ where C: serde::de::DeserializeOwned + Send + 'static,
     F: Fn(Connection, C) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
-    let Some((_, compatible)) = (unsafe { validate_start_arguments(host, out, worker_threads) }) else { return TB_BAD_ARGUMENT; };
-    let Some(state) = terminal::TerminalState::admit(HostCalls(compatible), None) else { return TB_CLOSED; };
-    let _result = factory(state.view());
-    state.empty_factory_failure();
-    TB_CLOSED
+    unsafe { start_terminal_factory_mode(host, out, worker_threads, factory, false) }
+}
+
+/// Linked counterpart with explicit native authority from the supplied host.
+/// It retains the embedding process's tracing subscriber and panic hook.
+///
+/// # Safety
+/// Uphold [`start_terminal_reconfigurable_module_with_factory`]'s contracts.
+#[doc(hidden)]
+pub unsafe fn start_linked_terminal_reconfigurable_module_with_factory<C, F, Fut>(
+    host: *const TbHostVtable, out: *mut TbModuleVtable, worker_threads: usize,
+    _detach_on_panic: bool, factory: impl FnOnce(NativeInstanceLiveness) -> Result<(F, RuntimeHooks)>,
+) -> i32
+where C: serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(Connection, C) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    unsafe { start_terminal_factory_mode(host, out, worker_threads, factory, true) }
+}
+
+// Process-lifetime C tombstone does not retain the actual State after proved
+// successful shutdown. Surviving liveness views retain their own slot permits.
+struct TerminalRuntimeContext { state: StdMutex<Option<Arc<terminal::TerminalState>>> }
+impl TerminalRuntimeContext {
+    fn state(&self) -> Option<Arc<terminal::TerminalState>> {
+        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+}
+unsafe extern "C" fn terminal_deliver(ctx: *mut c_void, ptr: *const u8, len: usize) -> i32 {
+    if ctx.is_null() || ptr.is_null() || len > MAX_FRAME_LEN { return TB_BAD_ARGUMENT; }
+    let context = unsafe { &*ctx.cast::<TerminalRuntimeContext>() };
+    let Some(state) = context.state() else { return TB_CLOSED; };
+    if !state.is_live() { return TB_CLOSED; }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+    let brokered = state.host.is_broker_routed();
+    let sender = state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).inbound.clone();
+    match sender.map(|sender| sender.try_send((bytes, brokered))) {
+        Some(Ok(())) => TB_OK,
+        Some(Err(mpsc::error::TrySendError::Full(_))) => TB_BACKPRESSURE,
+        _ => TB_CLOSED,
+    }
+}
+unsafe extern "C" fn terminal_shutdown(ctx: *mut c_void, deadline_ms: u64) -> i32 {
+    if ctx.is_null() { return TB_BAD_ARGUMENT; }
+    let context = unsafe { &*ctx.cast::<TerminalRuntimeContext>() };
+    let Some(state) = context.state() else { return TB_CLOSED; };
+    let _scope = state.owner.as_ref().map(ExecutionOwner::enter);
+    state.is_live(); // sample actual host Fault before selecting ordinary Stop
+    state.signal(TerminalReason::Stop);
+    let completion = state.wait(Duration::from_millis(deadline_ms));
+    // Genuine source/native Fault cannot earn accepted-vtable physical success.
+    state.is_live();
+    if completion != TerminalCompletion::PhysicallyStopped || state.has_fault() { return TB_PANICKED; }
+    let retired = context.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    drop(retired);
+    TB_OK
+}
+unsafe extern "C" fn terminal_reinitialize(ctx: *mut c_void, ptr: *const u8, len: usize) -> i32 {
+    if ctx.is_null() || len > 1024 * 1024 || (ptr.is_null() && len != 0) { return TB_BAD_ARGUMENT; }
+    let context = unsafe { &*ctx.cast::<TerminalRuntimeContext>() };
+    let Some(state) = context.state() else { return TB_CLOSED; };
+    if !state.is_live() { return TB_CLOSED; }
+    let _scope = state.owner.as_ref().map(ExecutionOwner::enter);
+    let callback = state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).reinitialize.clone();
+    let callback = callback.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !state.is_live() { return TB_CLOSED; }
+    let Some(callback) = callback.as_ref() else { return TB_CLOSED; };
+    match catch_unwind(AssertUnwindSafe(|| callback(ptr, len))) {
+        Ok(code) => code,
+        Err(payload) => { state.source_panic(terminal::PayloadKind::Reinit, payload); TB_PANICKED }
+    }
+}
+
+// The task never owns the foreign future across a yield or on cancellation.
+// Each poll takes/polls/reattaches without holding a resource mutex over user
+// code. Physical cleanup joins the sole task, then destroys this retained future.
+struct TerminalSetupPoll {
+    slot: terminal::SetupFutureSlot, state: Arc<terminal::TerminalState>, kind: terminal::PayloadKind,
+}
+impl Future for TerminalSetupPoll {
+    type Output = Result<()>;
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        let mut future = self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            future.as_mut().map_or(std::task::Poll::Ready(Err(Error::ConnectionClosed)), |future| future.as_mut().poll(cx))
+        }));
+        *self.slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = future;
+        match outcome {
+            Ok(std::task::Poll::Ready(Err(error))) => {
+                self.state.signal(TerminalReason::SetupFailed); std::task::Poll::Ready(Err(error))
+            }
+            Ok(poll) => poll,
+            Err(payload) => {
+                self.state.source_panic(self.kind, payload);
+                std::task::Poll::Ready(Err(Error::failed("module setup panicked")))
+            }
+        }
+    }
+}
+async fn terminal_notification(state: &terminal::TerminalState) {
+    loop {
+        let notification = state.terminal_notify.notified();
+        tokio::pin!(notification);
+        notification.as_mut().enable();
+        if state.is_terminal() { return; }
+        notification.await;
+    }
+}
+
+unsafe fn start_terminal_factory_mode<C, F, Fut>(
+    host: *const TbHostVtable, out: *mut TbModuleVtable, worker_threads: usize,
+    factory: impl FnOnce(NativeInstanceLiveness) -> Result<(F, RuntimeHooks)>, linked: bool,
+) -> i32
+where C: serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(Connection, C) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let Some((capacity, compatible)) = (unsafe { validate_start_arguments(host, out, worker_threads) }) else { return TB_BAD_ARGUMENT; };
+    // Reject unavailable, unknown and terminal authority before any factory.
+    let Some(query) = compatible.native_terminal_state else { return TB_CLOSED; };
+    if unsafe { query(compatible.host_ctx) } != tinybus::module::abi::TB_NATIVE_TERMINAL_LIVE { return TB_CLOSED; }
+    let owner = (!linked).then(|| ExecutionOwner::new(HostCalls(compatible)));
+    let Some(state) = terminal::TerminalState::admit(HostCalls(compatible), owner) else { return TB_CLOSED; };
+    if state.owner.is_some() { ExecutionOwner::install_panic_hook(); }
+    let _scope = state.owner.as_ref().map(ExecutionOwner::enter);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let config = match unsafe { parse_config::<C>(host) } { Ok(config) => config, Err(code) => return code };
+        state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).config = Some(Box::new(config));
+        let (setup, hooks) = match catch_unwind(AssertUnwindSafe(|| factory(state.view()))) {
+            Ok(Ok(returned)) => returned,
+            Ok(Err(_error)) => { state.signal(TerminalReason::SetupFailed); return TB_CLOSED; }
+            Err(payload) => { state.source_panic(terminal::PayloadKind::Factory, payload); return TB_PANICKED; }
+        };
+        let setup = Arc::new(setup);
+        state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retained_factory = Some(Box::new(setup.clone()));
+        state.register(hooks);
+        if !state.is_live() { return TB_CLOSED; }
+        let config = state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).config.take();
+        let config = *config.expect("attached config").downcast::<C>().unwrap_or_else(|_| unreachable!("private config type"));
+        let initial_setup = setup.clone();
+        state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).setup = Some(Box::new(move |connection| Box::pin(initial_setup(connection, config))));
+        let weak = Arc::downgrade(&state);
+        let reinitializer: ReinitializeFactory = Box::new(move |handle, connection_slot| {
+            Box::new(move |ptr, len| {
+                let Some(state) = weak.upgrade() else { return TB_CLOSED; };
+                if !state.is_live() { return TB_CLOSED; }
+                let bytes = if len == 0 { b"{}".as_slice() } else { unsafe { std::slice::from_raw_parts(ptr, len) } };
+                let config = match serde_json::from_slice::<C>(bytes) { Ok(config) => config, Err(_) => return TB_BAD_ARGUMENT };
+                let connection = connection_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                let Some(connection) = connection else { return TB_CLOSED; };
+                let slot = state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).reinit_future.clone();
+                let previous = slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+                drop(previous);
+                if !state.is_live() { return TB_CLOSED; }
+                let future = Box::pin(setup(connection, config));
+                *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(future);
+                let result = handle.block_on(async {
+                    tokio::select! { biased;
+                        result = TerminalSetupPoll { slot, state: state.clone(), kind: terminal::PayloadKind::Reinit } => result,
+                        () = terminal_notification(&state) => Err(Error::ConnectionClosed),
+                    }
+                });
+                match result { Ok(()) if state.is_live() => TB_OK, Ok(()) | Err(_) => TB_CLOSED }
+            })
+        });
+        state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).reinitializer_factory = Some(reinitializer);
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        if let Some(owner) = &state.owner { owner.configure(&mut builder); }
+        let runtime = match builder.worker_threads(worker_threads).enable_all().build() {
+            Ok(runtime) => runtime, Err(_) => { state.signal(TerminalReason::SetupFailed); return TB_CLOSED; }
+        };
+        // Immediate mechanical transfer: no later startup failure drops Runtime on ABI.
+        state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).runtime = Some(runtime);
+        let (inbound_tx, inbound_rx) = mpsc::channel(MODULE_QUEUE_CAPACITY);
+        state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).inbound = Some(inbound_tx);
+        let transport = Arc::new(ModuleTransport { host: state.host, inbound: Mutex::new(inbound_rx),
+            provenance: Arc::new(AtomicBool::new(false)), detach_on_panic: false, _terminal_owner: Some(state.sdk_owner()) });
+        let (handle, connection_slot, factory) = {
+            let mut resources = state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            (resources.runtime.as_ref().expect("attached runtime").handle().clone(), resources.connection.clone(), resources.reinitializer_factory.take())
+        };
+        let callback = factory.map(|factory| factory(handle.clone(), connection_slot.clone()));
+        let callback_slot = state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).reinitialize.clone();
+        *callback_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = callback;
+        let task_state = state.clone();
+        let task = handle.spawn(async move {
+            let connection = module_connection(transport);
+            if let Err(error) = connection.handshake().await { task_state.signal(TerminalReason::SetupFailed); return Err(error); }
+            connection.__set_panic_handler(Arc::new(|| Error::MethodFailed {
+                name: MODULE_PANIC_ERROR.to_owned(), message: "a module method panicked".to_owned(),
+            }));
+            let observer_state = Arc::downgrade(&task_state);
+            connection.__set_catch_observer(Arc::new(move || {
+                if let Some(state) = observer_state.upgrade() {
+                    state.mark_uncertain(); state.signal(TerminalReason::Fault);
+                }
+            }));
+            // Connection is persisted independently of initial task lifetime.
+            *connection_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(connection.clone());
+            if !task_state.is_live() { return Ok(()); }
+            let setup = task_state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).setup.take();
+            let future = match catch_unwind(AssertUnwindSafe(|| setup.map(|setup| setup(connection)))) {
+                Ok(Some(future)) => future,
+                Ok(None) => return Err(Error::ConnectionClosed),
+                Err(payload) => { task_state.source_panic(terminal::PayloadKind::Initial, payload); return Err(Error::failed("module setup construction panicked")); }
+            };
+            let slot = task_state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).initial_future.clone();
+            *slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(future);
+            let result = TerminalSetupPoll { slot, state: task_state.clone(), kind: terminal::PayloadKind::Initial }.await;
+            if result.is_ok() && task_state.is_live() { task_state.host.ready(); }
+            result
+        });
+        state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).initial = Some(task);
+        let context = Box::into_raw(Box::new(TerminalRuntimeContext { state: StdMutex::new(Some(state.clone())) })).cast::<c_void>();
+        if capacity >= size_of::<TbModuleVtable>() as u32 {
+            unsafe { out.write(TbModuleVtable { size: size_of::<TbModuleVtable>() as u32, _reserved: 0,
+                module_ctx: context, deliver: terminal_deliver, shutdown: terminal_shutdown, reinitialize: Some(terminal_reinitialize) }); }
+        } else {
+            unsafe { out.cast::<TbModuleVtableV1Prefix>().write(TbModuleVtableV1Prefix {
+                size: TB_MODULE_VTABLE_BASE_SIZE, _reserved: 0, module_ctx: context, deliver: terminal_deliver, shutdown: terminal_shutdown }); }
+        }
+        TB_OK
+    }));
+    let code = match result {
+        Ok(code) => code,
+        Err(payload) => { state.source_panic(terminal::PayloadKind::Startup, payload); TB_PANICKED }
+    };
+    if code != TB_OK {
+        if let Some(owner) = &state.owner { owner.stop(); }
+        if !state.is_terminal() { state.signal(TerminalReason::SetupFailed); }
+    }
+    state.publish();
+    code
 }
 
 #[cfg(test)]
