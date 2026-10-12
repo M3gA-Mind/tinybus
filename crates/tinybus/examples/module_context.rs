@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tinybus::{CallContext, Connection, Error, Interface, InterfaceName, MemberName, Result};
 
-struct ContextService(Connection);
+struct ContextService(Connection, std::sync::Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<tinybus::message::Message>>>);
 
 #[async_trait]
 impl Interface for ContextService {
@@ -46,14 +46,23 @@ impl Interface for ContextService {
                 };
                 Ok(serde_json::json!([sender, reply]))
             }
+            "WaitForWatchChanged" => {
+                let message = self.1.lock().await.recv().await
+                    .map_err(|_| Error::failed("directed signal receiver closed"))?;
+                Ok(message.body)
+            }
             _ => Err(Error::failed("unknown method")),
         }
     }
 }
 
 async fn setup(connection: Connection) -> Result<()> {
+    let signals = connection
+        .proxy("org.example.Context", "/context", "org.example.Context")?
+        .receive_directed_signal("WatchChanged")
+        .await?;
     connection
-        .serve_at("/context".parse()?, ContextService(connection.clone()))
+        .serve_at("/context".parse()?, ContextService(connection.clone(), std::sync::Arc::new(tokio::sync::Mutex::new(signals))))
         .await?;
     connection.request_name("org.example.Context").await
 }
@@ -62,6 +71,6 @@ tinybus_module::module_export! {
     setup = setup,
     worker_threads = 1,
     provides = ["org.example.Context"],
-    methods = ["Inspect", "Callback", "ConfidentialCallback"],
-    signals = [], requires = [], optional = [], lazy = true,
+    methods = ["Inspect", "Callback", "ConfidentialCallback", "WaitForWatchChanged"],
+    signals = ["WatchChanged"], requires = [], optional = [], lazy = true,
 }
