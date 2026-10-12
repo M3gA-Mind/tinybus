@@ -1141,6 +1141,17 @@ macro_rules! module_export {
         }
     };
     (
+        terminal_setup_factory = $factory:path,
+        config = $config:ty,
+        $($rest:tt)*
+    ) => {
+        $crate::module_export! {
+            @configured export = {#[unsafe(no_mangle)]},
+            start = $crate::start_terminal_reconfigurable_module_with_factory,
+            setup = $factory, config = $config, $($rest)*
+        }
+    };
+    (
         setup_factory = $factory:path,
         config = $config:ty,
         $($rest:tt)*
@@ -1181,6 +1192,14 @@ macro_rules! module_export {
 /// Both configured `setup` and per-instance `setup_factory` forms are supported.
 #[macro_export]
 macro_rules! module_export_static {
+    (terminal_setup_factory = $factory:path, config = $config:ty, $($rest:tt)*) => {
+        $crate::module_export! {
+            @configured export = {},
+            start = $crate::start_linked_terminal_reconfigurable_module_with_factory,
+            setup = $factory, config = $config, $($rest)*
+        }
+        $crate::module_export! { @linked }
+    };
     (setup_factory = $factory:path, config = $config:ty, $($rest:tt)*) => {
         $crate::module_export! {
             @configured export = {},
