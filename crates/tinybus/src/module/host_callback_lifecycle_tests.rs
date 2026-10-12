@@ -39,6 +39,7 @@ impl crate::Interface for CommittingCallback {
 #[derive(Clone, Copy)]
 enum DrainStop {
     Complete,
+    HeldProbeObserver,
     Timeout,
     Cancel,
     DropHost,
@@ -73,6 +74,22 @@ async fn host_stop_drain_cancellation_retains_stop_intent_and_denies_new_admissi
 #[ignore = "requires TINYBUS_TEST_CONTEXT_MODULE to point at the built cdylib"]
 async fn host_drop_after_cancelled_stop_waits_for_actual_provider_drain() {
     stop_after_admitted_callback(DrainStop::DropHost).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TINYBUS_TEST_CONTEXT_MODULE to point at the built cdylib"]
+async fn native_stop_completion_does_not_wait_for_the_denial_probe_observer() {
+    stop_after_admitted_callback(DrainStop::HeldProbeObserver).await;
+}
+
+async fn native_cleanup_finished(transport: &crate::module::transport::ModuleTransport) {
+    while transport.native_terminal_state_for_test()
+        & crate::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED
+        == 0
+        || transport.lifecycle_is_owned_for_test()
+    {
+        tokio::task::yield_now().await;
+    }
 }
 
 async fn stop_after_admitted_callback(mode: DrainStop) {
@@ -133,6 +150,7 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
     } else {
         Duration::from_secs(2)
     };
+    let stop_started = std::time::Instant::now();
     let mut stopping = Some(Box::pin(host.inner.stop(&loaded.name, deadline)));
     let mut early = std::future::poll_fn(|cx| {
         std::task::Poll::Ready(
@@ -146,7 +164,7 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
     if matches!(mode, DrainStop::Timeout) && early.is_none() {
         early = Some(stopping.take().unwrap().await);
     }
-    if !matches!(mode, DrainStop::Complete) {
+    if !matches!(mode, DrainStop::Complete | DrainStop::HeldProbeObserver) {
         drop(stopping.take());
     }
     let terminal_while_held = transport.native_terminal_state_for_test();
@@ -165,10 +183,44 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
         .iter()
         .any(|module| Arc::ptr_eq(&module.transport, &transport));
     let enable_denied = host.inner.enable(&loaded.name, true).is_err();
-    let new_call_denied = proxy
-        .call_confidential::<serde_json::Value>("ConfidentialCallback", ())
-        .await
-        .is_err();
+    // This observation is independently owned: its scheduling must not consume
+    // the stop's semantic deadline while the fixture deliberately holds work.
+    let probe_entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let probe_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let probe_release_on_failure = CallbackRelease(probe_release.clone());
+    let held_probe = matches!(mode, DrainStop::HeldProbeObserver);
+    let entered = probe_entered.clone();
+    let release_probe = probe_release.clone();
+    let denial = tokio::spawn(async move {
+        let denied = proxy
+            .call_confidential::<serde_json::Value>("ConfidentialCallback", ())
+            .await
+            .is_err();
+        if held_probe {
+            entered.add_permits(1);
+            let _permit = release_probe.acquire().await;
+        }
+        denied
+    });
+    let observer = if held_probe {
+        let transport = transport.clone();
+        Some(tokio::spawn(async move {
+            // Always release the observer, including a failed watchdog.
+            let _release = CallbackRelease(probe_release);
+            let entered = tokio::time::timeout(
+                Duration::from_secs(2),
+                probe_entered.acquire(),
+            ).await;
+            let completed = tokio::time::timeout(
+                Duration::from_secs(1),
+                native_cleanup_finished(&transport),
+            ).await;
+            (entered.is_ok(), completed.is_ok())
+        }))
+    } else {
+        None
+    };
+    let new_call_denied = denial.await;
     if matches!(mode, DrainStop::DropHost) {
         let account = host.inner.loaded.lock().unwrap()[0]
             .callback_state
@@ -199,6 +251,8 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
         })
         .await;
         let _outcome = request.await;
+        drop(probe_release_on_failure);
+        assert!(new_call_denied.is_ok_and(|denied| denied));
         assert!(completed.is_ok());
         assert_eq!(
             terminal_after_drop,
@@ -208,16 +262,15 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
         assert!(entered.is_ok());
         assert!(host_owner.upgrade().is_none());
         assert_eq!(still_counted, 1);
-        assert!(lifecycle_free && authority_denied && new_call_denied);
+        assert!(lifecycle_free && authority_denied);
         assert_eq!(committed.load(Ordering::Acquire), 1);
         assert!(!transport.is_faulted());
         return;
     }
     // Release and consume real callback/physical cleanup before all assertions.
     drop(release_on_failure);
-    tokio::time::timeout(Duration::from_secs(2), binding.guard().drained())
-        .await
-        .unwrap();
+    let drained = tokio::time::timeout(Duration::from_secs(2), binding.guard().drained())
+        .await;
     let stopped = if let Some(stopping) = stopping {
         if let Some(result) = early.take() {
             result
@@ -227,11 +280,34 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
     } else {
         host.inner.stop(&loaded.name, Duration::from_secs(2)).await
     };
-    let _outcome = request.await.unwrap();
-    assert!(stopped.is_ok());
+    let stop_elapsed = stop_started.elapsed();
+    let stop_code = stopped.as_ref().err().map(|error| error.wire_name().to_owned());
+    // An error is not evidence of reclamation. Complete the retained ordinary
+    // terminal job and independently observe native shutdown and lock release.
+    transport.request_terminal(false);
+    let cleanup = tokio::time::timeout(
+        Duration::from_secs(2),
+        native_cleanup_finished(&transport),
+    ).await;
+    let request_outcome = request.await;
+    drop(probe_release_on_failure);
+    let observer_outcome = match observer {
+        Some(observer) => Some(observer.await),
+        None => None,
+    };
+    eprintln!("stop fixture: code={stop_code:?} elapsed={stop_elapsed:?} cleanup={}",
+        cleanup.is_ok());
+    assert!(cleanup.is_ok(), "actual native cleanup did not finish");
+    assert!(request_outcome.is_ok());
+    assert!(drained.is_ok());
+    if let Some(outcome) = observer_outcome {
+        assert!(outcome.is_ok_and(|(entered, completed)| entered && completed),
+            "actual native cleanup waited for the unrelated denial observer");
+    }
+    assert!(stopped.is_ok(), "stop code={stop_code:?}, elapsed={stop_elapsed:?}");
     assert_eq!(committed.load(Ordering::Acquire), 1);
     assert_eq!(still_running, 1);
-    assert!(authority_denied && owner_retained && enable_denied && new_call_denied);
+    assert!(authority_denied && owner_retained && enable_denied && new_call_denied.is_ok_and(|denied| denied));
     assert!(!shutdown_started_early && !physically_stopped_early);
     assert_eq!(
         terminal_while_held,
