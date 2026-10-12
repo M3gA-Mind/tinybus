@@ -26,6 +26,9 @@ use tinybus::module::abi::{
 use tinybus::{Connection, Error, Result, Transport};
 use tokio::sync::{Mutex, mpsc};
 
+mod terminal;
+pub use terminal::{NativeInstanceLiveness, RuntimeHooks, TerminalCompletion, TerminalReason};
+
 mod execution_context;
 use execution_context::ExecutionOwner;
 
