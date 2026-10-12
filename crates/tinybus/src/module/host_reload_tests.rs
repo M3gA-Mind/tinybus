@@ -66,13 +66,10 @@ static LOGS: OnceLock<Mutex<HashMap<usize, Vec<String>>>> = OnceLock::new();
 unsafe extern "C" fn observe_log(ctx: *mut std::ffi::c_void, _: u32, ptr: *const u8, len: usize) {
     let line =
         String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(ptr, len) }).into_owned();
-    LOGS.get()
-        .unwrap()
-        .lock()
-        .unwrap()
-        .entry(ctx as usize)
-        .or_default()
-        .push(line);
+    record_log(LOGS.get(), ctx as usize, line);
+}
+fn record_log(storage: Option<&Mutex<HashMap<usize, Vec<String>>>>, key: usize, line: String) {
+    storage.unwrap().lock().unwrap().entry(key).or_default().push(line);
 }
 fn observed_native(host: &ModuleHost, path: &Path, prefix: &str) -> usize {
     let artifact = loader::load(path, false).unwrap();
@@ -188,4 +185,29 @@ async fn native_replacement_logs_and_sanitized_panics_use_only_its_original_host
     }
     second.shutdown(Duration::from_secs(3)).await;
     broker_task.abort();
+}
+
+
+#[test]
+fn native_log_fixture_recovers_poison_without_unwinding_across_abi() {
+    let storage = Mutex::new(HashMap::new());
+    let poisoned = std::panic::catch_unwind(|| {
+        let _guard = storage.lock().unwrap();
+        panic!("controlled Rust fixture poison");
+    });
+    // Exercise the callback's Rust body first, safely containing baseline RED.
+    let recovered = std::panic::catch_unwind(|| record_log(Some(&storage), 1, "local".into()));
+    if recovered.is_ok() {
+        let logs = LOGS.get_or_init(|| Mutex::new(HashMap::new()));
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = logs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            panic!("controlled Rust fixture poison");
+        });
+        let line = b"actual ABI callback after fixture poison";
+        unsafe { observe_log(1usize as *mut std::ffi::c_void, 1, line.as_ptr(), line.len()) };
+    }
+    let recorded = LOGS.get().and_then(|logs| logs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&1).cloned());
+    assert!(poisoned.is_err());
+    assert!(recovered.is_ok(), "callback body must recover poisoned fixture storage");
+    assert!(recorded.is_some_and(|lines| lines.iter().any(|line| line.contains("actual ABI callback"))));
 }

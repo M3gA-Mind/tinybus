@@ -167,6 +167,7 @@ fn shutdown_suppresses_the_exact_factory_and_configuration_caller_dispatch() {
         let late = count.load(Ordering::SeqCst);
         let replacement_after = replacement_count.load(Ordering::SeqCst);
         let replacement_stopped = if replaced == TB_OK { unsafe { (replacement.shutdown)(replacement.module_ctx, 1000) } } else { TB_CLOSED };
+        eprintln!("factory={factory}: start={started}, stop={stopped}, before={before}, live={live}, after_shutdown={after_shutdown}, late={late}, replacement={replacement_before}/{replacement_after}, replacement_stop={replacement_stopped}");
         assert_eq!(started, TB_OK);
         assert!(dispatch.is_some());
         assert!(live > before, "real caller dispatch forwards before shutdown");
