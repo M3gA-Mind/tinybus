@@ -150,7 +150,7 @@ async fn actual_linked_initial_cancellation_drops_future_and_joins_worker_on_phy
     let (fixture, events) = controlled::fixture();
     let broker = tinybus::broker::Broker::new();
     broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
-    let host = tinybus::module::ModuleHost::new(broker);
+    let host = Arc::new(tinybus::module::ModuleHost::new(broker));
     host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":1})).unwrap();
     let entered = events.recv_timeout(Duration::from_secs(3)).unwrap();
     let view = fixture.view.lock().unwrap().take().unwrap();
@@ -176,7 +176,7 @@ async fn actual_linked_setup_construction_and_poll_panics_still_finish_real_work
         let (fixture, events) = controlled::fixture();
         let broker = tinybus::broker::Broker::new();
         broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
-        let host = tinybus::module::ModuleHost::new(broker);
+        let host = Arc::new(tinybus::module::ModuleHost::new(broker));
         host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":mode})).unwrap();
         // Consume through actual join notification before assertions or host teardown.
         let mut seen = Vec::new();
@@ -248,12 +248,12 @@ async fn compiled_native_terminal_owns_initial_cancellation_panics_join_and_stal
         let encoded = unsafe { std::slice::from_raw_parts((&controls as *const NativeControls).cast::<u8>(), size_of::<NativeControls>()) }.to_vec();
         let broker = tinybus::broker::Broker::new();
         broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
-        let host = tinybus::module::ModuleHost::new(broker);
+        let host = Arc::new(tinybus::module::ModuleHost::new(broker));
         host.load_file_with_config(&path, serde_json::json!({"mode":mode,"test_controls":encoded})).unwrap();
         let (context, old_probe) = unsafe { terminal_fixture_symbols(&path) };
         let actual_context = context();
         let first = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
-        let stale_result = old_context.map(old_probe);
+        let stale_result = old_context.map(|token| old_probe(token));
         host.shutdown(Duration::from_secs(5)).await;
         let mut seen = vec![first];
         while !seen.iter().any(|(event, _)| *event == 6) { seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap()); }
@@ -278,7 +278,7 @@ async fn actual_linked_reinit_terminal_cancellation_settles_before_worker_join()
     let (fixture, events) = controlled::fixture();
     let broker = tinybus::broker::Broker::new();
     broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
-    let host = tinybus::module::ModuleHost::new(broker);
+    let host = Arc::new(tinybus::module::ModuleHost::new(broker));
     host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":0})).unwrap();
     let initial = events.recv_timeout(Duration::from_secs(3)).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
