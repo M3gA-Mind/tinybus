@@ -350,14 +350,15 @@ async fn a_pending_call_is_failed_when_the_module_closes_its_delivery_queue() {
     transport.defer_initialize(initialize_ok, host);
     transport.send(call()).await.unwrap();
     unsafe { (host.ready)(host.host_ctx) };
-    let reply = tokio::time::timeout(Duration::from_secs(1), transport.recv())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(reply.header.kind, MessageKind::Error);
-    assert!(transport.is_faulted());
+    let reply = tokio::time::timeout(Duration::from_secs(1), transport.recv()).await;
+    let faulted = transport.is_faulted();
+    // A failed receive may have no fault-owned cleanup job. Commit cleanup
+    // before reporting the captured result; this does not clear an actual fault.
+    transport.request_terminal(false);
     finish_closed_delivery_fixture(&transport, lock).await;
+    let reply = reply.unwrap().unwrap().unwrap();
+    assert_eq!(reply.header.kind, MessageKind::Error);
+    assert!(faulted);
 }
 
 // Keep the shared vtable fixture serialized through its final global writes.
