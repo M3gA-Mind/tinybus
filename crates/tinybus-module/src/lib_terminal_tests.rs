@@ -856,6 +856,9 @@ async fn actual_reinit_source_error_and_panic_request_outside_callback_exclusion
         }).await.unwrap();
         let result = host.reinitialize("tinybus-module", serde_json::json!({"mode":mode})).await;
         host.shutdown(Duration::from_secs(8)).await;
+        loop {
+            if matches!(events.recv_timeout(Duration::from_secs(5)).unwrap(), controlled::Event::Finish) { break; }
+        }
         assert!(result.is_err());
         assert_eq!(fixture.requests.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.joins.load(Ordering::SeqCst), 1);
