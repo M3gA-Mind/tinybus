@@ -223,3 +223,26 @@ fn shutdown_suppresses_the_exact_factory_and_configuration_caller_dispatch() {
         );
     }
 }
+
+unsafe extern "C" fn tracing_native_query(_: *mut c_void) -> u32 {
+    tracing::info!("terminal delivery query");
+    tinybus::module::abi::TB_NATIVE_TERMINAL_LIVE
+}
+#[test]
+fn terminal_deliver_enters_exact_instance_and_restores_nested_caller() {
+    let (caller, caller_count) = owner();
+    let (instance, instance_count) = owner();
+    let host = HostCalls(TbHostVtable {
+        native_terminal_state: Some(tracing_native_query),
+        ..instance.host.0
+    });
+    let state = super::super::terminal::TerminalState::admit(host, Some(instance)).unwrap();
+    let _outer = caller.enter();
+    let byte = 0;
+    let code = unsafe { super::super::terminal_deliver(state.context(), &byte, 1) };
+    tracing::info!("restored caller");
+    state.empty_factory_failure();
+    assert_eq!(code, TB_CLOSED); // No inbound queue was installed.
+    assert_eq!(instance_count.load(Ordering::SeqCst), 1);
+    assert_eq!(caller_count.load(Ordering::SeqCst), 1);
+}
