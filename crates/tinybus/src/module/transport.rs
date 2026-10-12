@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Condvar, Mutex as StdMutex, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -34,6 +34,7 @@ struct HostContext {
     faulted: AtomicBool,
     init_failed: AtomicBool,
     stopped: AtomicBool,
+    admission_closed: AtomicBool,
     init_started: AtomicBool,
     init_notify: Notify,
     ready: AtomicBool,
@@ -58,8 +59,55 @@ pub(crate) struct ModuleTransport {
     // let a second lifecycle callback overlap the still-running first one.
     lifecycle: Arc<Mutex<()>>,
     stop_task_spawned: Arc<AtomicBool>,
+    callbacks: CallbackGate,
     initialization_gate: StdMutex<Option<bool>>,
     initialization_gate_changed: Notify,
+}
+
+// Reservations cover physical callback execution, including signals. They are
+// independent of unanswered method calls and remain owned by the actual caller.
+#[derive(Default)]
+struct CallbackState {
+    closed: bool,
+    active: usize,
+}
+
+#[derive(Default)]
+struct CallbackGate {
+    state: StdMutex<CallbackState>,
+    drained: Condvar,
+}
+
+struct CallbackLease<'a>(&'a CallbackGate);
+
+impl CallbackGate {
+    /// Reserve entry atomically with physical stop's admission closure.
+    fn enter(&self) -> Result<CallbackLease<'_>> {
+        let mut state = self.state.lock().expect("module callback lock");
+        if state.closed {
+            return Err(Error::ConnectionClosed);
+        }
+        state.active += 1;
+        Ok(CallbackLease(self))
+    }
+
+    /// Retain the shutdown worker until every reserved callback has returned.
+    fn wait_drained(&self) {
+        let mut state = self.state.lock().expect("module callback lock");
+        while state.active != 0 {
+            state = self.drained.wait(state).expect("module callback lock");
+        }
+    }
+}
+
+impl Drop for CallbackLease<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().expect("module callback lock");
+        state.active -= 1;
+        if state.active == 0 {
+            self.0.drained.notify_all();
+        }
+    }
 }
 
 // `module_ctx` is opaque and all access to it goes through callbacks whose ABI
@@ -118,6 +166,7 @@ impl ModuleTransport {
             faulted: AtomicBool::new(false),
             init_failed: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
+            admission_closed: AtomicBool::new(false),
             init_started: AtomicBool::new(false),
             init_notify: Notify::new(),
             ready: AtomicBool::new(false),
@@ -137,6 +186,7 @@ impl ModuleTransport {
             drain_started: AtomicBool::new(false),
             lifecycle: Arc::new(Mutex::new(())),
             stop_task_spawned: Arc::new(AtomicBool::new(false)),
+            callbacks: CallbackGate::default(),
             initialization_gate: StdMutex::new(Some(true)),
             initialization_gate_changed: Notify::new(),
         });
@@ -225,19 +275,39 @@ impl ModuleTransport {
         self.initialization_gate_changed.notify_waiters();
     }
 
-    // Normal completion closes admission without inventing a module fault. The
-    // queue lock makes closure atomic with send admission and drainer retirement;
-    // no queued body survives disposal or starts a replacement drainer.
-    fn finish_stop(&self) {
-        {
+    /// Close admission before teardown, without reporting physical completion
+    /// or inventing a fault. The lifecycle owner alone invokes this operation.
+    fn close_admission(&self) {
+        let discarded = {
+            let _initialization = self
+                .initialization_gate
+                .lock()
+                .expect("initialization gate lock");
             let mut pending = self.pending.lock().expect("module pending lock");
-            self.context.stopped.store(true, Ordering::Release);
-            pending.clear();
-        }
+            let mut callbacks = self.callbacks.state.lock().expect("module callback lock");
+            callbacks.closed = true;
+            self.context.admission_closed.store(true, Ordering::Release);
+            std::mem::take(&mut *pending)
+        };
+        // Queued confidential bodies are released outside internal locks.
+        drop(discarded);
         self.context.init_notify.notify_waiters();
         self.context.ready_notify.notify_waiters();
         self.context.wake.notify_waiters();
         self.initialization_gate_changed.notify_waiters();
+    }
+
+    /// Publish physical completion only after the opaque shutdown returns.
+    fn finish_stop(&self) {
+        self.context.stopped.store(true, Ordering::Release);
+        self.context.init_notify.notify_waiters();
+        self.context.ready_notify.notify_waiters();
+        self.context.wake.notify_waiters();
+        self.initialization_gate_changed.notify_waiters();
+    }
+
+    fn admission_closed(&self) -> bool {
+        self.context.admission_closed.load(Ordering::Acquire)
     }
 
     fn is_stopped(&self) -> bool {
@@ -252,7 +322,7 @@ impl ModuleTransport {
                 .initialization_gate
                 .lock()
                 .expect("initialization gate lock");
-            if self.is_faulted() || self.is_stopped() {
+            if self.is_faulted() || self.admission_closed() {
                 return Err(Error::ConnectionClosed);
             }
             match allowed {
@@ -275,7 +345,7 @@ impl ModuleTransport {
                         .initialization_gate
                         .lock()
                         .expect("initialization gate lock");
-                    if self.is_stopped() {
+                    if self.admission_closed() {
                         return Err(InitFailure::Closed);
                     }
                     self.context.init_started.store(true, Ordering::Release);
@@ -327,7 +397,7 @@ impl ModuleTransport {
             })
             .await;
         match result {
-            Ok(()) if self.is_stopped() => Err(Error::ConnectionClosed),
+            Ok(()) if self.admission_closed() => Err(Error::ConnectionClosed),
             Ok(()) => Ok(()),
             Err(InitFailure::Closed) => Err(Error::ConnectionClosed),
             Err(InitFailure::Failed(reason)) => Err(Error::transport(reason.clone())),
@@ -339,7 +409,7 @@ impl ModuleTransport {
             let notified = self.context.ready_notify.notified();
             if self.context.ready.load(Ordering::Acquire)
                 || self.context.faulted.load(Ordering::Acquire)
-                || self.is_stopped()
+                || self.admission_closed()
             {
                 return;
             }
@@ -359,7 +429,7 @@ impl ModuleTransport {
     }
 
     pub(crate) async fn reinitialize(self: &Arc<Self>, bytes: crate::Secret) -> Result<()> {
-        if self.is_stopped() {
+        if self.admission_closed() {
             return Err(Error::ConnectionClosed);
         }
         let started = std::time::Instant::now();
@@ -371,7 +441,7 @@ impl ModuleTransport {
                         .expect("static member name is valid"),
                     timeout_ms: MODULE_INIT_DEADLINE.as_millis() as u64,
                 })?;
-        if self.is_stopped() {
+        if self.admission_closed() {
             return Err(Error::ConnectionClosed);
         }
         let module = self
@@ -432,7 +502,7 @@ impl ModuleTransport {
     pub(crate) async fn wait_initializing(&self) {
         loop {
             let notified = self.context.init_notify.notified();
-            if self.init_started() || self.is_faulted() || self.is_stopped() {
+            if self.init_started() || self.is_faulted() || self.admission_closed() {
                 return;
             }
             notified.await;
@@ -440,7 +510,7 @@ impl ModuleTransport {
     }
 
     async fn deliver_now(&self, message: Message) -> Result<()> {
-        if self.is_faulted() || self.is_stopped() {
+        if self.is_faulted() || self.admission_closed() {
             return Err(Error::ConnectionClosed);
         }
         let bytes = serde_json::to_vec(&message)?;
@@ -450,17 +520,24 @@ impl ModuleTransport {
 
         loop {
             let notified = self.context.wake.notified();
-            if self.is_faulted() || self.is_stopped() {
+            if self.is_faulted() || self.admission_closed() {
                 return Err(Error::ConnectionClosed);
             }
             let module = *self.module.lock().expect("module vtable lock");
             let Some(module) = module else {
                 return Err(Error::ConnectionClosed);
             };
+            let lease = self.callbacks.enter()?;
+            // Stop closes this gate and drains reservations before teardown;
+            // a caller disappearing cannot refund a running native callback.
             let code = unsafe { (module.deliver)(module.module_ctx, bytes.as_ptr(), bytes.len()) };
+            drop(lease);
             match code {
                 TB_OK => return Ok(()),
                 TB_BACKPRESSURE => {
+                    if self.admission_closed() {
+                        return Err(Error::ConnectionClosed);
+                    }
                     // A module that stops draining its queue and never calls
                     // `wake` must not park this delivery task — or the caller
                     // behind it — for the process lifetime. Expiry faults the
@@ -471,7 +548,7 @@ impl ModuleTransport {
                         .is_err()
                     {
                         let _pending = self.pending.lock().expect("module pending lock");
-                        if self.is_stopped() {
+                        if self.admission_closed() {
                             return Err(Error::ConnectionClosed);
                         }
                         self.context.faulted.store(true, Ordering::Release);
@@ -496,7 +573,7 @@ impl ModuleTransport {
     async fn drain_pending(self: Arc<Self>) {
         self.wait_ready().await;
         loop {
-            while !self.is_faulted() && !self.is_stopped() {
+            while !self.is_faulted() && !self.admission_closed() {
                 let message = self
                     .pending
                     .lock()
@@ -511,7 +588,7 @@ impl ModuleTransport {
                     return;
                 }
             }
-            if self.is_faulted() || self.is_stopped() {
+            if self.is_faulted() || self.admission_closed() {
                 self.drain_started.store(false, Ordering::Release);
                 return;
             }
@@ -542,7 +619,7 @@ impl ModuleTransport {
     async fn fault_pending(&self, failed: Message, error: Error) {
         let cleared = {
             let mut pending = self.pending.lock().expect("module pending lock");
-            if self.is_stopped() && matches!(error, Error::ConnectionClosed) {
+            if self.admission_closed() && matches!(error, Error::ConnectionClosed) {
                 pending.clear();
                 return;
             }
@@ -596,18 +673,12 @@ impl ModuleTransport {
         if self.is_stopped() {
             return TB_CLOSED;
         }
-        {
-            let _gate = self
-                .initialization_gate
-                .lock()
-                .expect("initialization gate lock");
-            if !self.init_started() && self.module.lock().expect("module vtable lock").is_none() {
-                self.finish_stop();
-            }
-        }
-        let code = self.shutdown_sync(deadline);
-        // A caller timeout is not physical completion. Running initialization
-        // and readiness observers are closed only after the opaque callback returns.
+        let started = std::time::Instant::now();
+        self.close_admission();
+        // This is the retained physical worker, not the caller's timeout. Never
+        // tear down code underneath an admitted callback or abort its lease.
+        self.callbacks.wait_drained();
+        let code = self.shutdown_sync(deadline.saturating_sub(started.elapsed()));
         self.finish_stop();
         self.context
             .inbound
@@ -674,13 +745,13 @@ impl From<StopError> for Error {
 #[async_trait]
 impl Transport for ModuleTransport {
     async fn send(&self, message: Message) -> Result<()> {
-        if self.is_stopped() {
+        if self.admission_closed() {
             return Err(Error::ConnectionClosed);
         }
         if let Err(error) = self.ensure_initialized().await {
             {
                 let _pending = self.pending.lock().expect("module pending lock");
-                if self.is_stopped() && matches!(error, Error::ConnectionClosed) {
+                if self.admission_closed() && matches!(error, Error::ConnectionClosed) {
                     return Err(Error::ConnectionClosed);
                 }
                 self.context.init_failed.store(true, Ordering::Release);
@@ -712,7 +783,7 @@ impl Transport for ModuleTransport {
         let is_call = message.header.kind == MessageKind::MethodCall;
         {
             let mut pending = self.pending.lock().expect("module pending lock");
-            if self.is_stopped() {
+            if self.admission_closed() {
                 return Err(Error::ConnectionClosed);
             }
             if is_call {
@@ -859,8 +930,10 @@ unsafe extern "C" fn host_broker_routing(ctx: *mut c_void) -> u32 {
 unsafe extern "C" fn host_ready(ctx: *mut c_void) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Some(context) = unsafe { ctx.cast::<HostContext>().as_ref() } {
-            context.ready.store(true, Ordering::Release);
-            context.ready_notify.notify_waiters();
+            if !context.admission_closed.load(Ordering::Acquire) {
+                context.ready.store(true, Ordering::Release);
+                context.ready_notify.notify_waiters();
+            }
         }
     }));
 }
