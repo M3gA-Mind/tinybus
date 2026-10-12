@@ -1581,7 +1581,10 @@ async fn dispatch(inner: &Inner, header: &Header, body: Value, brokered: bool) -
     };
     // Snapshot admission under the lock, then release it before user code:
     // callbacks can register/unserve interfaces while another call is parked.
-    let target = inner.objects.read().await.lookup(path, interface)?;
+    let target = {
+        let objects = inner.objects.read().await;
+        objects.lookup(path, interface)?
+    };
     ObjectTree::invoke(
         target,
         interface,
