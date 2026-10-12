@@ -1496,7 +1496,7 @@ async fn actual_native_eager_fault_denies_while_config_remains_borrowed_then_joi
     let host = DeferredInitializer { initialize: Box::new(|_| unreachable!()), host };
     let eager = std::thread::spawn({
         let transport = transport.clone();
-        move || transport.eager_initialize(init, host.host)
+        move || { let owner = host; transport.eager_initialize(init, owner.host) }
     });
     barrier.entered.notified().await;
     let view = barrier.state.lock().unwrap().0.unwrap();
