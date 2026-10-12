@@ -1101,7 +1101,7 @@ async fn actual_method_observer_fences_native_fault_and_request_done_before_bloc
     drop(connection);
     let call = tokio::spawn(async move {
         client.proxy(&destination, "/payload", "ai.tinyhumans.tinybus.Payload")
-            .unwrap().call::<_, serde_json::Value>("Panic", ()).await
+            .unwrap().call::<serde_json::Value>("Panic", ()).await
     });
     let sample = entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     // Actual method task is held in foreign payload Drop. Its Connection owner
