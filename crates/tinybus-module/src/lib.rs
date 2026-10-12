@@ -1560,15 +1560,6 @@ where
                 if !state.is_live() {
                     return TB_CLOSED;
                 }
-                let bytes = if len == 0 {
-                    b"{}".as_slice()
-                } else {
-                    unsafe { std::slice::from_raw_parts(ptr, len) }
-                };
-                let config = match serde_json::from_slice::<C>(bytes) {
-                    Ok(config) => config,
-                    Err(_) => return TB_BAD_ARGUMENT,
-                };
                 let connection = connection_slot
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1592,10 +1583,32 @@ where
                 if !state.is_live() {
                     return TB_CLOSED;
                 }
-                let future = Box::pin(setup(connection, config));
-                *slot
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(future);
+                // Copy ABI input before transferring the single construction operation.
+                // Only the existing physical worker parses/owns C and calls setup.
+                let bytes = if len == 0 { b"{}".to_vec() } else {
+                    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+                };
+                let construct_state = Arc::downgrade(&state);
+                let construct_setup = setup.clone();
+                let construct_slot = slot.clone();
+                let code = state.construct_reinit(Box::new(move || {
+                    let Some(state) = construct_state.upgrade() else { return TB_CLOSED; };
+                    if !state.is_live() { return TB_CLOSED; }
+                    let config = match serde_json::from_slice::<C>(&bytes) {
+                        Ok(config) => config,
+                        Err(_) => return TB_BAD_ARGUMENT,
+                    };
+                    // If Stop arrived during parsing, keep the received config attached
+                    // until this same worker's terminal resource disposal.
+                    state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).config = Some(Box::new(config));
+                    if !state.is_live() { return TB_CLOSED; }
+                    let config = state.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner).config.take().expect("attached reinit config");
+                    let config = *config.downcast::<C>().unwrap_or_else(|_| unreachable!("private config type"));
+                    let future = Box::pin(construct_setup(connection, config));
+                    *construct_slot.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(future);
+                    TB_OK
+                }));
+                if code != TB_OK { return code; }
                 let result = handle.block_on(async {
                     tokio::select! { biased;
                         result = TerminalSetupPoll { slot, state: state.clone(), kind: terminal::PayloadKind::Reinit } => result,

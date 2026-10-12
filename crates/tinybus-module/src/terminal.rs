@@ -155,6 +155,10 @@ impl PrimaryPayloads {
         }
     }
 }
+enum ReinitOperation {
+    Retire(SetupFuture),
+    Construct(Box<dyn FnOnce() -> i32 + Send>),
+}
 struct Control {
     request: Option<Arc<dyn Fn(TerminalReason) + Send + Sync>>,
     finish: Option<Box<dyn FnOnce() -> TerminalCompletion + Send>>,
@@ -165,7 +169,8 @@ struct Control {
     job: Option<Arc<FinishJob>>,
     payloads: PrimaryPayloads,
     active_reinit: bool,
-    prior_future: Option<SetupFuture>,
+    reinit_operation: Option<ReinitOperation>,
+    construction_code: i32,
     prior_pending: bool,
     retirement_failed: bool,
 }
@@ -293,7 +298,8 @@ impl TerminalState {
                 job: None,
                 payloads: PrimaryPayloads::default(),
                 active_reinit: false,
-                prior_future: None,
+                reinit_operation: None,
+                construction_code: TB_CLOSED,
                 prior_pending: false,
                 retirement_failed: false,
             }),
@@ -526,7 +532,7 @@ impl TerminalState {
             let mut control = self.lock();
             // active_reinit admits one caller. It cannot construct the next
             // future until the worker has acknowledged this exact disposal.
-            control.prior_future = Some(future);
+            control.reinit_operation = Some(ReinitOperation::Retire(future));
             control.prior_pending = true;
         }
         self.schedule();
@@ -539,6 +545,22 @@ impl TerminalState {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         !control.retirement_failed && control.finish_state != FinishState::SpawnFailed
+    }
+    pub fn construct_reinit(self: &Arc<Self>, construct: Box<dyn FnOnce() -> i32 + Send>) -> i32 {
+        {
+            let mut control = self.lock();
+            // The same sole cell owns construction captures before scheduling.
+            // Spawn failure retains them; no ABI caller receives generic C.
+            control.reinit_operation = Some(ReinitOperation::Construct(construct));
+            control.prior_pending = true;
+        }
+        self.schedule();
+        self.changed.notify_all();
+        let mut control = self.lock();
+        while control.prior_pending && control.finish_state != FinishState::SpawnFailed {
+            control = self.changed.wait(control).unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if control.finish_state == FinishState::SpawnFailed { TB_CLOSED } else { control.construction_code }
     }
     fn schedule(self: &Arc<Self>) {
         let job = {
@@ -593,18 +615,31 @@ impl TerminalState {
             let mut control = self.lock();
             // Retirement takes precedence over waiting for active_reinit:
             // that caller may itself be awaiting this worker's acknowledgment.
-            if let Some(future) = control.prior_future.take() {
+            if let Some(operation) = control.reinit_operation.take() {
                 drop(control);
-                let outcome = catch_unwind(AssertUnwindSafe(|| drop(future)));
-                let failed = match outcome {
-                    Ok(()) => false,
-                    Err(payload) => {
-                        self.source_panic(PayloadKind::Cleanup, payload);
-                        true
+                let (failed, code) = match operation {
+                    ReinitOperation::Retire(future) => {
+                        match catch_unwind(AssertUnwindSafe(|| drop(future))) {
+                            Ok(()) => (false, TB_OK),
+                            Err(payload) => {
+                                self.source_panic(PayloadKind::Cleanup, payload);
+                                (true, TB_CLOSED)
+                            }
+                        }
+                    }
+                    ReinitOperation::Construct(construct) => {
+                        match catch_unwind(AssertUnwindSafe(construct)) {
+                            Ok(code) => (false, code),
+                            Err(payload) => {
+                                self.source_panic(PayloadKind::Reinit, payload);
+                                (false, TB_PANICKED)
+                            }
+                        }
                     }
                 };
                 let mut control = self.lock();
                 control.retirement_failed |= failed;
+                control.construction_code = code;
                 control.prior_pending = false;
                 drop(control);
                 self.changed.notify_all();
