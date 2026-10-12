@@ -1509,7 +1509,10 @@ impl ModuleControl for ModuleHostInner {
         };
         let _lifecycle_busy = LifecycleBusyGuard::for_stop(self, name, transport.clone());
         if let Some(callbacks) = callbacks {
-            if let Err(error) = callbacks.drain(deadline.saturating_sub(started.elapsed())).await {
+            if let Err(error) = callbacks
+                .drain(deadline.saturating_sub(started.elapsed()))
+                .await
+            {
                 let mut loaded = self.loaded.lock().expect("module list lock");
                 if let Some(module) = loaded.iter_mut().find(|module| module.info.name == name) {
                     module.transition_from = None;
@@ -1517,7 +1520,9 @@ impl ModuleControl for ModuleHostInner {
                 return Err(error);
             }
         }
-        let stopped = transport.stop(deadline.saturating_sub(started.elapsed())).await;
+        let stopped = transport
+            .stop(deadline.saturating_sub(started.elapsed()))
+            .await;
         let mut loaded = self.loaded.lock().expect("module list lock");
         let module = loaded
             .iter_mut()
@@ -1591,7 +1596,9 @@ impl ModuleControl for ModuleHostInner {
         // Held through this synchronous mutation, atomic with lifecycle
         // reservation. The public waiter can end before its native task.
         if module.lifecycle_busy || module.transport.native_lifecycle_pending() {
-            return Err(Error::failed("module lifecycle operation is already running"));
+            return Err(Error::failed(
+                "module lifecycle operation is already running",
+            ));
         }
         let old = module.snapshot().state;
         if matches!(
