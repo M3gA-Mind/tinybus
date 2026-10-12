@@ -115,7 +115,9 @@ fn unowned_and_reentrant_panic_contexts_never_select_a_host_callback() {
 static CONFIG_DISPATCH: StdMutex<Option<tracing::Dispatch>> = StdMutex::new(None);
 struct CapturedConfig;
 impl<'de> serde::Deserialize<'de> for CapturedConfig {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
         let _ = serde_json::Value::deserialize(deserializer)?;
         *CONFIG_DISPATCH.lock().unwrap() = Some(tracing::dispatcher::get_default(Clone::clone));
         Ok(Self)
@@ -127,15 +129,23 @@ fn shutdown_suppresses_the_exact_factory_and_configuration_caller_dispatch() {
     for factory in [true, false] {
         let (fixture, count) = owner();
         let mut host = fixture.host.0;
-        host.config = tinybus::module::abi::TbSlice { ptr: b"{}".as_ptr(), len: 2 };
+        host.config = tinybus::module::abi::TbSlice {
+            ptr: b"{}".as_ptr(),
+            len: 2,
+        };
         let captured = Arc::new(StdMutex::new(None));
         let capture = captured.clone();
         let mut module = TbModuleVtable::default();
         let started = if factory {
             unsafe {
                 start_reconfigurable_module_with_factory::<serde_json::Value, _, _>(
-                    &host, &mut module, 1, false, move || {
-                        *capture.lock().unwrap() = Some(tracing::dispatcher::get_default(Clone::clone));
+                    &host,
+                    &mut module,
+                    1,
+                    false,
+                    move || {
+                        *capture.lock().unwrap() =
+                            Some(tracing::dispatcher::get_default(Clone::clone));
                         |_, _| async { Ok(()) }
                     },
                 )
@@ -143,38 +153,73 @@ fn shutdown_suppresses_the_exact_factory_and_configuration_caller_dispatch() {
         } else {
             unsafe {
                 start_module_with_config::<CapturedConfig, _, _>(
-                    &host, &mut module, 1, false, |_, _| async { Ok(()) },
+                    &host,
+                    &mut module,
+                    1,
+                    false,
+                    |_, _| async { Ok(()) },
                 )
             }
         };
-        let dispatch = if factory { captured.lock().unwrap().take() } else { CONFIG_DISPATCH.lock().unwrap().take() };
+        let dispatch = if factory {
+            captured.lock().unwrap().take()
+        } else {
+            CONFIG_DISPATCH.lock().unwrap().take()
+        };
         let before = count.load(Ordering::SeqCst);
         if let Some(dispatch) = &dispatch {
-            tracing::dispatcher::with_default(dispatch, || tracing::info!("captured caller before stop"));
+            tracing::dispatcher::with_default(dispatch, || {
+                tracing::info!("captured caller before stop")
+            });
         }
         let live = count.load(Ordering::SeqCst);
-        let stopped = if started == TB_OK { unsafe { (module.shutdown)(module.module_ctx, 1000) } } else { TB_CLOSED };
+        let stopped = if started == TB_OK {
+            unsafe { (module.shutdown)(module.module_ctx, 1000) }
+        } else {
+            TB_CLOSED
+        };
         let after_shutdown = count.load(Ordering::SeqCst);
         let (replacement_fixture, replacement_count) = owner();
         let mut replacement_host = replacement_fixture.host.0;
         replacement_host.config = host.config;
         let mut replacement = TbModuleVtable::default();
-        let replaced = unsafe { start_module(&replacement_host, &mut replacement, 1, false, |_| async { Ok(()) }) };
+        let replaced = unsafe {
+            start_module(&replacement_host, &mut replacement, 1, false, |_| async {
+                Ok(())
+            })
+        };
         let replacement_before = replacement_count.load(Ordering::SeqCst);
         if let Some(dispatch) = &dispatch {
-            tracing::dispatcher::with_default(dispatch, || tracing::info!("captured caller after actual shutdown"));
+            tracing::dispatcher::with_default(dispatch, || {
+                tracing::info!("captured caller after actual shutdown")
+            });
         }
         let late = count.load(Ordering::SeqCst);
         let replacement_after = replacement_count.load(Ordering::SeqCst);
-        let replacement_stopped = if replaced == TB_OK { unsafe { (replacement.shutdown)(replacement.module_ctx, 1000) } } else { TB_CLOSED };
-        eprintln!("factory={factory}: start={started}, stop={stopped}, before={before}, live={live}, after_shutdown={after_shutdown}, late={late}, replacement={replacement_before}/{replacement_after}, replacement_stop={replacement_stopped}");
+        let replacement_stopped = if replaced == TB_OK {
+            unsafe { (replacement.shutdown)(replacement.module_ctx, 1000) }
+        } else {
+            TB_CLOSED
+        };
+        eprintln!(
+            "factory={factory}: start={started}, stop={stopped}, before={before}, live={live}, after_shutdown={after_shutdown}, late={late}, replacement={replacement_before}/{replacement_after}, replacement_stop={replacement_stopped}"
+        );
         assert_eq!(started, TB_OK);
         assert!(dispatch.is_some());
-        assert!(live > before, "real caller dispatch forwards before shutdown");
+        assert!(
+            live > before,
+            "real caller dispatch forwards before shutdown"
+        );
         assert_eq!(stopped, TB_OK);
         assert_eq!(replaced, TB_OK);
         assert_eq!(replacement_stopped, TB_OK);
-        assert_eq!(late, after_shutdown, "stopped caller dispatch must not forward");
-        assert_eq!(replacement_after, replacement_before, "old dispatch cannot select replacement");
+        assert_eq!(
+            late, after_shutdown,
+            "stopped caller dispatch must not forward"
+        );
+        assert_eq!(
+            replacement_after, replacement_before,
+            "old dispatch cannot select replacement"
+        );
     }
 }

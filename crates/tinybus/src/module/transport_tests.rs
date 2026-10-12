@@ -2260,7 +2260,15 @@ async fn rejected_observer_after_ordinary_stop_preserves_nonfault_cause() {
 
 #[tokio::test]
 async fn completed_shutdown_has_already_released_its_native_lifecycle_marker() {
-    let _guard = VTABLE_TEST_LOCK
+    struct WorkerRelease(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for WorkerRelease {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    let guard = VTABLE_TEST_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await;
@@ -2271,17 +2279,45 @@ async fn completed_shutdown_has_already_released_its_native_lifecycle_marker() {
     let published = Arc::new(Notify::new());
     let entered = published.clone();
     let (release, worker) = std::sync::mpsc::channel();
+    let release = WorkerRelease(Some(release));
     *transport.after_cleanup_publication.lock().unwrap() = Some(Box::new(move || {
         entered.notify_one();
-        worker.recv().unwrap();
+        let _ = worker.recv();
     }));
-    let stopping = tokio::spawn(transport.clone().stop(Duration::from_secs(2)));
-    published.notified().await;
-    let result = stopping.await.unwrap();
+    let mut stopping = tokio::spawn(transport.clone().stop(Duration::from_secs(2)));
+    let publication = tokio::time::timeout(Duration::from_secs(2), published.notified()).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), &mut stopping).await;
     let still_pending = transport.native_lifecycle_pending();
-    // Always release the worker before asserting, even against the unfixed code.
-    release.send(()).unwrap();
-    assert_eq!(result.unwrap(), TB_OK);
+    drop(release);
+    transport.request_terminal(false);
+    let cleanup = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let changed = transport.context.physical_notify.notified();
+            if matches!(
+                transport.context.physical.lock().unwrap().cleanup,
+                CleanupState::Complete | CleanupState::NoCallbackRequired
+            ) {
+                break;
+            }
+            changed.await;
+        }
+        // Publication precedes native lifecycle unlock. Observe that actual
+        // exclusion release separately; this is not an OS-worker-exit claim.
+        let lifecycle = transport.lifecycle.clone().lock_owned().await;
+        drop(lifecycle);
+    })
+    .await;
+    if cleanup.is_err() {
+        // Keep fixture exclusion with the actual transport/job if cleanup is
+        // unresolved. Neither timeout nor dropped async waiter reclaims it.
+        *transport.fixture_controller.lock().unwrap() = Some(Arc::new(guard));
+    }
+    assert!(publication.is_ok(), "cleanup publication watchdog expired");
+    assert!(
+        cleanup.is_ok(),
+        "actual cleanup/lifecycle release remains pending"
+    );
+    assert_eq!(result.unwrap().unwrap().unwrap(), TB_OK);
     assert!(
         !still_pending,
         "completed cleanup still reports native work"

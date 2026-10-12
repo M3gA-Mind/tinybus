@@ -70,11 +70,23 @@ unsafe extern "C" fn observe_log(ctx: *mut std::ffi::c_void, _: u32, ptr: *const
 }
 fn record_log(storage: Option<&Mutex<HashMap<usize, Vec<String>>>>, key: usize, line: String) {
     if let Some(storage) = storage {
-        storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(key).or_default().push(line);
+        storage
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key)
+            .or_default()
+            .push(line);
     }
 }
 fn recorded_lines(key: usize) -> Vec<String> {
-    LOGS.get().and_then(|logs| logs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key).cloned()).unwrap_or_default()
+    LOGS.get()
+        .and_then(|logs| {
+            logs.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .cloned()
+        })
+        .unwrap_or_default()
 }
 fn observed_native(host: &ModuleHost, path: &Path, prefix: &str) -> usize {
     let artifact = loader::load(path, false).unwrap();
@@ -134,7 +146,11 @@ async fn native_replacement_logs_and_sanitized_panics_use_only_its_original_host
             .starts_with("first:")
     );
     let first_lines = recorded_lines(first_key);
-    assert!(first_lines.iter().any(|line| line.contains("clock fixture served")));
+    assert!(
+        first_lines
+            .iter()
+            .any(|line| line.contains("clock fixture served"))
+    );
     first.shutdown(Duration::from_secs(3)).await;
     tokio::time::timeout(Duration::from_secs(3), async {
         while caller
@@ -166,10 +182,26 @@ async fn native_replacement_logs_and_sanitized_panics_use_only_its_original_host
     let second_lines = recorded_lines(second_key);
     second.shutdown(Duration::from_secs(3)).await;
     broker_task.abort();
-    assert_eq!(first_lines.len(), first_count, "B must not call A's original logging callback");
-    assert!(second_lines.iter().any(|line| line.contains("clock fixture served")));
-    assert!(second_lines.iter().any(|line| line.contains("module panicked at")));
-    assert!(second_lines.iter().all(|line| !line.contains("secret-token")));
+    assert_eq!(
+        first_lines.len(),
+        first_count,
+        "B must not call A's original logging callback"
+    );
+    assert!(
+        second_lines
+            .iter()
+            .any(|line| line.contains("clock fixture served"))
+    );
+    assert!(
+        second_lines
+            .iter()
+            .any(|line| line.contains("module panicked at"))
+    );
+    assert!(
+        second_lines
+            .iter()
+            .all(|line| !line.contains("secret-token"))
+    );
 }
 
 #[test]
@@ -184,14 +216,35 @@ fn native_log_fixture_recovers_poison_without_unwinding_across_abi() {
     if recovered.is_ok() {
         let logs = LOGS.get_or_init(|| Mutex::new(HashMap::new()));
         let _ = std::panic::catch_unwind(|| {
-            let _guard = logs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _guard = logs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             panic!("controlled Rust fixture poison");
         });
         let line = b"actual ABI callback after fixture poison";
-        unsafe { observe_log(1usize as *mut std::ffi::c_void, 1, line.as_ptr(), line.len()) };
+        unsafe {
+            observe_log(
+                1usize as *mut std::ffi::c_void,
+                1,
+                line.as_ptr(),
+                line.len(),
+            )
+        };
     }
-    let recorded = LOGS.get().and_then(|logs| logs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&1).cloned());
+    let recorded = LOGS.get().and_then(|logs| {
+        logs.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&1)
+            .cloned()
+    });
     assert!(poisoned.is_err());
-    assert!(recovered.is_ok(), "callback body must recover poisoned fixture storage");
-    assert!(recorded.is_some_and(|lines| lines.iter().any(|line| line.contains("actual ABI callback"))));
+    assert!(
+        recovered.is_ok(),
+        "callback body must recover poisoned fixture storage"
+    );
+    assert!(recorded.is_some_and(|lines| {
+        lines
+            .iter()
+            .any(|line| line.contains("actual ABI callback"))
+    }));
 }
