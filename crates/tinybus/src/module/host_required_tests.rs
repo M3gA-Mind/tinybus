@@ -177,3 +177,72 @@ fn invalid_requirements_are_refused_without_echoing_input() {
         .is_err()
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TINYBUS_TEST_MODULE to point at the built cdylib"]
+async fn a_real_required_artifact_is_refused_then_admitted_and_serves_confidentially() {
+    use crate::Connection;
+    use crate::transport::memory::MemoryBus;
+    let artifact = PathBuf::from(std::env::var_os("TINYBUS_TEST_MODULE").unwrap());
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let filename = artifact.file_name().unwrap().to_str().unwrap();
+    let staged = directory.path().join(filename);
+    std::fs::copy(&artifact, &staged).unwrap();
+    let hash = crate::module::sha256_file(&staged).unwrap();
+    std::fs::write(
+        directory.path().join("modules.toml"),
+        format!("\"{filename}\" = \"{hash}\"\n"),
+    )
+    .unwrap();
+    let bus = MemoryBus::new();
+    let broker = Broker::new();
+    let broker_task = broker.spawn(bus.clone());
+    let host = ModuleHost::new(broker);
+    let address = BusName::new("ai.tinyhumans.openhuman.Clock").unwrap();
+    let path = ObjectPath::new("/ai/tinyhumans/openhuman/Clock").unwrap();
+    let required_for = |method| {
+        ModuleRequirements::new(
+            "tinybus",
+            address.clone(),
+            path.clone(),
+            vec![
+                RequiredInterface::new(
+                    InterfaceName::new(address.as_str()).unwrap(),
+                    VersionRange::new(Version::new(1, 0, 0), Some(Version::new(2, 0, 0))),
+                    vec![MemberName::new(method).unwrap()],
+                )
+                .unwrap(),
+            ],
+        )
+        .unwrap()
+    };
+    assert!(
+        host.load_file_with_requirements(&staged, serde_json::json!({}), &required_for("Missing"))
+            .is_err()
+    );
+    assert!(host.list().is_empty());
+    host.load_file_with_requirements(
+        &staged,
+        serde_json::json!({"prefix":"required:"}),
+        &required_for("Now"),
+    )
+    .unwrap();
+    let connection = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let proxy = connection
+        .proxy(address.as_str(), path.as_str(), address.as_str())
+        .unwrap();
+    let reply: String = proxy.call_confidential("Now", ()).await.unwrap();
+    assert!(reply.starts_with("required:"));
+    assert_eq!(
+        connection
+            .attestation(address)
+            .await
+            .unwrap()
+            .unwrap()
+            .sha256,
+        hash
+    );
+    broker_task.abort();
+}
