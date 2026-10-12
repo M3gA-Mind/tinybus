@@ -835,14 +835,18 @@ async fn native_callback_setup_failure_race(panic_setup: bool) {
     }));
     let loading_host = host.clone();
     let loading_binding = binding.clone();
-    let load = tokio::spawn(async move {
+    let mut load = tokio::spawn(async move {
         loading_host
             .load_file_with_host_callbacks(artifact, config, &loading_binding)
             .await
     });
-    tokio::time::timeout(Duration::from_secs(2), attached.notified())
-        .await
-        .unwrap();
+    tokio::select! {
+        _ = attached.notified() => {},
+        result = &mut load => panic!("native callback load ended before attach: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(2)) => {
+            panic!("native callback load did not reach attach before the setup deadline");
+        }
+    }
     let transport = host.inner.loaded.lock().unwrap()[0].transport.clone();
     // Actual ordinary lifecycle ownership, before the callback initialization
     // gate opens. This instance proves C never entered, rather than any join.
