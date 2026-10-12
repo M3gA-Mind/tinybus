@@ -184,13 +184,19 @@ async fn a_real_required_artifact_is_refused_then_admitted_and_serves_confidenti
     use crate::Connection;
     use crate::transport::memory::MemoryBus;
     let artifact = PathBuf::from(std::env::var_os("TINYBUS_TEST_MODULE").unwrap());
-    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    // Windows CI supplies an owner-only TEMP; the checkout can inherit group
+    // write permissions. Canonicalize Unix TEMP to avoid macOS /var symlinks.
+    let directory = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    let private_path = std::fs::canonicalize(directory.path()).unwrap();
+    #[cfg(windows)]
+    let private_path = directory.path().to_path_buf();
     let filename = artifact.file_name().unwrap().to_str().unwrap();
-    let staged = directory.path().join(filename);
+    let staged = private_path.join(filename);
     std::fs::copy(&artifact, &staged).unwrap();
     let hash = crate::module::sha256_file(&staged).unwrap();
     std::fs::write(
-        directory.path().join("modules.toml"),
+        private_path.join("modules.toml"),
         format!("\"{filename}\" = \"{hash}\"\n"),
     )
     .unwrap();
