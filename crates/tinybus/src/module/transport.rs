@@ -628,7 +628,6 @@ impl ModuleTransport {
         // A retry that cannot acquire the physical lock must not erase the
         // original running stop's host transition. Only its new lock owner may
         // replace that marker, immediately before handing the lock to the task.
-        self.stop_task_spawned.store(false, Ordering::Release);
         self.stop_task_spawned.store(true, Ordering::Release);
         let task = tokio::task::spawn_blocking(move || {
             let _lifecycle = lifecycle;

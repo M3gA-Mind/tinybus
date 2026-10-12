@@ -5,6 +5,7 @@ use crate::{BusName, InterfaceName, MemberName, ObjectPath};
 
 static DELIVERY_CODE: AtomicI32 = AtomicI32::new(TB_OK);
 static DELIVERIES: AtomicUsize = AtomicUsize::new(0);
+static DELIVERY_BLOCKED: AtomicBool = AtomicBool::new(false);
 static SHUTDOWN_CODE: AtomicI32 = AtomicI32::new(TB_OK);
 static SHUTDOWN_CALLS: AtomicUsize = AtomicUsize::new(0);
 static SHUTDOWN_BLOCKED: AtomicBool = AtomicBool::new(false);
@@ -16,6 +17,9 @@ static VTABLE_TEST_LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync
 
 unsafe extern "C" fn deliver(_: *mut c_void, _: *const u8, _: usize) -> i32 {
     DELIVERIES.fetch_add(1, Ordering::AcqRel);
+    while DELIVERY_BLOCKED.load(Ordering::Acquire) {
+        std::thread::yield_now();
+    }
     DELIVERY_CODE.load(Ordering::Acquire)
 }
 
@@ -597,6 +601,7 @@ struct ShutdownRelease;
 impl Drop for ShutdownRelease {
     fn drop(&mut self) {
         SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+        DELIVERY_BLOCKED.store(false, Ordering::Release);
         DELIVERY_CODE.store(TB_OK, Ordering::Release);
     }
 }
@@ -836,4 +841,85 @@ async fn an_actual_initializer_failure_during_stop_is_retained() {
     assert!(transport.init_failed(), "S52");
     assert!(transport.is_faulted(), "S53");
     assert!(!transport.is_ready(), "S54");
+}
+
+#[tokio::test]
+async fn concurrent_pending_sends_cannot_resurrect_a_completed_transport_drainer() {
+    let _lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let _release = ShutdownRelease;
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    let (transport, host) = ModuleTransport::new("racing-stop".into(), vec![]);
+    transport.defer_initialize(initialize_ok, host);
+    transport.ensure_initialized().await.expect("S55");
+    let barrier = Arc::new(tokio::sync::Barrier::new(17));
+    let mut sending = Vec::new();
+    for _ in 0..16 {
+        let sender = transport.clone();
+        let barrier = barrier.clone();
+        sending.push(tokio::spawn(async move {
+            barrier.wait().await;
+            sender.send(call()).await
+        }));
+    }
+    barrier.wait().await;
+    transport.stop_sync(Duration::ZERO);
+    for sending in sending {
+        assert!(
+            matches!(
+                sending.await.expect("S56"),
+                Ok(()) | Err(Error::ConnectionClosed)
+            ),
+            "S57"
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while transport.drain_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("S58");
+    assert!(transport.pending.lock().expect("S59").is_empty(), "S60");
+    assert!(!transport.is_faulted(), "S61");
+    assert!(!transport.init_failed(), "S62");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_actual_delivery_failure_overlapping_stop_is_retained() {
+    let _lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let _release = ShutdownRelease;
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    DELIVERY_CODE.store(TB_BAD_ARGUMENT, Ordering::Release);
+    DELIVERY_BLOCKED.store(true, Ordering::Release);
+    DELIVERIES.store(0, Ordering::Release);
+    let (transport, host) = ModuleTransport::new("delivery-failed-stop".into(), vec![]);
+    transport.defer_initialize(initialize_ok, host);
+    transport.send(call()).await.expect("S63");
+    unsafe {
+        (host.ready)(host.host_ctx);
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while DELIVERIES.load(Ordering::Acquire) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("S64");
+    transport.stop_sync(Duration::ZERO);
+    DELIVERY_BLOCKED.store(false, Ordering::Release);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while transport.drain_started.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("S65");
+    assert!(transport.is_faulted(), "S66");
+    assert!(!transport.is_ready(), "S67");
 }
