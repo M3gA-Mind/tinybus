@@ -345,6 +345,9 @@ async fn a_pending_call_is_failed_when_the_module_closes_its_delivery_queue() {
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await;
+    let _release = ShutdownRelease;
+    SHUTDOWN_ENTERED.store(false, Ordering::Release);
+    SHUTDOWN_BLOCKED.store(true, Ordering::Release);
     DELIVERY_CODE.store(TB_CLOSED, Ordering::Release);
     let (transport, host) = ModuleTransport::new("closed".to_string(), Vec::new());
     transport.defer_initialize(initialize_ok, host);
@@ -357,6 +360,11 @@ async fn a_pending_call_is_failed_when_the_module_closes_its_delivery_queue() {
         .unwrap();
     assert_eq!(reply.header.kind, MessageKind::Error);
     assert!(transport.is_faulted());
+    shutdown_entry().await;
+    assert!(
+        transport.is_stopped(),
+        "a failed-delivery fixture must finish shutdown before reusing callback flags"
+    );
     DELIVERY_CODE.store(TB_OK, Ordering::Release);
 }
 
@@ -1050,8 +1058,6 @@ async fn queued_readiness_and_backpressure_retire_before_actual_shutdown_returns
         .lock()
         .await;
     let _release = ShutdownRelease;
-    // Reproduce the fixture state left by a preceding shutdown test.
-    SHUTDOWN_ENTERED.store(true, Ordering::Release);
     SHUTDOWN_BLOCKED.store(true, Ordering::Release);
     SHUTDOWN_ENTERED.store(false, Ordering::Release);
     DELIVERIES.store(0, Ordering::Release);
