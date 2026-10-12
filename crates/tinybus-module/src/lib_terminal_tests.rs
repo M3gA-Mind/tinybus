@@ -2194,7 +2194,7 @@ async fn compiled_native_retained_views_bound_256_and_release_only_at_actual_las
     let replacement_result =
         replacement.load_file_with_config(&path, native_controls_config(0, &controls));
     let new_token = context();
-    let stale = first_token.map(probe);
+    let stale = first_token.map(|token| probe(token));
     let before = drops();
     replacement.shutdown(Duration::from_secs(5)).await;
     let mut replacement_settled = false;
