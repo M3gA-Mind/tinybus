@@ -26,9 +26,18 @@ delivery, confidential invocation and the original SHA attestation.
 ## Gates and limits
 
 Default and all-feature workspace tests, strict all-target/all-feature Clippy,
-workspace build, no-default check, strict rustdoc and formatting passed. MSRV,
-the complete dynamic fixture suite and per-file coverage are pending at this
-checkpoint. No upstream publication or host consumption is claimed yet.
+workspace build, no-default check, strict rustdoc and formatting passed. Rust1.85 full workspace/all-target/all-feature build and the complete dynamic
+fixture suite passed. The latter executed509 library,6 CLI,5 macro,42 SDK tests
+and6 doctests (568 total, zero ignored). Instrumented coverage executed562 tests;
+39 measured production files passed the existing90% per-file gate, minimum
+90.0641%, overall94.8386%. New requirements.rs has68/68 lines covered (100%).
+The existing CI exclusions were retained without additions.
+
+All final gates completed successfully against the canonical9062dd8 base.
+Logs: guarded-activation-{allfeatures,default,clippy,build,slim,docs,fmt,msrv,
+fixtures-all,coverage}.log and guarded-activation-coverage.json under target.
+This tracked summary retains counts if disposable artifacts are removed.
+Host consumption remains contingent on canonical upstream availability.
 
 Platform library constructors may execute during loading before a manifest can
 be inspected. This API prevents incompatible ABI setup/configuration callbacks;
