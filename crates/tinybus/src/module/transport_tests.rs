@@ -1383,12 +1383,16 @@ async fn scheduled_initializer_is_adopted_by_original_ordinary_stop() {
         worker_started.send(()).unwrap();
         worker_release_rx.recv().unwrap();
     }));
-    assert!(transport.schedule_initializer().unwrap());
+    let waiter = tokio::spawn({
+        let transport = transport.clone(); async move { transport.ensure_initialized().await }
+    });
     worker_started_rx.await.unwrap();
     let mut stopping = Box::pin(transport.clone().stop(Duration::from_secs(2)));
     tokio::select! { result = &mut stopping => panic!("stop completed before owner: {result:?}"),
         _ = async { while !transport.stop_task_spawned() { tokio::task::yield_now().await; } } => {} }
-    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 2);
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 2, "ordinary cancellation cannot invent Fault");
     worker_release.send(()).unwrap();
     assert_eq!(stopping.await.unwrap(), TB_CLOSED);
     assert_eq!(entries.load(Ordering::Acquire), 0);
@@ -1471,6 +1475,13 @@ async fn actual_native_late_init_is_joined_after_initiator_abandonment() {
         let transport = transport.clone(); async move { transport.ensure_initialized().await }
     });
     barrier.entered.notified().await;
+    let mut observation = Box::pin(transport.ensure_initialized());
+    std::future::poll_fn(|cx| {
+        assert!(std::future::Future::poll(observation.as_mut(), cx).is_pending());
+        std::task::Poll::Ready(())
+    }).await;
+    drop(observation);
+    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 1, "observer abandonment cannot cancel initiating owner");
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
     let view = barrier.state.lock().unwrap().0.unwrap();
@@ -1563,17 +1574,13 @@ async fn rejected_module_outputs_never_invoke_untrusted_callbacks() {
     SHUTDOWN_CALLS.store(0, Ordering::Release);
     for rejection in 0..4 {
         let (transport, host) = ModuleTransport::new(format!("rejected-{rejection}"), vec![]);
-        transport.defer_initializer(host, move |host| {
-            let mut module = TbModuleVtable::default();
-            unsafe { initialize_ok(&host, &mut module); }
-            match rejection {
-                0 => module.size = TB_MODULE_VTABLE_BASE_SIZE - 1,
-                1 => module.module_ctx = std::ptr::null_mut(),
-                2 => module.reinitialize = None,
-                _ => return Err("non-OK output must remain inaccessible".into()),
-            }
-            Ok(module)
-        });
+        let init: crate::module::abi::TbModuleInit = match rejection {
+            0 => initialize_short_output,
+            1 => initialize_null_context_output,
+            2 => initialize_missing_declared_reinit,
+            _ => initialize_non_ok_misleading_output,
+        };
+        transport.defer_initialize(init, host);
         assert!(transport.ensure_initialized().await.is_err());
         let physical = transport.context.physical.lock().unwrap();
         assert_eq!(physical.init, InitState::PublishedRejected);
@@ -1733,4 +1740,78 @@ async fn actual_native_late_eager_publication_cannot_refund_failed_cleanup_spawn
     // controller too. This is one explicit uncertain test instance, not global
     // leak-bound or secret-erasure proof.
     std::mem::forget(barrier);
+}
+
+
+unsafe extern "C" fn initialize_short_output(host: *const TbHostVtable, out: *mut TbModuleVtable) -> i32 {
+    unsafe { initialize_ok(host, out); (*out).size = TB_MODULE_VTABLE_BASE_SIZE - 1; }
+    TB_OK
+}
+unsafe extern "C" fn initialize_null_context_output(host: *const TbHostVtable, out: *mut TbModuleVtable) -> i32 {
+    unsafe { initialize_ok(host, out); (*out).module_ctx = std::ptr::null_mut(); }
+    TB_OK
+}
+unsafe extern "C" fn initialize_missing_declared_reinit(host: *const TbHostVtable, out: *mut TbModuleVtable) -> i32 {
+    unsafe { initialize_ok(host, out); (*out).reinitialize = None; }
+    TB_OK
+}
+unsafe extern "C" fn initialize_non_ok_misleading_output(host: *const TbHostVtable, out: *mut TbModuleVtable) -> i32 {
+    unsafe { initialize_ok(host, out); }
+    TB_PANICKED
+}
+
+#[tokio::test]
+async fn eager_rejected_outputs_keep_uncertainty_and_never_call_returned_callbacks() {
+    let _lock = VTABLE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    SHUTDOWN_CALLS.store(0, Ordering::Release);
+    for init in [initialize_short_output as crate::module::abi::TbModuleInit,
+        initialize_null_context_output, initialize_missing_declared_reinit,
+        initialize_non_ok_misleading_output] {
+        let (transport, host) = ModuleTransport::new("eager-invalid".into(), b"borrowed".to_vec());
+        assert!(transport.eager_initialize(init, host).is_err());
+        let state = transport.context.physical.lock().unwrap();
+        assert_eq!(state.init, InitState::PublishedRejected);
+        assert_eq!(state.cleanup, CleanupState::Uncertain);
+        assert!(state.job.is_some());
+        assert!(transport.module.lock().unwrap().is_none());
+        drop(state);
+        assert!(transport.context.config.lock().unwrap().is_empty());
+        assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 6);
+    }
+    assert_eq!(SHUTDOWN_CALLS.load(Ordering::Acquire), 0);
+}
+
+#[test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+fn actual_native_initializer_owner_outlives_runtime_and_host_handle_drop() {
+    let (transport, host, init, barrier) = native_fixture();
+    transport.defer_initialize(init, host);
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let transport = transport.clone();
+        tokio::spawn(async move { let _ = transport.ensure_initialized().await; });
+        barrier.entered.notified().await;
+    });
+    let weak = Arc::downgrade(&transport);
+    drop(runtime);
+    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 6);
+    drop(transport);
+    let retained = weak.upgrade().expect("real initializer owner survives runtime and host drop");
+    assert!(!barrier.state.lock().unwrap().2);
+    {
+        let mut state = barrier.state.lock().unwrap(); state.1 = true; barrier.changed.notify_all();
+    }
+    // The runtime is gone. Wait on the retained physical predicate/Condvar,
+    // never on a Tokio task, deadline or notification as completion proof.
+    let mut state = retained.context.physical.lock().unwrap();
+    while state.cleanup != CleanupState::Complete {
+        let (next, timeout) = retained.context.physical_changed.wait_timeout(state, Duration::from_secs(2)).unwrap();
+        state = next;
+        assert!(!timeout.timed_out(), "actual retained native cleanup must finish");
+    }
+    drop(state);
+    assert!(barrier.state.lock().unwrap().2);
+    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 14);
+    drop(retained);
+    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 14);
 }
