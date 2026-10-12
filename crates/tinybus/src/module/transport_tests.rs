@@ -341,7 +341,7 @@ async fn a_failed_initializer_is_reported_to_callers() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_pending_call_is_failed_when_the_module_closes_its_delivery_queue() {
-    let _lock = VTABLE_TEST_LOCK
+    let lock = VTABLE_TEST_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await;
@@ -357,7 +357,84 @@ async fn a_pending_call_is_failed_when_the_module_closes_its_delivery_queue() {
         .unwrap();
     assert_eq!(reply.header.kind, MessageKind::Error);
     assert!(transport.is_faulted());
+    finish_closed_delivery_fixture(&transport, lock).await;
+}
+
+
+// Keep the shared vtable fixture serialized through its final global writes.
+async fn finish_closed_delivery_fixture(
+    _transport: &ModuleTransport,
+    lock: tokio::sync::MutexGuard<'_, ()>,
+) {
     DELIVERY_CODE.store(TB_OK, Ordering::Release);
+    drop(lock);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_fault_reply_does_not_release_the_fixture_before_physical_cleanup() {
+    use std::future::Future;
+
+    struct WorkerRelease(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for WorkerRelease {
+        fn drop(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    let lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let _release = ShutdownRelease;
+    SHUTDOWN_ENTERED.store(false, Ordering::Release);
+    SHUTDOWN_CALLS.store(0, Ordering::Release);
+    let (transport, host) = ModuleTransport::new("serialized-fault-cleanup".into(), vec![]);
+    transport.defer_initialize(initialize_ok, host);
+    transport.ensure_initialized().await.unwrap();
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let worker_release = WorkerRelease(Some(release));
+    *transport.before_worker_lock.lock().unwrap() = Some(Box::new(move || {
+        let _ = started.send(());
+        let _ = release_rx.recv();
+    }));
+    DELIVERY_CODE.store(TB_CLOSED, Ordering::Release);
+    transport.send(call()).await.unwrap();
+    unsafe { (host.ready)(host.host_ctx) };
+    // The actual independently owned fault worker cannot acquire lifecycle yet.
+    let reply = tokio::time::timeout(Duration::from_secs(2), transport.recv()).await;
+    let started = tokio::time::timeout(Duration::from_secs(2), started_rx).await;
+    let faulted_before_cleanup = transport.is_faulted();
+    let callback_pending = !SHUTDOWN_ENTERED.load(Ordering::Acquire)
+        && !matches!(
+            transport.context.physical.lock().unwrap().cleanup,
+            CleanupState::Complete | CleanupState::Uncertain | CleanupState::NoCallbackRequired
+        );
+    let mut completion = Box::pin(finish_closed_delivery_fixture(&transport, lock));
+    let completed_early = std::future::poll_fn(|cx| {
+        std::task::Poll::Ready(completion.as_mut().poll(cx).is_ready())
+    })
+    .await;
+    let released_early = VTABLE_TEST_LOCK.get().unwrap().try_lock().is_ok();
+
+    // Release and observe the real callback before any regression assertion.
+    // The transport retains the actual context; cancelling an observer is not cleanup.
+    drop(worker_release);
+    wait_physical_cleanup(&transport).await;
+    if !completed_early {
+        completion.await;
+    }
+    let next_fixture_can_start = VTABLE_TEST_LOCK.get().unwrap().try_lock().is_ok();
+    assert!(matches!(reply, Ok(Ok(Some(ref reply))) if reply.header.kind == MessageKind::Error));
+    assert!(matches!(started, Ok(Ok(()))));
+    assert!(faulted_before_cleanup && callback_pending);
+    assert!(SHUTDOWN_ENTERED.load(Ordering::Acquire));
+    assert_eq!(SHUTDOWN_CALLS.load(Ordering::Acquire), 1);
+    assert!(!completed_early, "fault reply is not physical fixture completion");
+    assert!(!released_early, "next fixture must wait for actual cleanup");
+    assert!(next_fixture_can_start);
 }
 
 #[tokio::test]
