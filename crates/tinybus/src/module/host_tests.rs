@@ -2182,24 +2182,12 @@ async fn one_refused_module_does_not_stop_the_others_in_the_directory_from_loadi
     );
 }
 
-/// Copy `artifact` into a fresh directory beside a `modules.toml` listing
-/// `hash` for it, so a load can be driven against a real allowlist.
+/// Copy `artifact` into a fresh, private directory with its hash allowlist.
 ///
-/// Unix-only, and the reason is the loader's own admission check rather than
-/// anything about the code under test. On Windows that check trusts exactly
-/// three SIDs on a module directory: its owner, `LocalSystem`, and
-/// `BUILTIN\Administrators`. A CI runner's account is an administrator, so a
-/// directory a *test* creates is owned by `BUILTIN\Administrators` while the
-/// ACE it inherits names the user SID — neither the owner nor well-known
-/// trusted — and the load is refused. That is why the Windows workflow calls
-/// `SetOwner` on the directories it provisions; a test cannot do the same
-/// without Win32 calls of its own.
-///
-/// Gating here costs little: what these two tests exercise is the hash
-/// comparison and the attestation record it produces, which is identical on
-/// every platform. The Windows-specific directory policy is covered by the
-/// existing loader tests that run against the CI-provisioned directories.
-#[cfg(unix)]
+/// Each native fixture needs a separate mapping: the SDK installs a global
+/// tracing subscriber inside the library, so initializing the same DLL path
+/// twice shares state even across independent hosts. Windows staging uses the
+/// release-cache ACL repair so the real admission gate remains in force.
 fn staged_module(artifact: &Path, hash: &str) -> (tempfile::TempDir, PathBuf) {
     // Staged beside the artifact rather than in `/tmp`: the loader refuses a
     // directory another user could write to, and `/tmp` is exactly that. The
@@ -2209,6 +2197,8 @@ fn staged_module(artifact: &Path, hash: &str) -> (tempfile::TempDir, PathBuf) {
     // route around.
     let root = artifact.parent().expect("artifact has a parent directory");
     let dir = tempfile::tempdir_in(root).unwrap();
+    #[cfg(windows)]
+    super::cache::secure_release_cache(dir.path(), dir.path());
     let file_name = artifact.file_name().unwrap();
     let staged = dir.path().join(file_name);
     std::fs::copy(artifact, &staged).unwrap();
@@ -2410,7 +2400,6 @@ async fn an_eager_cdylib_authenticates_after_its_worker_runs_before_admission() 
 async fn authenticates_native_context(variable: &str) {
     let artifact = PathBuf::from(std::env::var_os(variable).expect(variable));
     let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
-    #[cfg(unix)]
     let (_dir, artifact) = staged_module(&artifact, &hash);
     let bus = MemoryBus::new();
     let broker = Broker::new();
@@ -2537,7 +2526,6 @@ async fn fixed_unique_module_calls_are_refused_in_terminal_states_before_detach(
 async fn a_verified_cdylib_can_deliver_a_confidential_host_callback() {
     let artifact = PathBuf::from(std::env::var_os("TINYBUS_TEST_CONTEXT_MODULE").unwrap());
     let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
-    #[cfg(unix)]
     let (_dir, artifact) = staged_module(&artifact, &hash);
     let bus = MemoryBus::new();
     let broker = Broker::new();
@@ -2655,7 +2643,6 @@ async fn eager_native_setup_callbacks_are_bound_before_ready_and_failures_rollba
         let artifact =
             PathBuf::from(std::env::var_os("TINYBUS_TEST_HOST_CALLBACK_MODULE").unwrap());
         let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
-        #[cfg(unix)]
         let (_dir, artifact) = staged_module(&artifact, &hash);
         let broker = Broker::new();
         let modules = ModuleHost::new(broker.clone());
@@ -2795,7 +2782,6 @@ impl crate::Interface for BoundNativeCallback {
 async fn a_native_callback_timeout_and_revoke_do_not_claim_worker_completion() {
     let artifact = PathBuf::from(std::env::var_os("TINYBUS_TEST_CONTEXT_MODULE").unwrap());
     let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
-    #[cfg(unix)]
     let (_dir, artifact) = staged_module(&artifact, &hash);
     let modules = ModuleHost::new(Broker::new());
     let binding = modules
