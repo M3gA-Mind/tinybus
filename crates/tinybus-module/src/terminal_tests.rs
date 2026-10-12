@@ -27,3 +27,84 @@ fn observed_native_terminal_never_reopens_a_retained_view() {
     state.publish();
     assert_eq!(state.wait(Duration::from_secs(3)), TerminalCompletion::PhysicallyStopped);
 }
+
+#[test]
+fn retired_anchor_cannot_refund_permit_while_old_view_survives() {
+    let admission = Admission::new();
+    let mut views = Vec::new();
+    for _ in 0..INSTANCE_LIMIT {
+        let state = TerminalState::admit_in(&admission, host(), None).unwrap();
+        views.push(state.view());
+        state.empty_factory_failure();
+    }
+    assert!(TerminalState::admit_in(&admission, host(), None).is_none());
+    views.pop();
+    let replacement = TerminalState::admit_in(&admission, host(), None).unwrap();
+    replacement.empty_factory_failure();
+    drop(replacement);
+    drop(views);
+    assert!(admission.slots.lock().unwrap().iter().all(|slot| !slot.reserved));
+}
+
+#[test]
+fn request_primary_payload_is_retained_and_finish_still_attempted_once() {
+    use std::sync::atomic::AtomicUsize;
+    struct PayloadDrop(Arc<AtomicUsize>);
+    impl Drop for PayloadDrop { fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); } }
+    let admission = Admission::new();
+    let state = TerminalState::admit_in(&admission, host(), None).unwrap();
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let finishes = Arc::new(AtomicUsize::new(0));
+    let (request_count, finish_count, payload) = (requests.clone(), finishes.clone(), dropped.clone());
+    state.register(RuntimeHooks::new(move |_| {
+        request_count.fetch_add(1, Ordering::SeqCst);
+        std::panic::panic_any(PayloadDrop(payload.clone()));
+    }, move || {
+        finish_count.fetch_add(1, Ordering::SeqCst);
+        TerminalCompletion::PhysicallyStopped
+    }));
+    state.publish();
+    state.signal(TerminalReason::Stop);
+    assert_eq!(state.wait(Duration::from_secs(3)), TerminalCompletion::Uncertain);
+    state.signal(TerminalReason::Fault);
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert_eq!(finishes.load(Ordering::SeqCst), 1);
+    assert_eq!(dropped.load(Ordering::SeqCst), 0);
+    assert!(state.lock().request_state == RequestState::Panicked);
+    assert!(admission.slots.lock().unwrap()[state.lease.index].anchor.is_some());
+}
+
+#[test]
+fn physical_finish_waits_for_bounded_request_completion_and_startup_publication() {
+    let admission = Admission::new();
+    let state = TerminalState::admit_in(&admission, host(), None).unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let request_release = release.clone();
+    let finished = Arc::new(AtomicBool::new(false));
+    let finish_seen = finished.clone();
+    state.register(RuntimeHooks::new(move |_| {
+        entered_tx.send(()).unwrap(); request_release.wait();
+    }, move || { finish_seen.store(true, Ordering::Release); TerminalCompletion::PhysicallyStopped }));
+    let caller_state = state.clone();
+    let caller = std::thread::spawn(move || caller_state.signal(TerminalReason::Stop));
+    entered_rx.recv().unwrap();
+    state.publish();
+    assert!(!finished.load(Ordering::Acquire));
+    release.wait(); caller.join().unwrap();
+    assert_eq!(state.wait(Duration::from_secs(3)), TerminalCompletion::PhysicallyStopped);
+    assert!(finished.load(Ordering::Acquire));
+}
+
+#[test]
+fn surviving_sdk_owned_transport_keeps_cleanup_uncertain_and_permit_anchored() {
+    let admission = Admission::new();
+    let state = TerminalState::admit_in(&admission, host(), None).unwrap();
+    let sdk_owner = state.sdk_owner();
+    state.register(RuntimeHooks::new(|_| {}, || TerminalCompletion::PhysicallyStopped));
+    state.publish(); state.signal(TerminalReason::Stop);
+    assert_eq!(state.wait(Duration::from_secs(3)), TerminalCompletion::Uncertain);
+    drop(sdk_owner);
+    assert!(admission.slots.lock().unwrap()[state.lease.index].anchor.is_some());
+}
