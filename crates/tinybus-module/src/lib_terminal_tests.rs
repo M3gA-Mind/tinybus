@@ -117,11 +117,15 @@ mod controlled {
         pub mode: u8,
         #[serde(default)]
         record_drop: bool,
+        #[serde(skip, default = "config_fixture")]
+        fixture: std::sync::Weak<Fixture>,
     }
+    static CONFIG_FIXTURE: StdMutex<std::sync::Weak<Fixture>> = StdMutex::new(std::sync::Weak::new());
+    fn config_fixture() -> std::sync::Weak<Fixture> { CONFIG_FIXTURE.lock().unwrap().clone() }
     impl Drop for Config {
         fn drop(&mut self) {
             if self.record_drop {
-                let fixture = NEXT.lock().unwrap().as_ref().unwrap().clone();
+                let Some(fixture) = self.fixture.upgrade() else { return; };
                 fixture.config_drops.fetch_add(1, Ordering::SeqCst);
                 let _ = fixture.events.send(Event::ConfigDrop(std::thread::current().name().unwrap_or("unnamed").to_owned()));
             }
@@ -164,6 +168,7 @@ mod controlled {
             request_off_lock: AtomicBool::new(true),
             future_drop_control: StdMutex::new(None),
         });
+        *CONFIG_FIXTURE.lock().unwrap() = Arc::downgrade(&fixture);
         *NEXT.lock().unwrap() = Some(fixture.clone());
         (fixture, receiver)
     }
