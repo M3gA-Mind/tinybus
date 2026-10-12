@@ -37,10 +37,12 @@ pub const TB_NATIVE_TERMINAL_LIVE: u32 = 1;
 pub const TB_NATIVE_TERMINAL_STOP_INTENT: u32 = 2;
 /// Actual fault intent, with public fault state taking precedence over stop.
 pub const TB_NATIVE_TERMINAL_FAULT: u32 = 4;
-/// Successful opaque shutdown return. For modules opting into native terminal
-/// hooks, successful finish must also prove their independent worker joined.
-/// This bit proves neither legacy worker completion nor receiver backing
-/// destruction. Faulted or uncertain shutdown must never set it.
+/// An accepted opaque shutdown callback actually returned TB_OK. Fault and
+/// stop intent remain set and continue to deny admission even with this bit.
+/// A legacy callback's TB_OK alone proves neither independent worker completion
+/// nor receiver backing destruction. For native terminal hooks, TB_OK must
+/// additionally require actual worker/resource finish without sticky uncertainty
+/// or fault; that stronger module contract is separate from this host evidence.
 pub const TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED: u32 = 8;
 
 /// Revision-one module initialization entrypoint.

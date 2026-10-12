@@ -152,6 +152,7 @@ struct PhysicalJob {
     initializer: StdMutex<Option<DeferredInitializer>>,
     guard: StdMutex<Option<tokio::sync::OwnedMutexGuard<()>>>,
     deadline: Duration,
+    fault_on_spawn_failure: bool,
 }
 
 struct InitiatingWaiter<'a> { transport: &'a ModuleTransport, armed: bool }
@@ -449,6 +450,7 @@ impl ModuleTransport {
             transport: self.self_ref.upgrade().ok_or(Error::ConnectionClosed)?,
             initializer: StdMutex::new(Some(initializer)), guard: StdMutex::new(None),
             deadline: MODULE_INIT_DEADLINE,
+            fault_on_spawn_failure: true,
         });
         state.init = InitState::Scheduled;
         state.job = Some(job.clone());
@@ -477,7 +479,7 @@ impl ModuleTransport {
         };
         if spawn.is_err() {
             let transport = &job.transport;
-            transport.commit_terminal(true);
+            transport.commit_terminal(job.fault_on_spawn_failure);
             let mut state = transport.context.physical.lock().expect("physical state lock");
             state.cleanup = CleanupState::Uncertain;
             state.result.get_or_insert(Err(InitFailure::Failed("module physical worker could not start".into())));
@@ -519,7 +521,7 @@ impl ModuleTransport {
         }
         let Some(transport) = self.self_ref.upgrade() else { return; };
         let job = Arc::new(PhysicalJob { transport, initializer: StdMutex::new(None),
-            guard: StdMutex::new(None), deadline: MODULE_INIT_DEADLINE });
+            guard: StdMutex::new(None), deadline: MODULE_INIT_DEADLINE, fault_on_spawn_failure: fault });
         state.job = Some(job.clone());
         drop(state);
         Self::submit_job(job);
@@ -546,7 +548,7 @@ impl ModuleTransport {
                 if state.job.is_none() {
                     state.job = self.self_ref.upgrade().map(|transport| Arc::new(PhysicalJob {
                         transport, initializer: StdMutex::new(None), guard: StdMutex::new(None),
-                        deadline: MODULE_INIT_DEADLINE,
+                        deadline: MODULE_INIT_DEADLINE, fault_on_spawn_failure: true,
                     }));
                 }
             }
@@ -878,7 +880,7 @@ impl ModuleTransport {
         let job = if existing || state.cleanup != CleanupState::Requested { None } else {
             let job = Arc::new(PhysicalJob { transport: self.clone(),
                 initializer: StdMutex::new(None), guard: StdMutex::new(acquired.take()),
-                deadline: remaining });
+                deadline: remaining, fault_on_spawn_failure: false });
             state.job = Some(job.clone());
             Some(job)
         };
