@@ -49,3 +49,18 @@ The existing scan-then-load path remains compatible. Hosts that need the new
 guarantee must use the new API rather than infer retained admission from a
 ModuleInfo returned by scan_dir. No production module release is performed by
 this change.
+
+## First hosted feedback
+
+The first hosted run caught a stricter feature-off compilation failure:
+requirements were exported with modules disabled, leaving unused private
+fields under RUSTFLAGS=-D warnings. An exact local strict kernel check reproduced
+the failure. The module and exports now use the same modules feature gate as
+ModuleHost, with no warning suppression.
+
+Windows also correctly refused the real fixture's checkout-relative temporary
+directory because it inherited another user's write access. The fixture now
+uses the runner-provided owner-only TEMP; Unix canonicalizes that path to avoid
+macOS /var symlinks. The confidential-call assertion remains enabled on every
+module platform job. Windows GREEN requires a fresh hosted run; Linux evidence
+alone is not claimed as Windows execution.
