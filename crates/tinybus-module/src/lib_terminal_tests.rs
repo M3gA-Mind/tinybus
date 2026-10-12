@@ -36,6 +36,80 @@ fn output() -> TbModuleVtable {
     }
 }
 #[test]
+fn terminal_callbacks_reject_zero_and_unknown_context_tokens_as_closed() {
+    let bytes = b"{}";
+    for address in [0, 1, 255, usize::MAX] {
+        let ctx = std::ptr::with_exposed_provenance_mut(address);
+        let results = unsafe {
+            [
+                ("deliver", terminal_deliver(ctx, bytes.as_ptr(), bytes.len())),
+                ("shutdown", terminal_shutdown(ctx, 1)),
+                (
+                    "reinitialize",
+                    terminal_reinitialize(ctx, bytes.as_ptr(), bytes.len()),
+                ),
+            ]
+        };
+        assert_eq!(
+            results,
+            [
+                ("deliver", TB_CLOSED),
+                ("shutdown", TB_CLOSED),
+                ("reinitialize", TB_CLOSED),
+            ],
+            "context token {address} with otherwise valid arguments"
+        );
+    }
+}
+
+#[test]
+fn legacy_callbacks_keep_null_context_bad_argument() {
+    let bytes = b"{}";
+    let ctx = std::ptr::null_mut();
+    let mut out = output();
+    let results = unsafe {
+        [
+            (
+                "init",
+                start_module(std::ptr::null(), &mut out, 1, false, |_| async {
+                    Ok(())
+                }),
+            ),
+            ("deliver", deliver(ctx, bytes.as_ptr(), bytes.len())),
+            ("shutdown", shutdown(ctx, 1)),
+            (
+                "reinitialize",
+                reinitialize(ctx, bytes.as_ptr(), bytes.len()),
+            ),
+        ]
+    };
+    assert_eq!(
+        results,
+        [
+            ("init", TB_BAD_ARGUMENT),
+            ("deliver", TB_BAD_ARGUMENT),
+            ("shutdown", TB_BAD_ARGUMENT),
+            ("reinitialize", TB_BAD_ARGUMENT),
+        ]
+    );
+}
+
+#[test]
+fn terminal_callbacks_keep_invalid_frame_and_config_bad_argument() {
+    let ctx = std::ptr::null_mut();
+    let bytes = b"{}";
+    let results = unsafe {
+        [
+            terminal_deliver(ctx, std::ptr::null(), 0),
+            terminal_deliver(ctx, bytes.as_ptr(), MAX_FRAME_LEN + 1),
+            terminal_reinitialize(ctx, std::ptr::null(), 1),
+            terminal_reinitialize(ctx, bytes.as_ptr(), 1024 * 1024 + 1),
+        ]
+    };
+    assert_eq!(results, [TB_BAD_ARGUMENT; 4]);
+}
+
+#[test]
 fn native_query_is_required_before_terminal_factory_evaluation() {
     use tinybus::module::abi::*;
     // Exactly LIVE is the sole admitted value. Missing, empty, terminal,
