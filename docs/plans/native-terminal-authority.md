@@ -57,7 +57,7 @@ New crates/tinybus-module/src/terminal.rs and terminal_tests.rs; lib.rs reexport
     enum TerminalCompletion { PhysicallyStopped, Uncertain }
     struct NativeInstanceLiveness { inner: Arc<TerminalState> }
     struct RuntimeHooks {
-        request: Box<dyn Fn(TerminalReason) + Send + Sync>,
+        request: Arc<dyn Fn(TerminalReason) + Send + Sync>,
         finish: Box<dyn FnOnce() -> TerminalCompletion + Send>,
     }
 
@@ -247,44 +247,319 @@ actual reinit fault/query denial before return, ordinary callback lease retentio
 Host Drop/rollback tombstones, instance isolation and one real join. Keep every
 original #57 callback drain, physical lock, retry and original marker assertion.
 
-## Task 4: module-local hooks through runtime and fault paths
+## Task 4: accepted module-local lifecycle protocol
 
-Files: new terminal.rs/terminal_tests.rs/lib_terminal_tests.rs in tinybus-module;
-lib.rs, lib_setup_factory_tests.rs, lib_lifecycle_tests.rs.
-Declare sibling test modules, no inline tests.
+Baseline for this task: a8a8f9ffb935409da5bc3ead20dcad44f7299292.
+The corrections below supersede conflicting earlier proposal text.
 
-Red tests unavailable query rejects before factory; two instances isolated;
-retained view after runtime shutdown; host fault precedes local request;
-request/finish once; poisoned hook storage; finish panic stays uncertain;
-terminal reinit never reruns setup; retained service refs cannot suppress cleanup.
+# Task 4 proposed concrete module ownership
 
-Implement API above. New private start_terminal_reconfigurable_module_factory_mode
-and doc-hidden linked/unlinked entrypoints serve macro arms. Existing entrypoints
-retain old behavior. start_module_runtime takes optional Arc<TerminalState>;
-transport, RuntimeState and setup monitor share it, existing callers pass None.
-shutdown requests Stop before callback disposal, releases reinitializer mutex,
-then runs finish synchronously on retained physical host cleanup worker before
-runtime.shutdown_timeout. Indefinite join outlives deadline without TB_OK.
-Uncertain/panic finish returns content-free failure, never physical completion.
+Evidence-only proposal for root preflight. No source/build/pin/ref/commit mutation.
+Uses accepted fe080 ABI tail and Task 2/3 host ownership, not another ABI.
+Source observations: lib.rs RuntimeState/start_module_runtime/factory-mode/shutdown;
+connection.rs::handle_call invokes caught panic handler after dispatch unwinds and
+before error enqueue; registry locks are released before user invocation. Existing
+transport send faults only after successful send; this cannot remain primary fault
+notification for opted-in modules. Existing entrypoints retain their behavior.
 
-Task 4 remains separate, unimplemented scope. Its startup guard owns returned
-hooks until runtime/output publication; factory Err/panic before return owns
-partial disposal itself. Request callback is an independent Arc and finish a
-separate take-once slot. Publish intent, claim bounded request outside locks,
-signal request completion even on panic; physical finish waits request-done
-off runtime, callback-gate and reinitializer locks. Pre-registration fault
-persists and invokes bounded request once at registration. Ordinary
-terminal-caused setup cancellation must remain non-Fault, while genuine
-Err/panic still upgrades Fault even racing ordinary stop.
+## Proposed public module-local API
 
-The accepted host prerequisite does not establish catch-time fault publication,
-module-local worker/resource finish, fixed retained job bounds or confidential
-payload/backing last-Drop. Task 4's own accepted specification must prove those
-contracts at the actual CatchUnwind boundary before payload destruction; no
-enqueue/send-success inference, extra panic task or global panic hook join.
-A caught registry-free callback boundary must publish fault/request before
-returning its error. New physical-success evidence remains distinct from legacy
-Stopped and receiver backing destruction.
+New terminal.rs, terminal_tests.rs and lib_terminal_tests.rs; lib.rs reexports:
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum TerminalReason { Stop, HostClosed, Fault, SetupFailed }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub enum TerminalCompletion { PhysicallyStopped, Uncertain }
+    #[derive(Clone)]
+    pub struct NativeInstanceLiveness { inner: Arc<TerminalState> }
+    pub struct RuntimeHooks {
+        request: Arc<dyn Fn(TerminalReason) + Send + Sync>,
+        finish: Box<dyn FnOnce() -> TerminalCompletion + Send>,
+    }
+    impl RuntimeHooks {
+        pub fn new<R, F>(request: R, finish: F) -> Self
+        where R: Fn(TerminalReason) + Send + Sync + 'static,
+              F: FnOnce() -> TerminalCompletion + Send + 'static;
+    }
+    impl NativeInstanceLiveness {
+        pub fn is_live(&self) -> bool;
+        pub fn request_fault(&self);
+    }
+
+All fields private; no raw pointer, constructor, serde or Connection enrollment.
+New terminal_setup_factory macro/linked arm takes factory(view) ->
+tinybus::Result<(F, RuntimeHooks)>, F: Fn(Connection, C)->Fut + Send+Sync+'static,
+Fut: Future<Output=Result<()>>+Send+'static. Same Arc<F> serves setup/reinit.
+New doc-hidden start_terminal_reconfigurable_module_with_factory and linked
+equivalent own C argument validation; no change to old setup/setup_factory APIs.
+
+Normalize/copy HostCalls only through trusted unsafe module-init contract. Check
+native_terminal_state exists and returns exactly TB_NATIVE_TERMINAL_LIVE before
+factory evaluation; unavailable/terminal returns TB_CLOSED with factory untouched.
+Do not infer lifetime from broker_routing or sender JSON. Strong callback lifetime
+is already part of accepted unsafe ABI contract; actual HostContext persists.
+Every is_live samples local terminal, actual callback, local terminal again. Unknown
+flags fail closed, mark observed HostClosed locally; valid Fault upgrades Fault.
+StopIntent observes Stop. Observation does not claim physical fence/join/backing Drop.
+
+Factory constructs controller/resources but launches worker only after returned
+hooks are registered, during setup. Before return, factory owns partial Err/panic
+cleanup. A factory calling view.request_fault before returning persists terminal
+intent; after hooks register replay one bounded request and deny setup. Factory
+Err/panic with no hooks cannot give SDK a join handle it never received.
+
+## Request protocol, cause precedence and non-recursion
+
+TerminalState holds copied HostCalls; monotonic terminal/fault atomics; mutex
+ControlState with request Arc Option, separate finish Option, RequestState
+(Unregistered/Idle/Running/Done/Panicked), FinishState
+(Idle/Anchored/Running/Complete/Uncertain), startup-publication state; Condvar.
+All locks recover poison to terminal/uncertain rather than second panic. Atomic
+intent is committed before taking these locks or invoking arbitrary code.
+
+Cause precedence: real Fault dominates Stop/HostClosed. SetupFailed is diagnostic
+fault cause, also sets fault flag; never downgrade fault after once request. Stop
+and HostClosed both normal terminal, no HostCalls::fault. Preserve first real fault
+cause; reason passed to already-invoked request is immutable, persisted reason may
+upgrade later. Request contract is identical atomic admission closure for every
+cause, so fault escalation never needs a second request invocation.
+
+request_fault calls HostCalls::fault FIRST, then records local fault and runs
+request_if_registered. Host callback schedules only, never awaits/reenters module
+hooks. Host intent closes independent worker phases even if module request cannot
+yet run. request_if_registered clones request Arc and marks Running under lock,
+releases lock, catches callback unwind, reacquires lock to publish Done/Panicked
+and notify. If another caller sees Running it returns without waiting; only
+physical finish waits request-done. Request panic commits fault/Uncertain and
+notifies BEFORE invoking host.fault for escalation; no retry or recursive request.
+Pre-registration request stays pending; registration installs both callbacks under
+one lock then invokes request_if_registered outside it. No missed early fault.
+
+Request MUST be bounded atomic admission-close/cancel signal: no I/O/join/reentrant
+SDK API, no waiting physical phase gate or Registry/reinitializer mutex. The SDK
+cannot forcibly bound trusted callback code; state docs/tests establish contract.
+Already granted Publish may finish; actual next-phase query denies immediately.
+Physical gate fence plus actual worker join occurs only in finish. Arbitrary worker
+catch invokes request_fault after unwinding out of physical gate, not panic hook.
+
+## One retained physical finish owner including no RuntimeState paths
+
+Use private module-global anchor collection of Arc<TerminalState>, one entry per
+opted-in instance while controller ownership needs retention. Insert BEFORE
+factory evaluation/transfer can create SDK-owned hooks and before any spawn.
+Each instance ControlState has ONE optional Arc<FinishJob>; job owns terminal
+state plus startup/runtime cleanup resources. Collection owns state independently
+of rejected spawn closure, setup future, service refs and output vtable. No public
+fake constructor; no extra HostContext or per-view/per-query allocation. This is
+explicit module-local controller/anchor bookkeeping, not an ABI lifetime object.
+The collection is inspectable/testable and clears completed entries; uncertain
+entries deliberately remain. No global boundedness claim; finite total admission
+would require separately approved cap. Do not substitute an untracked Box leak
+or self-cycle for this external retained owner.
+
+finish scheduling under ControlState: install job then mark Anchored exactly once;
+clone job into Builder::spawn. Spawn Err drops only clone, retains original anchor,
+marks Uncertain, retains resources and closes intent. No implicit retry/claim reset.
+Spawner injectable privately. Actual worker waits request-done AND startup ownership
+publication before taking finish. Neither request caller nor runtime worker waits.
+Startup locks/ControlState/phase/reinitializer locks all released before finish.
+Take FnOnce once under lock, then run outside lock/catch_unwind. Physical completion
+requires TerminalCompletion::PhysicallyStopped; failure/panic stays Uncertain and
+retains job/state/resources conservatively. Cleanup thread never calls host shutdown.
+
+This additional module cleanup thread exists once per terminal instance, not once
+per error; request itself never spawns. C shutdown observes/schedules same job then
+waits completion on host's physical blocking worker. A fault during stop cannot
+claim second finish. Module startup failure has identical finish owner even when
+no valid vtable was ever published and host cannot call shutdown.
+
+## Startup ownership guard: exact transfer and failure paths
+
+Create StartupGuard outside catch_unwind after argument/config/capability validation
+and TerminalState/anchor creation. Factory Err/panic before returning hooks marks
+terminal, removes empty anchor only when SDK owns no controller/resources; factory
+partial disposal remains its responsibility. On successful factory return register
+hooks immediately under guard, before tracing subscriber/runtime creation.
+
+Guard owns shared StartupResources (runtime Option, reinitializer slot Option,
+connection/inbound resources as created). Every resource is attached to this owned
+structure immediately; no fallible gap leaves runtime/closure on unwinding stack
+with accidental blocking Drop. Only cleanup worker takes them after publication.
+
+Refactor opted-in runtime builder path, preserving legacy calls:
+
+1. tracing set_global_default failure after hook transfer: guard records SetupFailed,
+   host fault, bounded request, schedules anchored finish; returns TB_CLOSED.
+2. runtime Builder failure: same, runtime absent. No direct finish on init callback.
+3. panic in reinitializer construction, task spawn, RuntimeState construction or
+   after ownership transfer: outer catch retains guard/StartupResources, marks fault,
+   schedules same finish and returns TB_PANICKED. Runtime Drop occurs on cleanup
+   thread after finish, not unwinding ABI/runtime worker.
+4. RuntimeState Box created: guard still owns resources until output publication.
+   write_module_vtable only uses prevalidated writable capacity. Once complete,
+   mark PublishedRuntime and disarm guard, keeping anchor until actual finish.
+5. Panic before output publication: no TB_OK/usable output promised; guard publishes
+   StartupFailed/resources to job, no host cleanup assumption. After successful
+   publication, RuntimeState/shutdown own normal routing and shared finish job.
+
+Guard Drop never joins/blocks: it marks terminal and transfers to already anchored
+resources/job, signals publication; catch path performs bounded request/schedule
+outside unwind. Guard is fallback when unwinding, not an arbitrary-callback panic
+hook. Startup publication wait prevents fault-triggered finish from overtaking
+registration/runtime transfer. No await while holding startup locks.
+
+## Runtime shutdown and setup result classification
+
+RuntimeState adds optional terminal state; old entrypoints None unchanged. Opted-in
+shutdown first samples actual host flags to select Fault/SetupFailed precedence;
+if still Live and actual shutdown entered, commit local Stop. Request once.
+Take reinitializer under its mutex, release mutex, drop captured callback outside
+lock. Close inbound. Publish cleanup resources; schedule same finish owner.
+Wait request/finish completion on host physical shutdown worker, holding no module
+runtime/reinitializer/startup/phase locks. Actual Host lifecycle remains serialized
+around opaque C callback, as accepted Task 2/3. Runtime.shutdown_timeout runs ONLY
+after successful join result, on physical cleanup thread or host worker after
+resources ownership is taken once. Uncertain finish returns TB_PANICKED, never TB_OK;
+resources remain retained if releasing could discard actual uncertain ownership.
+
+Setup monitor: actual Ok(Err) or JoinError::is_panic upgrades SetupFailed/Fault even
+if ordinary stop races. JoinError::is_cancelled while persisted Stop/HostClosed
+shares normal cleanup WITHOUT host.fault; successful setup's intentional pending
+task canceled by ordinary runtime shutdown is covered. Unexpected cancellation
+while Live is SetupFailed. Fault host flags always dominate local normal cause.
+Record cancellation decision before runtime teardown; monitor cannot be sole
+controller owner because shutdown can abort it. Setup monitor schedules, never
+awaits physical finish; failed callback disposal on physical worker releases its
+mutex before joining and never blocks runtime needed by in-flight setup/reinit.
+Setup/reinit reject terminal before start and before activation. Real setup
+Err/panic must be reported at source catch/result boundary before publication of
+normal shutdown success; do not rely solely on a monitor canceled during teardown.
+
+Caught method handler installed with __set_panic_handler invokes request_fault
+before content-free error construction/enqueue. Existing handle_call clones/drops
+handler lock; dispatch already unwound Registry locks. Remove opted-in reliance
+on successful ModuleTransport::send panic-error handling; old behavior unchanged.
+Global panic hook remains location-only, no terminal hook/join/reentrant SDK code.
+
+## Host init output interaction
+
+No TB_OK from startup failure, and no host invocation of misleading rejected output.
+Host PublishedRejected/NoCallbackRequired concerns usable host callback access;
+it DOES NOT certify no module startup controller/backing remains. The module's
+independent anchor owns failed-startup finish. If finish pending/Uncertain, host
+native query stays terminal without PhysicallyStopped. Successful startup finish
+with no valid returned vtable still cannot manufacture a host physical-success bit;
+only host accepted-vtable shutdown success sets that ABI bit. No extra ABI needed.
+Malformed foreign module output/launch without returned hooks remains unjoinable
+uncertainty; this safe API never promises to clean resources it never received.
+
+## Scoped red/green tests and actual compiled fixtures
+
+Sibling tests pin unavailable query before factory, retained copied view after
+runtime shutdown, independent instance/factory isolation, unknown flags deny;
+fault before registration -> exactly one request after registration/no setup;
+request races finish with barriers -> finish starts only after request done;
+request panic -> host scheduling once/no recursion/no second request;
+poison recovery -> terminal uncertain/no double panic;
+spawn failure -> real controller/resource Drop stays retained after no-vtable
+startup error, Host Drop and runtime teardown; finish FnOnce never repeats.
+
+Inject tracing-registration conflict, runtime-build error, panic after hook transfer,
+panic after runtime creation/before output publication; observe actual finish/join
+off init/runtime workers and correct uncertainty on spawn failure. Test normal
+initial setup cancel and successful pending-task cancel; race real Err/panic with
+stop -> Fault preserved; block outbox/host send -> caught handler still closes
+native authority before error enqueue. Reinit terminal never launches/replaces.
+
+Actual compiled module_terminal fixture registers std worker/controller, holds
+Publish lease and opaque reinit/init, exposes init-bound test C release controls.
+Host fault during opaque hold denies next worker query before cleanup can enter;
+old lease release enables actual fence/join. Deadline/drop retains join, hook
+request bounded while gate held, actual worker panic after unwind, startup failure
+with no valid vtable still finishes through module anchor, post-HostDrop query
+tombstone safe. Real old-prefix host rejects only opted-in factory; legacy works.
+Use barriers/events, no sleeps; compiled controls never become production authority.
+
+No tests infer confidential last-Drop/refund from callback/future/join counters.
+No codec/crypto/retirement/global load cap addition. Root preflight must approve
+module-global anchor bookkeeping and StartupResources ownership transfer before
+Task 4 writer implements; they are explicit proposed internal ownership, not
+pretended current APIs or an additional C lifetime contract.
+
+# Task 4 module-local lifecycle preflight
+
+Reviewed accepted-task4-proposed.md against unchanged tinybus-module/src/lib.rs and connection.rs; Task 1 additive ABI now exists. Read-only: only this ignored report written. No source/build/ref/pin mutations. No extra C ABI or allocator/lifetime handoff is needed.
+
+## Important findings and accepted concrete resolutions
+
+**New global collection needs finite admission.** Proposal:93–104 adds a collection retaining failed-startup/Uncertain instances indefinitely. Existing RuntimeState leakage does not account for this: tracing/build failures return before its allocation (lib.rs:570–579,608–615 versus 684–691). A growing Vec plus a global-bound disclaimer is insufficient.
+
+Root accepts a fixed **256** private terminal-instance permit/anchor array reserved before factory evaluation/SDK hook ownership. Exhaustion returns TB_CLOSED without invoking factory. Each state owns its SlotLease; external slot owns Arc<State>, state owns one Arc<Job>, Job holds Weak<State>, and a submitted worker captures strong State+Job. No state/job strong self-cycle. Successful actual finish plus all SDK-owned resource teardown permits anchor/job removal under bookkeeping locks, with destructors outside locks. The slot permit is released only at actual State last-Drop, so retained old liveness views keep their slot occupied and cannot cause unbounded retired-state accumulation through slot reuse. Uncertain/spawn failure retains slot/state/job/resources permanently; no reset/retry/refund. Factory failure before SDK resource transfer can remove its empty anchor; an escaped retained view still keeps the permit occupied until actual Drop. Fixed metadata does not bound arbitrary trusted closure/resource bytes or all mapped SDK images/host contexts. This is an admission cap for the new opt-in bookkeeping, not a broad legacy loader rewrite. Test capacity exhaustion, retained-view permit retention, actual success retirement and uncertain permanent occupancy.
+
+**Startup attachment must include all owned captures, not just Runtime.** Proposal:130–133 mentions runtime/slot/connection/inbound resources but factory returns F before runtime construction. Current factory path builds initial_setup and reinitialize_factory on the ABI stack (lib.rs:927–932,970–971); tracing failure can drop those captures before RuntimeState exists. Root accepts immediate attachment of returned Arc<F>, parsed config/initial setup closure, reinitializer factory/slot, transport/connection/inbound resources and actual task handles to preexisting StartupResources before subsequent fallible/unwind boundaries. Successful returned Runtime must be attached via poison-recovering, non-user-code transfer immediately after Builder success at lib.rs:608–615, before channels/reinitializer/task construction at 616–631. RuntimeState and FinishJob share this resource owner rather than transferring exclusive Runtime to a fallible local stack. No Runtime Drop on ABI/runtime worker; startup failure cleanup runs on anchored physical worker. Arbitrary factory partial cleanup/destructors before hook transfer remain trusted factory obligations; the SDK cannot promise to control resources it never received. Tests inject failure after every transfer boundary and observe actual destructor thread and retention, not merely flags.
+
+**Request failure must not spend physical finish.** Proposal:79–80 says request panic commits Uncertain, but FinishState Uncertain must not prevent the still-uninvoked finish callback from executing. Use orthogonal sticky_uncertainty plus finish invocation state. Request panic/poison publishes fault, marks RequestState Panicked/done and sticky uncertainty, then schedules the same still-eligible physical finish. Never repeat request or consume finish merely because uncertainty was recorded. After actual finish, uncertainty stays visible; no TB_OK/permit refund follows a failed request merely because join succeeded. A failed spawn remains unsubmitted and retained with no automatic retry. Tests cover request panic before job submission and while finish waits request-done.
+
+## Accepted setup/reinit protocol: settle execution before physical completion
+
+Current source keeps the successful initial setup task pending forever (lib.rs:646–655), and its monitor owns the exclusive JoinHandle (664–665). Err/panic is reported only after callback disposal and host fault at 669–680. RuntimeState shutdown disposes callback under the reinitializer mutex then destroys runtime (375–400); C reinit holds that mutex while block_on polls setup (404–417,955–960). A new job that waits this mutex or initial setup completion without first arranging cancellation can wait forever for work whose completion needs terminal cleanup. Joining a worker before an initial/reinit setup future is settled also lets that future launch work after the claimed join.
+
+Use this concrete opted-in-only protocol:
+
+1. Keep initial setup invocation and its returned future in a real task. Catch both synchronous F(connection, config) construction and asynchronous future polling inline, not only the later monitor. Publish actual Err/panic -> Fault/SetupFailed immediately at that result boundary, before readiness or any task-completion notification. Record cancellation separately, preserving already-committed Stop/HostClosed. Existing non-opted-in behavior is unchanged.
+2. Initial task returns after its actual setup result; do not park it forever. The already-persisted connection_slot owns the serving Connection (lib.rs:648–649); StartupResources owns that slot for runtime lifetime. FinishJob/StartupResources owns the task's sole JoinHandle. A monitor may observe shared published outcome, but must not consume the only handle required for real cancellation/completion proof.
+3. On terminal request, keep Runtime alive, abort an unfinished initial task, and await its actual JoinHandle on the physical cleanup thread (via retained runtime handle). This proves future cancellation/drop has actually happened. Classify is_cancelled caused by Stop/HostClosed as normal; genuine source-observed Err/panic always upgrades Fault. Do not await that join on a runtime worker, under reinitializer/startup/control/gate locks, or after shutting down its runtime.
+4. Opted-in reinit drives its setup invocation under terminal-aware cancellation (a terminal notification/predicate select with inline result/panic recording; poll the result branch first when result and terminal are both ready, so an actual ready Err is not lost). This lets a persisted request close the running reinit future while C still owns its mutex; it then returns a normal terminal code and releases that mutex. A real Err/panic observed while polling still faults before returning. No new setup invocation starts after terminal, and readiness/owner publication rechecks terminal. Cleanup can then take the reinitializer slot, release its mutex and drop captured callbacks outside it. Waiting a reinit that ignores cancellation synchronously retains pending ownership; it is not quiescence.
+5. After actual initial-setup settlement and reinitializer disposal, run the one finish callback, keeping Runtime services available for the actual controller worker's fence/join. The request callback must already have performed bounded cancel/wake; finish must not rely on an initial/reinit setup future that has been canceled, nor await host shutdown. This dependency contract belongs in public callback docs. Synchronous never-returning user setup, blocking destructor, nonreturning reinit, or worker dependency that cannot settle remains retained pending/Uncertain with no successful completion. Do not fake a timeout as join.
+6. After finish success, teardown SDK-owned runtime/connection/callback/task resources exactly once off locks on the physical worker. Only then publish completion and retire the anchor if there is no sticky uncertainty. Recheck local/actual host fault when answering C shutdown; normal Stop cannot erase genuine Fault/SetupFailed arriving during setup or teardown. Fault/uncertain never earns the host physical-success bit. Successful no-vtable startup cleanup proves only module-local cleanup: host query stays terminal and cannot fabricate accepted-vtable shutdown evidence.
+
+This avoids the concrete initial-task/reinitializer/runtime dependency cycle without adding a C field. It changes only the opt-in internal setup task lifetime. If implementation chooses another protocol, it must prove the same actual future settlement before finish/physical success and retain a sole actual JoinHandle or equally strong completion owner; a setup monitor canceled by runtime teardown is insufficient.
+
+## Boundaries already supported by source
+
+Caught per-connection panic handler runs after registry-free dispatch catches unwind and before error enqueue: connection.rs:1441–1453; object-tree lock ends at 1584–1587 before invocation. Transport writing is a separate writer task (1355–1365). Put host fault first in that handler, before error construction/send. ModuleTransport::send's existing TB_OK-only fault at lib.rs:270–285 cannot be relied on for the opted-in path. Request callback is separate Arc; finish FnOnce is separately taken, callback storage locks released before arbitrary code, request completion notified even on panic. Global panic hook remains location-only. A factory pre-fault is persisted before registration, request replayed once after registration, and setup denied; finish waits the startup-publication predicate to avoid overtaking resource transfer.
+
+Task 1's actual host query field docs (abi.rs:184–202) cover copied callback/context and post-runtime worker lifetime. Module-local anchors never export Rust traits/Arc or allocations through C and add no new host context. PhysicalStopped means actual supported shutdown/join evidence, never receiver-last-Drop, codec retirement or foreign allocation destruction.
+
+## Scoped verdict
+
+**Task 4 IMPLEMENTABLE** with this report's accepted corrections governing the writer. Root has accepted fixed256 actual-last-State-Drop admission, job Weak ownership, immediate StartupResources transfer, the initial-task real JoinHandle protocol, result-first terminal-aware reinit cancellation, actual source Err/panic publication, off-runtime request/initial-task settlement/finish/resource-teardown ordering, and final local/native Fault recheck. This is a concrete module-local protocol with no remaining source contradiction or extra ABI requirement.
+
+The required orthogonal matrix is: Request Panicked/done -> sticky_uncertainty, while uninvoked Finish remains eligible for its same once job; actual finish return is recorded independently. SpawnFailed retains anchored unsubmitted owner, sticky uncertainty, no retry. Finish panic/Uncertain retains remaining anchored resources and permit. Only actual successful finish AND all SDK-owned teardown with no sticky uncertainty can remove anchor/job; permit itself remains until State last-Drop. Cause Fault is independent of whether resources were actually joined/released and never disappears from terminal state. A successfully cleaned no-vtable startup instance cannot make the host physical-success bit appear. NoCallbackRequired for no returned callable host vtable must never imply that a registered module controller does not exist.
+
+Arbitrary synchronous nonreturning setup/Drop, blocked opaque reinit or worker dependency can retain pending ownership indefinitely. Callback docs must require bounded cancel/wake request and finish's independent gate/fence/join responsibilities; there is no forced trusted-code cancellation, no arbitrary captured-byte bound, and no confidential receiver destruction proof. Existing legacy entrypoints remain unchanged. Fresh actual compiled failure/cancellation/join/admission proofs remain implementation acceptance gates, not preflight claims. This verdict does not change the active host Task2/3 writer's scope.
+
+
+## Binding panic-payload order addendum
+
+Root accepts request panic/poison sticky uncertainty independently from the once finish state. The writer must also prevent primary panic payload Drop before the actual fault fence. `catch_unwind(...).is_err()`, `Err(_)`, or temporary matches can dispose the caught `Box<dyn Any + Send>` before later fault notification. Use explicit `Err(payload)` ownership in every new catch. Do not format/downcast payloads or override the global hook.
+
+For once-only module request/finish and the new setup/reinit catches, use fixed private per-instance first-payload cells inside admitted TerminalState, rather than an unbounded vector or a local value whose destructor runs at return. Exact new-source categories: request (once), finish (once), initial setup (first construction/poll panic), reinit (first panic, terminal then denies further invocation), factory (first/only call), startup wrapper (once), and cleanup/SDK teardown wrapper (once). **At most seven first-payload Box owners per admitted instance**, separately named cells, with no arbitrary payload-byte bound. These cells can be omitted where a boundary is already captured by another category, but must not alias categories that can both fail. Initial/reinit construction and polling share their respective first-fault cell; once terminal they cannot be polled/retried to accumulate new primary payloads. This is not a bound on arbitrary panics in unrelated user tasks or legacy/concurrent method calls.
+
+On primary capture: retain ownership explicitly; publish actual host/native Fault plus local terminal/sticky uncertainty without invoking any foreign destructor, then install the payload in its still-empty fixed cell under poison-recovered control storage. For request panic, set Request Panicked/done and notify completion outside held locks BEFORE any potential payload disposal; finish remains eligible once. For setup/reinit publish the real fault before task/C result completion; for finish/teardown record uncertain completion and notify before return. Atomic native/local intent must not depend on acquiring payload storage. No replacement/take-and-drop of a populated cell on a retry: terminal/once admission forbids that retry.
+
+The minimal safe disposal policy is **do not dispose captured primary payloads in this slice**. Sticky-fault state remains externally anchored with its permit/controller/resources; the fixed cells retain payloads for the process lifetime. This is accountable finite owner-count retention under fixed256 admitted states, not an untracked per-panic leak, a zeroization guarantee, or a total foreign-byte bound. The same real physical finish is still attempted once after request completion; sticky uncertainty prevents TB_OK, success-bit publication or permit refund even if worker join succeeds. If implementation instead chooses guarded disposal, its secondary-payload owner must also have an explicitly reserved fixed cell and fault/done notifications must already have happened; arbitrary recursive destructor panic/block/abort cannot be promised recoverable. Do not add a generic panic framework or a resubmission loop.
+
+Captured payload ownership does not make arbitrary user future/capture destruction safe: synchronous blocking Drop or secondary unwind during cancellation can leave the actual task JoinHandle pending or fail. Keep the accepted runtime/job/permit owner alive and do not claim completion. A destructor may abort the process; no generic abort/foreign allocator recovery is promised. Initial-task actual join and reinit exclusion remain required before physical completion; runtime timeout/future cancellation is not their substitute.
+
+### Actual method-panic source gap requiring a narrow opt-in catch observer
+
+Source review found a stronger prerequisite than the prior report's handler-only wording. connection.rs:1554–1557 catches a user future poll with `Err(_) => Poll::Ready(Err(()))`. Its foreign payload can be dropped *inside that catch match*, before `handle_call` invokes the registered panic handler at 1451–1453. Therefore installing fault-first logic only in `__set_panic_handler` is too late for a payload that blocks/panics on Drop.
+
+Add a narrowly private opted-in catch-time terminal observer to the Connection/CatchUnwind path (Rust-local only, no C ABI). Clone its callback outside handler/registry locks. On `Err(payload)` invoke the observer to commit actual host/local Fault, bounded request completion and sticky uncertainty BEFORE payload is dropped; then produce the content-free method error. Existing legacy observer-absent behavior can remain. If observer-triggered request fails, its own fixed request cell/completion protocol applies. Ordinary method dispatch and global panic hooks must not acquire controller joins/gates.
+
+Do not pretend all concurrent method panic payloads fit the seven once-boundary cells: method calls have no such count bound. The narrow observer guarantees fault-before-disposal for those payloads; it does not promise to retain/recover every arbitrary method destructor. After observer commits sticky fault, a blocking/secondary-panicking method payload can prevent later error delivery/task settlement, but native authority is already denied and the actual external owner/permit remains retained. No physical success/refund follows that method panic. Guarding and repeatedly retaining arbitrary method payloads would require separately bounded admission and is outside this slice.
+
+**Addendum verdict:** module-local once-boundary retention is implementable within fixed admitted state and without new ABI. Full Task4 fault-before-payloadDrop proof additionally requires the narrow opted-in Connection catch-time observer above; handler-only implementation does not pass. This is a precise source-backed correction, not a promise about all legacy connection panics. Add a panic_any payload with blocking Drop barrier: verify independent native query denies and request-done is observable before the barrier is released; repeat request/finish/initial/reinit boundary cases and assert the actual once finish attempt/retained permit rather than flags alone.
+
+
+Root accepts the narrow opt-in Connection catch-time prerequisite. Its observer is installed only by the actual terminal factory/runtime path, closes private TerminalState plus actual HostCalls::fault first, and catches request panic through the fixed request-cell/done protocol before the primary method payload can drop. No public fake liveness constructor, payload-selected observer authority or connection-wide growing collection is introduced. New setup construction/poll/reinit catches use the same terminal observer ordering. Preserve existing content-free MethodFailed wire schema and legacy observer-absent behavior.
+
+Runtime resource qualification is binding: `runtime.shutdown_timeout` (current lib.rs:393) can return with opaque blocking tasks/Drop still alive. Its return is not proof those owners were destroyed. Remove successful anchors/release accounting only with actual teardown evidence. Any surviving SDK task/transport/observer must retain its actual TerminalState clone, keeping the State-owned permit occupied through actual task/clone Drop; if that ownership cannot be established, keep the external Uncertain anchor. Never interpret timeout, async Connection closure or callback/future drain as actual method-task Drop, independent-worker join or receiver last-Drop. The controller's proved worker join is a separate fact from SDK-owned resource destruction. User-created detached tasks not received/tracked by SDK remain the trusted controller's lifecycle obligation; no generic task-destruction guarantee follows.
+
+Exact source touchpoints/tests for this correction: `tinybus/src/connection.rs::CatchUnwind::poll` (1554–1557) explicit payload capture/observer before Drop, `handle_call` (1441–1453) observer cloning outside lock/content-free error after fault, and `tinybus-module/src/lib.rs` caught setup/runtime wrappers plus new terminal.rs request/finish first-payload cells. Controlled `panic_any` payload records Drop entry and may block there: assert actual native Fault observed before Drop entry, actual Request done notification before waiting finish, and outgoing blocked/failed send cannot postpone the fence. Request/finish primary payload is retained in its fixed cell and never reaches Drop in this slice; method payload may drop only after the observer fence. Check actual original once finish attempt, sticky uncertainty and held permit while task/destructor/native join remains pending. Do not infer task destruction from future-count or message-drain acknowledgements.
+
+**Final scoped Task4 verdict: IMPLEMENTABLE with all binding corrections in this report, including the accepted narrow opt-in catch-time observer and actual SDK-owner/permit retention qualification.** Implementation acceptance still requires fresh native/source proofs. No source, builds, refs, pins, global hook changes or foreign payload formatting were performed for this review.
 
 ## Task 5: actual compiled native proof and compatibility negatives
 
