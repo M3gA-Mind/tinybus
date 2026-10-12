@@ -260,15 +260,21 @@ fn callback_lookup_holds_exact_state_across_retirement_until_actual_last_drop() 
 
 #[test]
 fn first_cleanup_drop_panic_retains_all_unprocessed_resource_owners() {
-    let _serial = TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _serial = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     FLAGS.store(TB_NATIVE_TERMINAL_LIVE, Ordering::Release);
     struct FirstDrop;
     impl Drop for FirstDrop {
-        fn drop(&mut self) { panic!("controlled first cleanup Drop"); }
+        fn drop(&mut self) {
+            panic!("controlled first cleanup Drop");
+        }
     }
     struct RemainingDrop(Arc<AtomicUsize>);
     impl Drop for RemainingDrop {
-        fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
     }
     let admission = Admission::new();
     let state = TerminalState::admit_in(&admission, host(), None).unwrap();
@@ -282,12 +288,18 @@ fn first_cleanup_drop_panic_retains_all_unprocessed_resource_owners() {
         }));
         resources.retained_factory = Some(Box::new(RemainingDrop(remaining.clone())));
     }
-    state.register(RuntimeHooks::new(|_| {}, || TerminalCompletion::PhysicallyStopped));
+    state.register(RuntimeHooks::new(
+        |_| {},
+        || TerminalCompletion::PhysicallyStopped,
+    ));
     state.publish();
     state.signal(TerminalReason::Stop);
     let completion = state.wait(Duration::from_secs(3));
     let dropped = remaining.load(Ordering::SeqCst);
     assert_eq!(completion, TerminalCompletion::Uncertain);
-    assert_eq!(dropped, 0, "first cleanup panic must leave later foreign owners attached");
+    assert_eq!(
+        dropped, 0,
+        "first cleanup panic must leave later foreign owners attached"
+    );
     assert!(state.resources.lock().unwrap().retained_factory.is_some());
 }

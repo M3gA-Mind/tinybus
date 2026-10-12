@@ -641,10 +641,13 @@ impl TerminalState {
                 }
             }
         }
-        let callback = reinitialize
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
+        // Fence the admitted synchronous callback without taking its foreign
+        // captures yet. Terminal admission denies a waiter after this fence.
+        drop(
+            reinitialize
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
         if let Some(owner) = &self.owner {
             owner.stop();
         }
@@ -653,6 +656,10 @@ impl TerminalState {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         drop(future);
+        let callback = reinitialize
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         drop(callback);
         let request = self.lock().request.take();
         drop(request);
@@ -664,25 +671,54 @@ impl TerminalState {
         true
     }
     fn release_resources(&self) -> bool {
-        let (setup, factory, config, reinit_factory, connection, inbound) = {
-            let mut resources = self
-                .resources
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            (
-                resources.setup.take(),
-                resources.retained_factory.take(),
-                resources.config.take(),
-                resources.reinitializer_factory.take(),
-                resources.connection.clone(),
-                resources.inbound.take(),
-            )
-        };
+        // Take one owner at a time. If its foreign Drop panics, the enclosing
+        // single cleanup catch stops here and every later owner stays anchored.
+        let setup = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .setup
+            .take();
+        drop(setup);
+        let factory = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained_factory
+            .take();
+        drop(factory);
+        let config = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config
+            .take();
+        drop(config);
+        let reinit_factory = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reinitializer_factory
+            .take();
+        drop(reinit_factory);
+        let connection = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connection
+            .clone();
         let connection = connection
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
-        drop((setup, factory, config, reinit_factory, connection, inbound));
+        drop(connection);
+        let inbound = self
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .inbound
+            .take();
+        drop(inbound);
         let runtime = self
             .resources
             .lock()
