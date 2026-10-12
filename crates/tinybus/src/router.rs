@@ -157,6 +157,7 @@ impl MatchRule {
                 "type" => {
                     rule.kind = Some(match value {
                         "signal" => MessageKind::Signal,
+                        "directed_signal" => MessageKind::DirectedSignal,
                         "method_call" => MessageKind::MethodCall,
                         "method_return" => MessageKind::MethodReturn,
                         "error" => MessageKind::Error,

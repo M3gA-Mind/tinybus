@@ -41,7 +41,7 @@ fn directed_signals_target_only_the_live_bound_module_and_declared_member() {
     let mut router = Router::default();
     let (binding_id, binding_peer) = router.attach(tokio::sync::mpsc::channel(8).0);
     let (target_sender, mut target_receiver) = tokio::sync::mpsc::channel(8);
-    let (module_id, module_peer) = router.attach(target_sender);
+    let (_, module_peer) = router.attach(target_sender);
     let (outsider_sender, mut outsider_receiver) = tokio::sync::mpsc::channel(8);
     let (outsider_id, outsider_peer) = router.attach(outsider_sender);
     router.add_match(outsider_id, MatchRule::new().directed_signals());
