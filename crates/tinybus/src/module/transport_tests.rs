@@ -1377,26 +1377,19 @@ async fn scheduled_initializer_is_adopted_by_original_ordinary_stop() {
         let entries = entries.clone();
         move |_| { entries.fetch_add(1, Ordering::AcqRel); Err("unexpected C entry".into()) }
     });
-    // Hold the job before submission so stop can acquire lifecycle first.
-    transport.reject_worker_spawn.store(true, Ordering::Release);
-    // Scheduling rejection itself must fault, so normal adoption is tested
-    // with an anchored job whose worker has not yet acquired lifecycle.
-    let initializer = transport.initializer.lock().unwrap().take().unwrap();
-    let job = Arc::new(PhysicalJob {
-        transport: transport.clone(), initializer: StdMutex::new(Some(initializer)),
-        guard: StdMutex::new(None), deadline: MODULE_INIT_DEADLINE,
-    });
-    {
-        let mut state = transport.context.physical.lock().unwrap();
-        state.init = InitState::Scheduled;
-        state.job = Some(job.clone());
-    }
+    let (worker_started, worker_started_rx) = tokio::sync::oneshot::channel();
+    let (worker_release, worker_release_rx) = std::sync::mpsc::channel();
+    *transport.before_worker_lock.lock().unwrap() = Some(Box::new(move || {
+        worker_started.send(()).unwrap();
+        worker_release_rx.recv().unwrap();
+    }));
+    assert!(transport.schedule_initializer().unwrap());
+    worker_started_rx.await.unwrap();
     let mut stopping = Box::pin(transport.clone().stop(Duration::from_secs(2)));
     tokio::select! { result = &mut stopping => panic!("stop completed before owner: {result:?}"),
         _ = async { while !transport.stop_task_spawned() { tokio::task::yield_now().await; } } => {} }
     assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 2);
-    transport.reject_worker_spawn.store(false, Ordering::Release);
-    ModuleTransport::submit_job(job);
+    worker_release.send(()).unwrap();
     assert_eq!(stopping.await.unwrap(), TB_CLOSED);
     assert_eq!(entries.load(Ordering::Acquire), 0);
     assert!(!transport.is_faulted());
@@ -1430,11 +1423,11 @@ struct NativeControls {
     entered: unsafe extern "C" fn(*mut c_void, *const TbHostVtable),
     joined: unsafe extern "C" fn(*mut c_void),
 }
-struct NativeBarrier {
-    state: StdMutex<(Option<TbHostVtable>, bool, bool)>,
-    changed: Condvar,
-    entered: tokio::sync::Notify,
-    joined: tokio::sync::Notify,
+pub(crate) struct NativeBarrier {
+    pub(crate) state: StdMutex<(Option<TbHostVtable>, bool, bool)>,
+    pub(crate) changed: Condvar,
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) joined: tokio::sync::Notify,
 }
 unsafe impl Send for NativeBarrier {}
 unsafe impl Sync for NativeBarrier {}
@@ -1452,7 +1445,7 @@ unsafe extern "C" fn native_joined(ctx: *mut c_void) {
     state.2 = true;
     barrier.joined.notify_one();
 }
-fn native_fixture() -> (Arc<ModuleTransport>, TbHostVtable, crate::module::abi::TbModuleInit, Arc<NativeBarrier>) {
+pub(crate) fn native_fixture() -> (Arc<ModuleTransport>, TbHostVtable, crate::module::abi::TbModuleInit, Arc<NativeBarrier>) {
     let path = std::env::var_os("TINYBUS_TEST_CONTROLLED_INIT_MODULE").expect("controlled native fixture path");
     let artifact = crate::module::loader::load(std::path::Path::new(&path), false).unwrap();
     let barrier = Arc::new(NativeBarrier {
@@ -1558,4 +1551,182 @@ async fn ordinary_shutdown_retains_non_ok_return_without_physical_success() {
     assert!(transport.stop_task_spawned());
     assert!(transport.is_stopped(), "legacy stopped is separate from physical-success proof");
     assert!(!transport.is_faulted());
+}
+
+#[tokio::test]
+async fn rejected_module_outputs_never_invoke_untrusted_callbacks() {
+    let _lock = VTABLE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    SHUTDOWN_CALLS.store(0, Ordering::Release);
+    for rejection in 0..4 {
+        let (transport, host) = ModuleTransport::new(format!("rejected-{rejection}"), vec![]);
+        transport.defer_initializer(host, move |host| {
+            let mut module = TbModuleVtable::default();
+            unsafe { initialize_ok(&host, &mut module); }
+            match rejection {
+                0 => module.size = TB_MODULE_VTABLE_BASE_SIZE - 1,
+                1 => module.module_ctx = std::ptr::null_mut(),
+                2 => module.reinitialize = None,
+                _ => return Err("non-OK output must remain inaccessible".into()),
+            }
+            Ok(module)
+        });
+        assert!(transport.ensure_initialized().await.is_err());
+        let physical = transport.context.physical.lock().unwrap();
+        assert_eq!(physical.init, InitState::PublishedRejected);
+        assert_eq!(physical.cleanup, CleanupState::Uncertain);
+        assert!(physical.job.is_some());
+        assert!(transport.module.lock().unwrap().is_none());
+        drop(physical);
+        assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 6);
+    }
+    assert_eq!(SHUTDOWN_CALLS.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn rejected_ordinary_worker_submission_retains_original_lifecycle_guard() {
+    let (transport, host) = ModuleTransport::new("stop-spawn-rejection".into(), vec![]);
+    transport.defer_initialize(initialize_ok, host);
+    transport.ensure_initialized().await.unwrap();
+    transport.reject_worker_spawn.store(true, Ordering::Release);
+    assert!(matches!(transport.clone().stop(Duration::from_secs(1)).await, Err(StopError::Started(_))));
+    assert!(transport.stop_task_spawned());
+    assert!(transport.lifecycle.try_lock().is_err(), "rejected closure cannot drop actual acquired guard");
+    let weak = Arc::downgrade(&transport);
+    drop(transport);
+    let retained = weak.upgrade().expect("actual owner retained beyond host handle");
+    assert_eq!(retained.context.physical.lock().unwrap().cleanup, CleanupState::Uncertain);
+    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 2);
+    assert!(!retained.is_faulted(), "ordinary spawner failure is uncertainty, not module fault");
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_deadline_fault_retains_late_cleanup_without_wall_clock_sleep() {
+    let (transport, host, init, barrier) = native_fixture();
+    transport.defer_initialize(init, host);
+    let waiter = tokio::spawn({
+        let transport = transport.clone(); async move { transport.ensure_initialized().await }
+    });
+    barrier.entered.notified().await;
+    tokio::time::pause();
+    tokio::time::advance(MODULE_INIT_DEADLINE).await;
+    assert!(waiter.await.unwrap().is_err());
+    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 6);
+    assert!(!barrier.state.lock().unwrap().2);
+    {
+        let mut state = barrier.state.lock().unwrap();
+        state.1 = true;
+        barrier.changed.notify_all();
+    }
+    // Resume the real timer only for the outer stuck-test safety deadline.
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified()).await.unwrap();
+    wait_physical_cleanup(&transport).await;
+    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 14);
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_fault_between_return_and_publication_uses_same_owner() {
+    let (transport, host, init, barrier) = native_fixture();
+    let (publication_tx, publication_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    *transport.before_init_publication.lock().unwrap() = Some(Box::new(move || {
+        publication_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    }));
+    transport.defer_initialize(init, host);
+    let waiter = tokio::spawn({
+        let transport = transport.clone(); async move { transport.ensure_initialized().await }
+    });
+    barrier.entered.notified().await;
+    {
+        let mut state = barrier.state.lock().unwrap(); state.1 = true; barrier.changed.notify_all();
+    }
+    publication_rx.await.unwrap();
+    let job = transport.context.physical.lock().unwrap().job.clone().unwrap();
+    unsafe { (host.fault)(host.host_ctx, std::ptr::null(), 0); }
+    {
+        let state = transport.context.physical.lock().unwrap();
+        assert!(Arc::ptr_eq(&job, state.job.as_ref().unwrap()));
+        assert_eq!(state.cleanup, CleanupState::Requested);
+        assert!(state.result.is_none(), "cleanup must not claim an empty publication");
+    }
+    assert!(!barrier.state.lock().unwrap().2);
+    release_tx.send(()).unwrap();
+    assert!(waiter.await.unwrap().is_err());
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified()).await.unwrap();
+    wait_physical_cleanup(&transport).await;
+    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 14);
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_reinitializer_fault_denies_before_c_returns_and_joins_once() {
+    let (transport, host, init, barrier) = native_fixture();
+    {
+        let mut state = barrier.state.lock().unwrap(); state.1 = true;
+    }
+    transport.defer_initialize(init, host);
+    transport.ensure_initialized().await.unwrap();
+    barrier.entered.notified().await;
+    {
+        let mut state = barrier.state.lock().unwrap(); state.1 = false;
+    }
+    let reinit = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.reinitialize(crate::Secret::new(vec![])).await }
+    });
+    barrier.entered.notified().await;
+    unsafe { (host.fault)(host.host_ctx, std::ptr::null(), 0); }
+    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 6);
+    assert!(!barrier.state.lock().unwrap().2);
+    assert!(transport.lifecycle.try_lock().is_err(), "actual C reinit owns physical exclusion");
+    {
+        let mut state = barrier.state.lock().unwrap(); state.1 = true; barrier.changed.notify_all();
+    }
+    reinit.await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified()).await.unwrap();
+    wait_physical_cleanup(&transport).await;
+    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 14);
+    assert!(transport.reinitialize(crate::Secret::new(vec![])).await.is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_late_eager_publication_cannot_refund_failed_cleanup_spawn() {
+    let (transport, host, init, barrier) = native_fixture();
+    transport.reject_worker_spawn.store(true, Ordering::Release);
+    let host_owner = DeferredInitializer { initialize: Box::new(|_| unreachable!()), host };
+    let eager = std::thread::spawn({
+        let transport = transport.clone();
+        move || { let owner = host_owner; transport.eager_initialize(init, owner.host) }
+    });
+    barrier.entered.notified().await;
+    unsafe { (host.fault)(host.host_ctx, std::ptr::null(), 0); }
+    let job = transport.context.physical.lock().unwrap().job.clone().unwrap();
+    assert_eq!(transport.context.physical.lock().unwrap().cleanup, CleanupState::Uncertain);
+    {
+        let mut state = barrier.state.lock().unwrap(); state.1 = true; barrier.changed.notify_all();
+    }
+    assert!(eager.join().unwrap().is_err());
+    transport.reject_worker_spawn.store(false, Ordering::Release);
+    transport.request_terminal(true);
+    {
+        let state = transport.context.physical.lock().unwrap();
+        assert_eq!(state.init, InitState::ExternalValid);
+        assert_eq!(state.cleanup, CleanupState::Uncertain);
+        assert!(Arc::ptr_eq(&job, state.job.as_ref().unwrap()));
+    }
+    assert!(transport.module.lock().unwrap().is_some(), "valid late output is cleanup access only");
+    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 6);
+    assert!(!barrier.state.lock().unwrap().2, "rejected submission must never be silently retried");
+    let weak = Arc::downgrade(&transport);
+    drop(transport);
+    drop(job);
+    assert!(weak.upgrade().is_some());
+    // The deliberately unjoinable native instance retains its externally anchored
+    // controller too. This is one explicit uncertain test instance, not global
+    // leak-bound or secret-erasure proof.
+    std::mem::forget(barrier);
 }

@@ -69,6 +69,10 @@ pub(crate) struct ModuleTransport {
     initialization_gate_changed: Notify,
     #[cfg(test)]
     reject_worker_spawn: AtomicBool,
+    #[cfg(test)]
+    before_worker_lock: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_init_publication: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 // Reservations cover physical callback execution, including signals. They are
@@ -238,6 +242,10 @@ impl ModuleTransport {
             initialization_gate_changed: Notify::new(),
             #[cfg(test)]
             reject_worker_spawn: AtomicBool::new(false),
+            #[cfg(test)]
+            before_worker_lock: StdMutex::new(None),
+            #[cfg(test)]
+            before_init_publication: StdMutex::new(None),
         });
         *context.owner.lock().expect("physical owner lock") = Arc::downgrade(&transport);
         let config = context.config.lock().expect("module config lock");
@@ -909,6 +917,11 @@ impl ModuleTransport {
 impl PhysicalJob {
     fn run(self: Arc<Self>) {
         let transport = &self.transport;
+        #[cfg(test)]
+        {
+            let hook = transport.before_worker_lock.lock().expect("worker test hook lock").take();
+            if let Some(hook) = hook { hook(); }
+        }
         let initializer = self.initializer.lock().expect("physical initializer lock").take();
         if let Some(initializer) = initializer {
             let guard = transport.lifecycle.clone().blocking_lock_owned();
@@ -937,6 +950,11 @@ impl PhysicalJob {
                 Err(_) => Err(InitFailure::Failed("module initialization panicked".into())),
             };
             transport.clear_config();
+            #[cfg(test)]
+            {
+                let hook = transport.before_init_publication.lock().expect("publication test hook lock").take();
+                if let Some(hook) = hook { hook(); }
+            }
             if result.is_err() { transport.commit_terminal(true); }
             let cleanup = {
                 let mut state = transport.context.physical.lock().expect("physical state lock");
@@ -1219,4 +1237,4 @@ unsafe extern "C" fn host_ready(ctx: *mut c_void) {
 
 #[cfg(test)]
 #[path = "transport_tests.rs"]
-mod tests;
+pub(super) mod tests;

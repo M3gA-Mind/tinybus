@@ -82,7 +82,7 @@ test-support = ["modules", "macros"]
 
 
 [dev-dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "test-util"] }
 tempfile = "3"
 
 [[bin]]

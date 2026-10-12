@@ -14,6 +14,7 @@ unsafe impl Send for Controls {}
 
 struct Instance {
     controls: Controls,
+    host: TbHostVtable,
     stop: Arc<(Mutex<bool>, Condvar)>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -32,7 +33,11 @@ pub extern "C" fn tinybus_module_manifest_v1() -> TbSlice {
 }
 
 unsafe extern "C" fn deliver(_: *mut c_void, _: *const u8, _: usize) -> i32 { TB_OK }
-unsafe extern "C" fn reinitialize(_: *mut c_void, _: *const u8, _: usize) -> i32 { TB_OK }
+unsafe extern "C" fn reinitialize(ctx: *mut c_void, _: *const u8, _: usize) -> i32 {
+    let instance = unsafe { &*ctx.cast::<Instance>() };
+    unsafe { (instance.controls.entered)(instance.controls.ctx, &instance.host); }
+    TB_OK
+}
 unsafe extern "C" fn shutdown(ctx: *mut c_void, _: u64) -> i32 {
     let mut instance = unsafe { Box::from_raw(ctx.cast::<Instance>()) };
     *instance.stop.0.lock().unwrap() = true;
@@ -60,7 +65,7 @@ pub unsafe extern "C" fn tinybus_module_init_v1(host: *const TbHostVtable, out: 
         let mut stopped = worker_stop.0.lock().unwrap();
         while !*stopped { stopped = worker_stop.1.wait(stopped).unwrap(); }
     });
-    let instance = Box::new(Instance { controls, stop, worker: Some(worker) });
+    let instance = Box::new(Instance { controls, host: *host, stop, worker: Some(worker) });
     unsafe { *out = TbModuleVtable {
         size: size_of::<TbModuleVtable>() as u32, _reserved: 0,
         module_ctx: Box::into_raw(instance).cast(), deliver, shutdown,
