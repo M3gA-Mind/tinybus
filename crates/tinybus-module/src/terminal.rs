@@ -221,8 +221,21 @@ pub(super) struct TerminalState {
 pub(super) struct SdkOwner {
     state: Arc<TerminalState>,
 }
+impl SdkOwner {
+    pub fn caught_panic(&self) {
+        self.state.mark_uncertain();
+        self.state.signal(TerminalReason::Fault);
+    }
+}
 impl Drop for SdkOwner {
     fn drop(&mut self) {
+        // A last-field guard also runs when a preceding foreign destructor
+        // unwinds. Counting that as clean disposal would fabricate completion.
+        // The diagnostic owner may already be stopped; explicitly fence native
+        // authority and preserve the anchor before releasing the resource count.
+        if std::thread::panicking() {
+            self.caught_panic();
+        }
         self.state.sdk_owners.fetch_sub(1, Ordering::AcqRel);
     }
 }
@@ -728,7 +741,7 @@ impl TerminalState {
         if let Some(runtime) = runtime {
             runtime.shutdown_timeout(Duration::from_secs(4));
         }
-        // Timeout is not proof: any surviving SDK transport/task keeps State
+        // Timeout is not proof: every surviving SDK transport/Connection/method keeps State
         // and its resource count. Unknown surviving ownership stays anchored.
         self.sdk_owners.load(Ordering::Acquire) == 0
     }

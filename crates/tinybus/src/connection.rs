@@ -192,11 +192,13 @@ struct Inner {
     signal_deliveries: broadcast::Sender<crate::SignalDelivery>,
     local_publisher: crate::LocalPublisherIdentity,
     panic_handler: std::sync::RwLock<Option<Arc<dyn Fn() -> Error + Send + Sync>>>,
-    catch_observer: std::sync::RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     /// Bulk streams being received. On the connection rather than in the object
     /// tree because a chunk has to be checked against the header's stamped
     /// `sender`; interfaces receive only the verified subset in CallContext.
     streams: StreamRegistry,
+    // Last: opted-in observers retain whole-Connection teardown ownership,
+    // including ObjectTree, streams and cloned method observers.
+    catch_observer: std::sync::RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Closes the transport when the last [`Connection`] handle goes away.

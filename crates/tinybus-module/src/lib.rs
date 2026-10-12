@@ -1678,12 +1678,9 @@ where
                 name: MODULE_PANIC_ERROR.to_owned(),
                 message: "a module method panicked".to_owned(),
             }));
-            let observer_state = Arc::downgrade(&task_state);
+            let observer_owner = task_state.sdk_owner();
             connection.__set_catch_observer(Arc::new(move || {
-                if let Some(state) = observer_state.upgrade() {
-                    state.mark_uncertain();
-                    state.signal(TerminalReason::Fault);
-                }
+                observer_owner.caught_panic();
             }));
             // Connection is persisted independently of initial task lifetime.
             *connection_slot
