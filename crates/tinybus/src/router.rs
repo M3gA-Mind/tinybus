@@ -68,6 +68,12 @@ impl MatchRule {
         self
     }
 
+    /// Restrict to recipient-directed signals emitted for a local callback.
+    pub fn directed_signals(mut self) -> Self {
+        self.kind = Some(MessageKind::DirectedSignal);
+        self
+    }
+
     /// Restrict to one interface.
     pub fn interface(mut self, interface: InterfaceName) -> Self {
         self.interface = Some(interface);
@@ -151,6 +157,7 @@ impl MatchRule {
                 "type" => {
                     rule.kind = Some(match value {
                         "signal" => MessageKind::Signal,
+                        "directed_signal" => MessageKind::DirectedSignal,
                         "method_call" => MessageKind::MethodCall,
                         "method_return" => MessageKind::MethodReturn,
                         "error" => MessageKind::Error,
@@ -577,6 +584,29 @@ impl Router {
         capability.revoke();
         self.host_callbacks
             .retain(|entry| !Arc::ptr_eq(entry, capability));
+    }
+
+    #[cfg(feature = "modules")]
+    pub(crate) fn directed_signal_target(
+        &self,
+        source: &BusName,
+        destination: &BusName,
+        header: &crate::message::Header,
+    ) -> Result<mpsc::Sender<Message>> {
+        if header.kind != MessageKind::DirectedSignal
+            || header.sender.as_ref() != Some(source)
+            || header.destination.as_ref() != Some(destination)
+        {
+            return Err(Error::failed("directed signal routing fields are invalid"));
+        }
+        if !self
+            .host_callbacks
+            .iter()
+            .any(|capability| capability.matches_directed_signal(source, destination, header))
+        {
+            return Err(Error::failed("directed signal authority is unavailable"));
+        }
+        self.resolve(destination)
     }
 
     /// The outbox of whoever owns `destination`.

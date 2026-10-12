@@ -11,6 +11,30 @@ fn signal(interface: &str, member: &str, path: &str) -> Message {
     m
 }
 
+#[test]
+fn directed_signal_rules_do_not_match_broadcast_signals_or_each_other() {
+    let interface = InterfaceName::new("ai.tinyhumans.Storage").unwrap();
+    let member = MemberName::new("WatchChanged").unwrap();
+    let path = ObjectPath::new("/storage/Documents").unwrap();
+    let broadcast = Message::signal(
+        path.clone(),
+        interface.clone(),
+        member.clone(),
+        serde_json::Value::Null,
+    );
+    let directed = Message::directed_signal(
+        BusName::new(":1.5").unwrap(),
+        path,
+        interface,
+        member,
+        serde_json::Value::Null,
+    );
+    assert!(MatchRule::new().signals().matches(&broadcast));
+    assert!(!MatchRule::new().signals().matches(&directed));
+    assert!(MatchRule::new().directed_signals().matches(&directed));
+    assert!(!MatchRule::new().directed_signals().matches(&broadcast));
+}
+
 fn outbox() -> mpsc::Sender<Message> {
     mpsc::channel(8).0
 }
@@ -43,6 +67,27 @@ fn parsing_rejects_unknown_keys_rather_than_ignoring_them() {
     assert!(MatchRule::parse("interfce=ai.tinyhumans.Mail").is_err());
     assert!(MatchRule::parse("type=telegram").is_err());
     assert!(MatchRule::parse("interface").is_err());
+}
+
+#[test]
+fn parses_directed_signal_rules_as_a_separate_message_kind() {
+    let rule = MatchRule::parse(
+        "type=directed_signal,interface=ai.tinyhumans.Storage,member=WatchChanged",
+    )
+    .unwrap();
+    let directed = Message::directed_signal(
+        BusName::new(":1.5").unwrap(),
+        ObjectPath::new("/storage/Documents").unwrap(),
+        InterfaceName::new("ai.tinyhumans.Storage").unwrap(),
+        MemberName::new("WatchChanged").unwrap(),
+        serde_json::Value::Null,
+    );
+    assert!(rule.matches(&directed));
+    assert!(MatchRule::parse("type=signal").unwrap().matches(&signal(
+        "ai.tinyhumans.Storage",
+        "WatchChanged",
+        "/storage/Documents"
+    )));
 }
 
 #[test]

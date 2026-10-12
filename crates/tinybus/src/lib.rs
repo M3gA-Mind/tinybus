@@ -124,7 +124,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///
 /// Interface additions do not bump this value. It is published for manifests
 /// and diagnostics; v1 does not put it in the `Hello` handshake.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The well-known name of the broker's own service.
 ///

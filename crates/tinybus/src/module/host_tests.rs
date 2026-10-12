@@ -2618,6 +2618,72 @@ async fn a_verified_cdylib_can_deliver_a_confidential_host_callback() {
     task.abort();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TINYBUS_TEST_CONTEXT_MODULE to point at the built cdylib"]
+async fn a_bound_cdylib_receives_only_its_declared_host_directed_signal() {
+    let artifact = PathBuf::from(std::env::var_os("TINYBUS_TEST_CONTEXT_MODULE").unwrap());
+    let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
+    let (_dir, artifact) = staged_module(&artifact, &hash);
+    let bus = MemoryBus::new();
+    let broker = Broker::new();
+    let task = broker.spawn(bus.clone());
+    let modules = ModuleHost::new(broker);
+    let binding = modules
+        .prepare_host_callbacks_with_signals(
+            vec![crate::module::HostCallbackEndpoint {
+                path: "/callback".parse().unwrap(),
+                interface: "org.example.Callback".parse().unwrap(),
+                members: vec!["Observe".parse().unwrap()],
+            }],
+            vec![crate::module::HostCallbackSignal {
+                path: "/callback".parse().unwrap(),
+                interface: "org.example.Callback".parse().unwrap(),
+                members: vec!["WatchChanged".parse().unwrap()],
+            }],
+        )
+        .await
+        .unwrap();
+    binding
+        .serve_at("/callback".parse().unwrap(), NativeContextCallback)
+        .await
+        .unwrap();
+    modules
+        .load_file_with_host_callbacks(artifact, serde_json::json!({}), &binding)
+        .await
+        .unwrap();
+
+    let outsider = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let mut outsider_signals = outsider
+        .proxy("org.example.Callback", "/callback", "org.example.Callback")
+        .unwrap()
+        .receive_directed_signal("WatchChanged")
+        .await
+        .unwrap();
+    let notice = serde_json::json!(["opaque-watch", {"kind":"invalidated","cursor":"opaque-next"}]);
+    binding
+        .emit_signal(
+            &"/callback".parse().unwrap(),
+            &"org.example.Callback".parse().unwrap(),
+            &"WatchChanged".parse().unwrap(),
+            &notice,
+        )
+        .await
+        .unwrap();
+
+    let module = binding.guard().module_peer().unwrap();
+    let received: serde_json::Value = binding
+        .proxy(module.as_str(), "/context", "org.example.Context")
+        .unwrap()
+        .call("WaitForWatchChanged", ())
+        .await
+        .unwrap();
+    assert_eq!(received, notice);
+    assert!(outsider_signals.try_recv().is_err());
+    task.abort();
+}
+
 struct CountingNativeCallback(Arc<std::sync::atomic::AtomicUsize>);
 #[async_trait::async_trait]
 impl crate::Interface for CountingNativeCallback {
