@@ -2065,8 +2065,8 @@ async fn compiled_native_factory_and_hook_failures_preserve_original_finish_and_
         } else {
             assert!(result.is_ok());
             assert_eq!(seen.iter().filter(|event| event.0 == 3).count(), 1);
-            assert_eq!(seen.iter().filter(|event| *event == (5, 1)).count(), 1);
-            assert_eq!(seen.iter().filter(|event| *event == (7, 1)).count(), 1);
+            assert_eq!(seen.iter().filter(|event| **event == (5, 1)).count(), 1);
+            assert_eq!(seen.iter().filter(|event| **event == (7, 1)).count(), 1);
             assert!(seen.iter().any(|event| event.0 == 13 && event.1 & 7 == 7));
         }
         assert!(
