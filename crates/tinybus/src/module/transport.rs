@@ -465,10 +465,15 @@ impl ModuleTransport {
     pub(crate) fn commit_terminal(&self, fault: bool) {
         use crate::module::abi::{TB_NATIVE_TERMINAL_FAULT, TB_NATIVE_TERMINAL_STOP_INTENT};
         if fault { self.context.faulted.store(true, Ordering::Release); }
-        self.context.native_terminal_state.fetch_update(Ordering::AcqRel, Ordering::Acquire, |flags| {
-            Some((flags & !crate::module::abi::TB_NATIVE_TERMINAL_LIVE) |
-                 TB_NATIVE_TERMINAL_STOP_INTENT | if fault { TB_NATIVE_TERMINAL_FAULT } else { 0 })
-        }).ok();
+        let flags = &self.context.native_terminal_state;
+        let mut old = flags.load(Ordering::Acquire);
+        loop {
+            let new = (old & !crate::module::abi::TB_NATIVE_TERMINAL_LIVE) |
+                TB_NATIVE_TERMINAL_STOP_INTENT | if fault { TB_NATIVE_TERMINAL_FAULT } else { 0 };
+            match flags.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break, Err(current) => old = current,
+            }
+        }
         self.close_admission();
     }
 
@@ -832,6 +837,7 @@ impl ModuleTransport {
         }
         let remaining = deadline.saturating_sub(started.elapsed());
         self.commit_terminal(false);
+        let (existing, job, mut acquired) = {
         let mut state = self.context.physical.lock().expect("physical state lock");
         if state.cleanup == CleanupState::Idle { state.cleanup = CleanupState::Requested; }
         let existing = state.job.is_some();
@@ -844,20 +850,22 @@ impl ModuleTransport {
             Some(job)
         };
         self.stop_task_spawned.store(true, Ordering::Release);
-        drop(state);
+        (existing, job, acquired)
+        };
         // A Scheduled initializer must acquire the guard itself to prove no C entry.
         if existing { drop(acquired.take()); }
         if let Some(job) = job { Self::submit_job(job); }
         let wait = async {
             loop {
                 let changed = self.context.physical_notify.notified();
+                let outcome = {
                 let state = self.context.physical.lock().expect("physical state lock");
-                let outcome = match state.cleanup {
+                match state.cleanup {
                     CleanupState::Complete | CleanupState::NoCallbackRequired => Some(Ok(state.code.unwrap_or(TB_CLOSED))),
                     CleanupState::Uncertain => Some(Err(StopError::Started(Error::transport("module cleanup is uncertain")))),
                     _ => None,
+                }
                 };
-                drop(state);
                 if let Some(outcome) = outcome { return outcome; }
                 changed.await;
             }
@@ -1146,7 +1154,8 @@ unsafe extern "C" fn host_fault(ctx: *mut c_void, _: *const u8, _: usize) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Some(context) = unsafe { ctx.cast::<HostContext>().as_ref() } {
             context.faulted.store(true, Ordering::Release);
-            context.native_terminal_state.fetch_update(Ordering::AcqRel, Ordering::Acquire, |flags| Some((flags & !1) | 2 | 4)).ok();
+            context.native_terminal_state.fetch_or(crate::module::abi::TB_NATIVE_TERMINAL_STOP_INTENT | crate::module::abi::TB_NATIVE_TERMINAL_FAULT, Ordering::AcqRel);
+            context.native_terminal_state.fetch_and(!crate::module::abi::TB_NATIVE_TERMINAL_LIVE, Ordering::AcqRel);
             context.init_notify.notify_waiters();
             context.ready_notify.notify_waiters();
             context.inbound.lock().expect("host inbound lock").take();

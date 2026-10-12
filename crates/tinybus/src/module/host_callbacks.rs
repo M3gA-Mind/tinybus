@@ -587,7 +587,7 @@ impl ModuleHost {
         };
         if !ready {
             binding.revoke();
-            let _ = transport.stop_sync(Duration::ZERO);
+            transport.request_terminal(true);
             let _ = transport.close().await;
             self.inner
                 .loaded
@@ -669,7 +669,7 @@ impl Drop for LoadRollback<'_> {
             }
             // A timed-out initializer may still run. Stop is best effort;
             // revocation/detach removes authority without claiming cessation.
-            let _ = transport.stop_sync(Duration::ZERO);
+            transport.request_terminal(true);
             self.host
                 .inner
                 .loaded
@@ -682,13 +682,14 @@ impl Drop for LoadRollback<'_> {
 
 impl Drop for ModuleHostInner {
     fn drop(&mut self) {
-        for module in self.loaded.get_mut().expect("module list lock").iter() {
-            self.broker
-                .router
-                .lock()
-                .expect("router lock")
-                .revoke_callbacks_for_peer(&module.unique_name);
+        let modules = self.loaded.get_mut().expect("module list lock");
+        let transports: Vec<_> = modules.iter().map(|module| module.transport.clone()).collect();
+        for transport in &transports { transport.commit_terminal(false); }
+        {
+            let mut router = self.broker.router.lock().expect("router lock");
+            for module in modules.iter() { router.revoke_callbacks_for_peer(&module.unique_name); }
         }
+        for transport in transports { transport.request_terminal(false); }
     }
 }
 

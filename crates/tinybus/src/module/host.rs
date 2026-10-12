@@ -1020,16 +1020,8 @@ impl ModuleHost {
             transport.defer_initialize(artifact.init, host_vtable);
         } else {
             admitted.state = ModuleState::Initializing;
-            let mut module_vtable = TbModuleVtable::default();
-            let code = unsafe { (artifact.init)(&host_vtable, &mut module_vtable) };
-            transport.clear_config();
-            if code != TB_OK {
+            if transport.eager_initialize(artifact.init, host_vtable).is_err() {
                 let error = Error::module_refused(path, "module initialization failed");
-                self.record_manifest_rejection(&error, manifest, RefusalClass::Failed);
-                return Err(error);
-            }
-            if transport.initialize(module_vtable).is_err() {
-                let error = Error::module_refused(path, "module returned an invalid vtable");
                 self.record_manifest_rejection(&error, manifest, RefusalClass::Failed);
                 return Err(error);
             }
@@ -1150,7 +1142,7 @@ impl ModuleHost {
                     .lock()
                     .expect("router lock")
                     .detach_unique(&unique);
-                let _ = transport.stop_sync(Duration::from_millis(0));
+                transport.request_terminal(true);
                 let error = Error::module_refused(path, "module bus name is already owned");
                 self.record_manifest_rejection(&error, manifest, RefusalClass::Unresolved);
                 return Err(error);
@@ -1520,7 +1512,10 @@ impl ModuleControl for ModuleHostInner {
             }
             Err(StopError::Started(error)) => return Err(error),
         }
-        module.info.state = ModuleState::Stopped;
+        module.info.state = if module.transport.is_faulted() {
+            if module.transport.init_failed() { ModuleState::Failed { reason: "module initialization failed".into() } }
+            else { ModuleState::Faulted { reason: "module reported an unrecoverable fault".into() } }
+        } else { ModuleState::Stopped };
         Ok(module.info.clone())
     }
 
@@ -1663,7 +1658,7 @@ impl ModuleControl for ModuleHostInner {
         let module = loaded
             .iter_mut()
             .find(|module| &module.unique_name == unique_name)?;
-        if let Some(old) = module.transition_from.take() {
+        if !module.transport.is_faulted() && let Some(old) = module.transition_from.take() {
             module.info.state = ModuleState::Stopped;
             return Some((module.info.name.clone(), old, ModuleState::Stopped));
         }
