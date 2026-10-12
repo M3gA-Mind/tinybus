@@ -26,8 +26,12 @@ owner scope/generation/receiver, local flags, live native query, then local flag
 again. Query success is admission linearization; later intent cannot undo an OS
 operation already granted. Query alone is not a publication permit.
 
-Normal stop commits intent only after acquiring actual lifecycle lock, before
-handing it to retained physical task. Canceled/unacquired stop makes no commitment.
+Host stop commits ordinary intent before its bounded provider-callback drain.
+Drain timeout or cancellation preserves that intent and the loaded owner; native
+physical handoff waits for actual provider completion. An entirely unpolled stop
+has no effect. Direct transport stop commits after acquiring the native lifecycle
+lock, before handing it to the retained physical task; canceling that direct wait
+before acquisition makes no new commitment.
 Actual fault, rollback and Host Drop commit immediately, even behind opaque C init
 or reinit. Fault takes public-state precedence; normal stop never becomes Faulted.
 Fault cleanup must not create ordinary transition_from or restart terminal modules.
