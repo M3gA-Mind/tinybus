@@ -2927,7 +2927,22 @@ impl Drop for StopRelease {
 #[tokio::test]
 async fn ordinary_stop_never_fabricates_faulted_before_or_after_callback_completion() {
     let _test_guard = FAKE_MODULE_TEST_LOCK.lock().await;
-    let host = ModuleHost::new(Broker::new());
+    let bus = MemoryBus::new();
+    let broker = Broker::new();
+    let broker_task = broker.spawn(bus.clone());
+    let host = ModuleHost::new(broker);
+    let observer = Connection::connect(bus.connect().await.expect("H18"))
+        .await
+        .expect("H19");
+    let mut state_changes = observer
+        .add_match(
+            crate::router::MatchRule::parse(
+                "type=signal,interface=ai.tinyhumans.tinybus.Bus,member=ModuleStateChanged",
+            )
+            .expect("H20"),
+        )
+        .await
+        .expect("H21");
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     let release = StopRelease(Some(sender));
     *BLOCKING_STOP_RECEIVER
@@ -3000,6 +3015,25 @@ async fn ordinary_stop_never_fabricates_faulted_before_or_after_callback_complet
             "H13"
         );
     }
+    // This is a current-thread runtime. Without an await or yield after dropping
+    // the loaded lock, the broker cannot process its ready detach task before
+    // this real Host retry completes synchronously against the closed transport.
+    {
+        let mut retry = std::pin::pin!(host.inner.stop("clock", Duration::from_secs(1)));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            matches!(
+                std::future::Future::poll(retry.as_mut(), &mut context),
+                std::task::Poll::Ready(Err(Error::ConnectionClosed))
+            ),
+            "H22"
+        );
+    }
+    assert_eq!(
+        host.inner.loaded.lock().expect("H23")[0].transition_from,
+        Some(ModuleState::Ready),
+        "H24"
+    );
     tokio::time::timeout(Duration::from_secs(2), async {
         while host.list()[0].state != ModuleState::Stopped {
             tokio::task::yield_now().await;
@@ -3007,4 +3041,19 @@ async fn ordinary_stop_never_fabricates_faulted_before_or_after_callback_complet
     })
     .await
     .expect("H14");
+    let stopped_event = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let message = state_changes.recv().await.expect("H25");
+            if message.body.get(2).and_then(serde_json::Value::as_str) == Some("stopped") {
+                break message;
+            }
+        }
+    })
+    .await
+    .expect("H26");
+    assert!(
+        stopped_event.body == serde_json::json!(["clock", "ready", "stopped", null]),
+        "H27"
+    );
+    broker_task.abort();
 }
