@@ -232,6 +232,15 @@ Factory panics return the native initialization panic code. The factory form
 is available in module_export, module_export_static and
 module_export_optional_static; legacy setup callbacks remain supported.
 
+## Controller admission
+
+`ModuleHost::new` uses its supplied broker's immutable module-control policy.
+Legacy `Broker::new` permits peer module-control calls. Select
+`Broker::new_restricted_module_control` and attach one trusted controller
+transport when configuration carries credentials or scoped actor authority.
+See [restricted module control](../broker/README.md#restricted-module-control-modules-feature)
+for endpoint ownership, denial semantics and controller lifetime.
+
 ## Host-required activation
 
 Use ModuleHost::load_file_with_requirements when setup must not run unless the
