@@ -1311,6 +1311,12 @@ struct TerminalTransport {
     inner: ModuleTransport,
     _owner: terminal::SdkOwner,
 }
+#[cfg(test)]
+impl Drop for TerminalTransport {
+    fn drop(&mut self) {
+        self._owner.record_transport_drop_for_test();
+    }
+}
 #[async_trait]
 impl Transport for TerminalTransport {
     async fn send(&self, message: Message) -> Result<()> {

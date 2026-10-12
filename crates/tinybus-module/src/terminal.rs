@@ -227,6 +227,8 @@ pub(super) struct TerminalState {
     reject_worker_spawn: AtomicBool,
     #[cfg(test)]
     startup_failure_stage: AtomicU8,
+    #[cfg(test)]
+    transport_drop_thread: StdMutex<Option<String>>,
     lease: SlotLease,
     token: usize,
 }
@@ -236,6 +238,12 @@ pub(super) struct SdkOwner {
     state: Arc<TerminalState>,
 }
 impl SdkOwner {
+    #[cfg(test)]
+    pub(super) fn record_transport_drop_for_test(&self) {
+        *self.state.transport_drop_thread.lock().unwrap() = Some(
+            std::thread::current().name().unwrap_or("unnamed").to_owned(),
+        );
+    }
     pub fn caught_panic(&self) {
         self.state.mark_uncertain();
         self.state.signal(TerminalReason::Fault);
@@ -316,6 +324,8 @@ impl TerminalState {
             reject_worker_spawn: AtomicBool::new(false),
             #[cfg(test)]
             startup_failure_stage: AtomicU8::new(0),
+            #[cfg(test)]
+            transport_drop_thread: StdMutex::new(None),
             lease: SlotLease {
                 admission: Arc::downgrade(admission),
                 index,
@@ -576,6 +586,10 @@ impl TerminalState {
         } else {
             control.construction_code
         }
+    }
+    #[cfg(test)]
+    pub(super) fn transport_drop_thread_for_test(&self) -> Option<String> {
+        self.transport_drop_thread.lock().unwrap().clone()
     }
     #[cfg(test)]
     pub(super) fn reject_startup_for_test(&self, stage: u8) {

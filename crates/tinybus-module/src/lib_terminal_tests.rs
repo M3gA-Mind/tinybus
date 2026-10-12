@@ -484,6 +484,10 @@ async fn actual_linked_posttransfer_startup_panics_keep_received_captures_on_phy
         assert_ne!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
         assert_eq!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0);
         assert!(terminal::TerminalState::lookup(view.inner.context()).is_some());
+        if stage == 5 || stage == 6 {
+            assert_eq!(view.inner.transport_drop_thread_for_test().as_deref(),
+                Some("tinybus-terminal"), "actual startup transport stage {stage}");
+        }
         let resources = view.inner.resources.lock().unwrap();
         assert!(resources.runtime.is_none());
         assert!(resources.initial.is_none());
