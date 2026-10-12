@@ -42,7 +42,10 @@ fn terminal_callbacks_reject_zero_and_unknown_context_tokens_as_closed() {
         let ctx = std::ptr::with_exposed_provenance_mut(address);
         let results = unsafe {
             [
-                ("deliver", terminal_deliver(ctx, bytes.as_ptr(), bytes.len())),
+                (
+                    "deliver",
+                    terminal_deliver(ctx, bytes.as_ptr(), bytes.len()),
+                ),
                 ("shutdown", terminal_shutdown(ctx, 1)),
                 (
                     "reinitialize",
@@ -71,9 +74,7 @@ fn legacy_callbacks_keep_null_context_bad_argument() {
         [
             (
                 "init",
-                start_module(std::ptr::null(), &mut out, 1, false, |_| async {
-                    Ok(())
-                }),
+                start_module(std::ptr::null(), &mut out, 1, false, |_| async { Ok(()) }),
             ),
             ("deliver", deliver(ctx, bytes.as_ptr(), bytes.len())),
             ("shutdown", shutdown(ctx, 1)),
