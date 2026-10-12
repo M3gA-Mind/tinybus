@@ -36,6 +36,13 @@ fn nested_caller_scopes_restore_owner_and_stopped_context_never_uses_replacement
     let (first, first_count) = owner();
     let (second, second_count) = owner();
     let outer = first.enter();
+    let parent = tracing::info_span!("parent");
+    let child = tracing::info_span!("child", value = tracing::field::Empty);
+    child.record("value", 42);
+    child.follows_from(parent.id());
+    {
+        let _entered = child.enter();
+    }
     tracing::info!("first caller");
     {
         let _inner = second.enter();
@@ -86,4 +93,20 @@ fn worker_blocking_and_block_on_contexts_use_their_own_runtime_callbacks() {
         runtime.shutdown_timeout(Duration::from_secs(1));
         assert!(OWNER.with(|slot| slot.borrow().is_none()));
     }
+}
+
+#[test]
+fn unowned_and_reentrant_panic_contexts_never_select_a_host_callback() {
+    ExecutionOwner::install_panic_hook();
+    let (owner, count) = owner();
+    assert!(std::panic::catch_unwind(|| panic!("unowned secret payload")).is_err());
+    {
+        let _guard = owner.enter();
+        OWNER.with(|slot| {
+            let _borrowed = slot.borrow_mut();
+            assert!(std::panic::catch_unwind(|| panic!("reentrant secret payload")).is_err());
+        });
+    }
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert!(owner.panic_location.lock().unwrap().is_none());
 }
