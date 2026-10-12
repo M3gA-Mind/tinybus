@@ -35,9 +35,26 @@ pub(crate) struct CallbackState {
     module_transport: Mutex<Option<std::sync::Weak<ModuleTransport>>>,
     lifetime: Mutex<Lifetime>,
     drained: Notify,
+    physical_drained: std::sync::Condvar,
 }
 
 impl CallbackState {
+    /// Physical cleanup waits offruntime, without a watchdog or native exclusion.
+    pub(crate) fn wait_drained(&self) {
+        let mut state = self
+            .lifetime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = false;
+        state.revoked = true;
+        while state.running != 0 {
+            state = self
+                .physical_drained
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
     pub(crate) async fn drain(self: &Arc<Self>, deadline: Duration) -> Result<()> {
         tokio::time::timeout(deadline, HostCallbackGuard(self.clone()).drained())
             .await
@@ -352,10 +369,15 @@ struct GuardedInterface<I> {
 struct Running(Arc<CallbackState>);
 impl Drop for Running {
     fn drop(&mut self) {
-        let mut state = self.0.lifetime.lock().expect("callback lifetime lock");
+        let mut state = self
+            .0
+            .lifetime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.running -= 1;
         if state.running == 0 {
             self.0.drained.notify_waiters();
+            self.0.physical_drained.notify_all();
         }
     }
 }
@@ -393,9 +415,14 @@ impl<I: Interface> Interface for GuardedInterface<I> {
             state.running += 1;
             Running(self.state.clone())
         };
-        self.interface
-            .call_with_context(member, args, context)
-            .await
+        // The later-created user future is destroyed before Running on both
+        // completion and cancellation; no response queue owns this accounting.
+        let result = {
+            let user = self.interface.call_with_context(member, args, context);
+            user.await
+        };
+        drop(_running);
+        result
     }
 }
 
@@ -465,6 +492,7 @@ impl ModuleHost {
                     registering: Vec::new(),
                 }),
                 drained: Notify::new(),
+                physical_drained: std::sync::Condvar::new(),
             }),
         })
     }
@@ -547,6 +575,7 @@ impl ModuleHost {
             let fingerprint = callback_config_fingerprint(&bytes);
             drop(config);
             let (transport, host) = ModuleTransport::new(admitted.name.clone(), bytes);
+            transport.bind_host_callbacks(binding.state.clone())?;
             #[cfg(test)]
             {
                 // Transfer the fixture config borrow before C can enter, so

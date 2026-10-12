@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex as StdMutex, Weak};
+use std::sync::{Arc, Condvar, Mutex as StdMutex, OnceLock, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -74,6 +74,8 @@ pub(crate) struct ModuleTransport {
     native_lifecycle_pending: Arc<AtomicBool>,
     stop_task_spawned: Arc<AtomicBool>,
     callbacks: CallbackGate,
+    // One exact provider account. Its transport backlink is weak.
+    host_callbacks: OnceLock<Arc<crate::module::host::callbacks::CallbackState>>,
     initialization_gate: StdMutex<Option<bool>>,
     initialization_gate_changed: Notify,
     #[cfg(test)]
@@ -288,6 +290,7 @@ impl ModuleTransport {
             native_lifecycle_pending: Arc::new(AtomicBool::new(false)),
             stop_task_spawned: Arc::new(AtomicBool::new(false)),
             callbacks: CallbackGate::default(),
+            host_callbacks: OnceLock::new(),
             initialization_gate: StdMutex::new(Some(true)),
             initialization_gate_changed: Notify::new(),
             #[cfg(test)]
@@ -767,8 +770,18 @@ impl ModuleTransport {
         }
     }
 
+    pub(crate) fn bind_host_callbacks(
+        &self,
+        callbacks: Arc<crate::module::host::callbacks::CallbackState>,
+    ) -> Result<()> {
+        self.host_callbacks
+            .set(callbacks)
+            .map_err(|_| Error::failed("module callback binding is already installed"))
+    }
+
     pub(crate) fn native_lifecycle_pending(&self) -> bool {
         self.native_lifecycle_pending.load(Ordering::Acquire)
+            || (self.admission_closed() && !self.is_stopped())
             || self
                 .context
                 .physical
@@ -1277,12 +1290,14 @@ impl PhysicalJob {
                     .expect("physical state lock");
             }
         }
-        let guard = self
-            .guard
-            .lock()
-            .expect("physical guard lock")
-            .take()
-            .unwrap_or_else(|| transport.lifecycle.clone().blocking_lock_owned());
+        let mut acquired = self.guard.lock().expect("physical guard lock").take();
+        if let Some(callbacks) = transport.host_callbacks.get() {
+            // User futures may need lifecycle services. Retain this physical
+            // owner, but release native exclusion before their actual drain.
+            drop(acquired.take());
+            callbacks.wait_drained();
+        }
+        let guard = acquired.unwrap_or_else(|| transport.lifecycle.clone().blocking_lock_owned());
         {
             let mut state = transport
                 .context
