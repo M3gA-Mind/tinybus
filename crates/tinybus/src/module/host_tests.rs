@@ -3130,7 +3130,7 @@ async fn actual_native_fault_during_ordinary_stop_keeps_fault_state_and_single_j
     let (release, release_rx) = std::sync::mpsc::channel();
     *barrier.finish_gate.lock().unwrap() = Some(release_rx);
     let stopping = tokio::spawn({
-        let host = host.clone(); async move { host.stop(info.name, Duration::from_secs(2)).await }
+        let host = host.clone(); async move { host.inner.stop_inner(&info.name, Duration::from_secs(2)).await }
     });
     barrier.joined.notified().await;
     assert!(transport.stop_task_spawned());

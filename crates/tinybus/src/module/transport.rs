@@ -159,10 +159,7 @@ struct InitiatingWaiter<'a> { transport: &'a ModuleTransport, armed: bool }
 impl Drop for InitiatingWaiter<'_> {
     fn drop(&mut self) {
         if self.armed {
-            let published = self.transport.context.physical.lock().expect("physical state lock").result.is_some();
-            if !published && !self.transport.admission_closed() {
-                self.transport.request_terminal(true);
-            }
+            self.transport.abandon_initialization();
         }
     }
 }
@@ -415,7 +412,7 @@ impl ModuleTransport {
         let result = match tokio::time::timeout(MODULE_INIT_DEADLINE, wait).await {
             Ok(result) => { abandonment.armed = false; result }
             Err(_) => {
-                if initiating && !self.admission_closed() { self.request_terminal(true); }
+                if initiating { self.abandon_initialization(); }
                 abandonment.armed = false;
                 return Err(Error::transport("module initialization exceeded its deadline"));
             }
@@ -488,7 +485,7 @@ impl ModuleTransport {
         }
     }
 
-    pub(crate) fn commit_terminal(&self, fault: bool) {
+    fn publish_terminal_flags(&self, fault: bool) {
         use crate::module::abi::{TB_NATIVE_TERMINAL_FAULT, TB_NATIVE_TERMINAL_STOP_INTENT};
         if fault { self.context.faulted.store(true, Ordering::Release); }
         let flags = &self.context.native_terminal_state;
@@ -500,6 +497,23 @@ impl ModuleTransport {
                 Ok(_) => break, Err(current) => old = current,
             }
         }
+    }
+
+    fn abandon_initialization(&self) {
+        {
+            let mut state = self.context.physical.lock().expect("physical state lock");
+            // Linearize publication versus the initiating waiter's abandonment.
+            // Atomic-only cause publication does not invert the host lock order.
+            if state.result.is_some() || self.context.native_terminal_state.load(Ordering::Acquire)
+                != crate::module::abi::TB_NATIVE_TERMINAL_LIVE { return; }
+            self.publish_terminal_flags(true);
+            if state.cleanup == CleanupState::Idle { state.cleanup = CleanupState::Requested; }
+        }
+        self.request_terminal(true);
+    }
+
+    pub(crate) fn commit_terminal(&self, fault: bool) {
+        self.publish_terminal_flags(fault);
         self.close_admission();
     }
 
