@@ -119,9 +119,16 @@ fn prefix_hosts_normalize_both_tails() {
         std::mem::offset_of!(TbHostVtable, broker_routing)
     );
     assert!(unsafe { TbHostVtable::read_compatible(std::ptr::null()) }.is_none());
-    // Only a u32 allocation is present for the rejected short header.
+    // The rejected host owns only its declared bytes, with vtable alignment.
     let short = TB_HOST_VTABLE_BASE_SIZE - 1;
-    assert!(unsafe { TbHostVtable::read_compatible(std::ptr::from_ref(&short).cast()) }.is_none());
+    let layout =
+        std::alloc::Layout::from_size_align(short as usize, align_of::<TbHostVtable>()).unwrap();
+    let storage = unsafe { std::alloc::alloc_zeroed(layout) };
+    assert!(!storage.is_null());
+    unsafe { storage.cast::<u32>().write(short) };
+    let rejected = unsafe { TbHostVtable::read_compatible(storage.cast()) }.is_none();
+    unsafe { std::alloc::dealloc(storage, layout) };
+    assert!(rejected);
     let prefix = frozen_prefix(size_of::<FrozenHostPrefix>());
     let normalized =
         unsafe { TbHostVtable::read_compatible(std::ptr::from_ref(&prefix).cast()) }.unwrap();
