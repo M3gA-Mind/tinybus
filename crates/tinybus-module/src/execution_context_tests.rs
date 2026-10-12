@@ -27,6 +27,7 @@ fn owner() -> (ExecutionOwner, &'static AtomicUsize) {
         },
         ready,
         broker_routing: None,
+        native_terminal_state: None,
     });
     (ExecutionOwner::new(host), count)
 }
