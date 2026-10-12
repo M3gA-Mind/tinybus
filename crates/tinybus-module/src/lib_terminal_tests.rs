@@ -2412,3 +2412,167 @@ async fn compiled_native_startup_transfers_and_runtime_build_error_dispose_on_ph
         );
     }
 }
+
+struct NativeBarrierControls {
+    events: std::sync::mpsc::Sender<(u32, u32)>,
+    blocked_event: u32,
+    release: (StdMutex<bool>, std::sync::Condvar),
+}
+impl NativeBarrierControls {
+    fn release(&self) {
+        *self.release.0.lock().unwrap() = true;
+        self.release.1.notify_all();
+    }
+}
+unsafe extern "C" fn native_barrier_event(ctx: *mut c_void, event: u32, value: u32) {
+    let controls = unsafe { &*ctx.cast::<NativeBarrierControls>() };
+    let _ = controls.events.send((event, value));
+    if event == controls.blocked_event {
+        let mut released = controls.release.0.lock().unwrap();
+        while !*released {
+            released = controls.release.1.wait(released).unwrap();
+        }
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a fresh-process privately pinned __native-fixture-support eight-artifact cohort"]
+async fn compiled_native_entered_initial_and_reinit_work_settle_before_original_finish() {
+    let path = std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_TERMINAL_MODULE").unwrap());
+    // Modes40/41 block actual synchronous construction/poll; mode42 blocks
+    // actual retained future Drop. Reinit43 returns a genuine ready Err only
+    // after the same poll has observed an already-committed real host Stop.
+    for (reinitializing, mode) in [
+        (false, 40u8),
+        (false, 41),
+        (false, 42),
+        (false, 44),
+        (false, 45),
+        (true, 40),
+        (true, 41),
+        (true, 42),
+        (true, 43),
+        (true, 44),
+        (true, 45),
+    ] {
+        let (events, receiver) = std::sync::mpsc::channel();
+        let barrier = Box::into_raw(Box::new(NativeBarrierControls {
+            events,
+            blocked_event: match mode {
+                40 | 44 => 23,
+                42 => 25,
+                _ => 24,
+            },
+            release: (StdMutex::new(false), std::sync::Condvar::new()),
+        }));
+        let controls = NativeControls {
+            ctx: barrier.cast(),
+            event: native_barrier_event,
+        };
+        let host = native_fixture_host();
+        host.load_file_with_config(
+            &path,
+            native_controls_config(if reinitializing { 0 } else { mode }, &controls),
+        )
+        .unwrap();
+        let (context, _, drops, _, flags) = unsafe { terminal_fixture_symbols(&path) };
+        let reinit: unsafe extern "C" fn(usize, *const u8, usize) -> i32 =
+            unsafe { native_fixture_symbol(&path, c"terminal_test_reinit") };
+        let before = drops();
+        let mut seen = Vec::new();
+        if reinitializing {
+            while !seen.iter().any(|event: &(u32, u32)| event.0 == 2) {
+                seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+        }
+        let call = reinitializing.then(|| {
+            let token = context();
+            let bytes = serde_json::to_vec(&native_controls_config(mode, &controls)).unwrap();
+            std::thread::spawn(move || unsafe { reinit(token, bytes.as_ptr(), bytes.len()) })
+        });
+        // Drop42 is first entered on actual physical cleanup after shutdown.
+        if mode != 42 {
+            while !seen
+                .iter()
+                .any(|event| event.0 == unsafe { &*barrier }.blocked_event)
+            {
+                seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+        } else if !reinitializing {
+            while !seen.iter().any(|event| event.0 == 2) {
+                seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+        } else {
+            while seen.iter().filter(|event| event.0 == 2).count() != 2 {
+                seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+        }
+        host.shutdown(Duration::from_millis(30)).await;
+        if mode == 42 {
+            while !seen.iter().any(|event| event.0 == 25) {
+                seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+            }
+        }
+        let blocked_native = flags();
+        seen.extend(receiver.try_iter());
+        let finish_before_release = seen.iter().any(|event| event.0 == 5);
+        let drop_before_release = drops();
+        // Release before any assertion; join the real ABI caller, actual
+        // initial task/future and original independent controller below.
+        unsafe { &*barrier }.release();
+        let reinit_result = call.map(|call| call.join().unwrap());
+        host.shutdown(Duration::from_secs(5)).await;
+        while !seen.iter().any(|event| event.0 == 6) {
+            seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while drops() == before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let settled_native = flags();
+        seen.extend(receiver.try_iter());
+        drop(host);
+        unsafe {
+            drop(Box::from_raw(barrier));
+        }
+        assert!(
+            !finish_before_release,
+            "entered mode {mode}, reinit {reinitializing}"
+        );
+        assert_eq!(drop_before_release, before);
+        assert_ne!(
+            blocked_native & tinybus::module::abi::TB_NATIVE_TERMINAL_STOP_INTENT,
+            0
+        );
+        assert_eq!(
+            blocked_native & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+            0
+        );
+        assert_eq!(seen.iter().filter(|event| **event == (5, 1)).count(), 1);
+        assert_eq!(seen.iter().filter(|event| **event == (7, 1)).count(), 1);
+        assert!(seen.iter().any(|event| event.0 == 13 && event.1 & 7 == 7));
+        assert!(seen.iter().any(|event| event.0 == 16 && event.1 & 1 == 1));
+        assert!(
+            seen.iter()
+                .filter(|event| event.0 == 26)
+                .all(|event| event.1 == 1)
+        );
+        if let Some(result) = reinit_result {
+            assert_eq!(result, if mode == 44 { TB_PANICKED } else { TB_CLOSED });
+        }
+        if mode == 43 || mode == 44 || mode == 45 {
+            assert_ne!(
+                settled_native & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT,
+                0,
+                "genuine source error/panic must dominate simultaneous ready Stop"
+            );
+            assert_eq!(
+                settled_native & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+                0
+            );
+            assert!(!seen.iter().any(|event| event.0 == 17));
+        }
+    }
+}
