@@ -1033,6 +1033,109 @@ async fn actual_linked_reinit_terminal_cancellation_settles_before_worker_join()
     assert!(drops.into_iter().all(|index| index < finish));
 }
 
+struct MethodPayloadGate {
+    state: std::sync::Weak<terminal::TerminalState>,
+    entered: std::sync::mpsc::Sender<(u32, bool, usize, tokio::runtime::Id)>,
+    release: Arc<std::sync::Barrier>,
+    settled: std::sync::mpsc::Sender<()>,
+}
+struct BlockingMethodPayload(Arc<MethodPayloadGate>);
+impl Drop for BlockingMethodPayload {
+    fn drop(&mut self) {
+        let state = self.0.state.upgrade().unwrap();
+        let host = state.host.0;
+        let flags = unsafe { host.native_terminal_state.unwrap()(host.host_ctx) };
+        // This sample is the first foreign payload-disposal action. It reads
+        // actual copied native authority and the real registered request state.
+        self.0.entered.send((
+            flags, state.request_done_for_test(), state.sdk_owner_count_for_test(),
+            tokio::runtime::Handle::current().id(),
+        )).unwrap();
+        drop(state);
+        self.0.release.wait();
+        self.0.settled.send(()).unwrap();
+    }
+}
+struct MethodPayloadObject(Arc<MethodPayloadGate>);
+#[async_trait]
+impl tinybus::Interface for MethodPayloadObject {
+    fn name(&self) -> tinybus::InterfaceName {
+        "ai.tinyhumans.tinybus.Payload".parse().unwrap()
+    }
+    fn members(&self) -> Vec<tinybus::MemberName> {
+        vec!["Panic".parse().unwrap()]
+    }
+    async fn call(&self, _: &tinybus::MemberName, _: serde_json::Value) -> Result<serde_json::Value> {
+        std::panic::panic_any(BlockingMethodPayload(self.0.clone()));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_method_observer_fences_native_fault_and_request_done_before_blocked_payload_drop() {
+    let _serial = controlled::TEST_LOCK.lock().await;
+    let (fixture, events) = controlled::fixture();
+    let broker = tinybus::broker::Broker::new();
+    let bus = tinybus::transport::memory::MemoryBus::new();
+    broker.clone().spawn(bus.clone());
+    let client = Connection::connect(bus.connect().await.unwrap()).await.unwrap();
+    let host = Arc::new(tinybus::module::ModuleHost::new(broker));
+    host.attach_linked_with_config(
+        controlled::linked_module().unwrap(), serde_json::json!({"mode":0}),
+    ).unwrap();
+    events.recv_timeout(Duration::from_secs(3)).unwrap();
+    let view = fixture.view.lock().unwrap().take().unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (settled_tx, settled_rx) = std::sync::mpsc::channel();
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let gate = Arc::new(MethodPayloadGate {
+        state: Arc::downgrade(&view.inner), entered: entered_tx,
+        release: release.clone(), settled: settled_tx,
+    });
+    let (connection, module_runtime) = {
+        let resources = view.inner.resources.lock().unwrap();
+        let connection = resources.connection.lock().unwrap().clone().unwrap();
+        (connection, resources.runtime.as_ref().unwrap().handle().id())
+    };
+    let destination = connection.unique_name().unwrap().to_string();
+    connection.serve_at("/payload".parse().unwrap(), MethodPayloadObject(gate)).await.unwrap();
+    drop(connection);
+    let call = tokio::spawn(async move {
+        client.proxy(&destination, "/payload", "ai.tinyhumans.tinybus.Payload")
+            .unwrap().call::<_, serde_json::Value>("Panic", ()).await
+    });
+    let sample = entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    // Actual method task is held in foreign payload Drop. Its Connection owner
+    // survives runtime shutdown_timeout and therefore denies SDK completion.
+    host.shutdown(Duration::from_secs(8)).await;
+    let completion = view.inner.wait(Duration::ZERO);
+    let anchored = terminal::TerminalState::lookup(view.inner.context()).is_some();
+    let retained_sdk = view.inner.sdk_owner_count_for_test();
+    let native = view.inner.host.0;
+    let flags = unsafe { native.native_terminal_state.unwrap()(native.host_ctx) };
+    release.wait();
+    settled_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    let call_result = call.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while view.inner.sdk_owner_count_for_test() != 0 {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    // All controlled payload work, actual method caller and controller worker
+    // have settled before assertions; the conservative original anchor remains.
+    assert_ne!(sample.0 & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
+    assert!(sample.1, "installed observer must finish bounded request before foreign Drop");
+    assert!(sample.2 > 0, "actual method Connection/task must retain SDK State owner");
+    assert_eq!(sample.3, module_runtime);
+    assert_eq!(completion, TerminalCompletion::Uncertain);
+    assert!(anchored && retained_sdk > 0);
+    assert_eq!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0);
+    assert_eq!(fixture.requests.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.finishes.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.joins.load(Ordering::Acquire), 1);
+    assert!(call_result.is_err());
+    assert!(terminal::TerminalState::lookup(view.inner.context()).is_some());
+}
+
 // A real served object, rather than a synthetic transport owner: Inner destroys
 // its transport before its ObjectTree, so the old count can reach zero here.
 struct TeardownObject {

@@ -578,6 +578,10 @@ impl TerminalState {
         self.reject_worker_spawn.store(true, Ordering::Release);
     }
     #[cfg(test)]
+    pub(super) fn sdk_owner_count_for_test(&self) -> usize {
+        self.sdk_owners.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
     pub(super) fn request_done_for_test(&self) -> bool {
         matches!(self.lock().request_state, RequestState::Done | RequestState::Panicked)
     }
