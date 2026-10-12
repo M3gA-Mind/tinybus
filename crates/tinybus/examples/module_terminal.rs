@@ -299,7 +299,6 @@ pub unsafe extern "C" fn tinybus_module_init_v1(
                 if let Some(encoded) = config.get("test_controls").and_then(|value| serde_json::from_value::<Vec<u8>>(value.clone()).ok()).filter(|bytes| bytes.len() == size_of::<Controls>()) {
                     let controls = unsafe {
                         encoded
-                            .test_controls
                             .as_ptr()
                             .cast::<Controls>()
                             .read_unaligned()
