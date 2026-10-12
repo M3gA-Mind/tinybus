@@ -91,6 +91,7 @@ fn a_module_whose_queue_is_full_reports_backpressure_rather_than_blocking_the_br
     let (sender, _receiver) = mpsc::channel(1);
     sender.try_send((vec![1], false)).unwrap();
     let state = RuntimeState {
+        owner: None,
         host: HostCalls(host(b"{}")),
         inbound: StdMutex::new(Some(sender)),
         runtime: StdMutex::new(None),
@@ -110,6 +111,7 @@ fn a_module_whose_queue_is_full_reports_backpressure_rather_than_blocking_the_br
 #[test]
 fn a_frame_over_the_size_cap_is_rejected_rather_than_truncated() {
     let state = RuntimeState {
+        owner: None,
         host: HostCalls(host(b"{}")),
         inbound: StdMutex::new(None),
         runtime: StdMutex::new(None),
@@ -202,6 +204,7 @@ fn a_manifest_declaration_exports_the_declared_surface_and_dependencies() {
 #[test]
 fn a_panicking_shutdown_callback_reports_panicked_not_timed_out() {
     let state = RuntimeState {
+        owner: None,
         host: HostCalls(host(b"{}")),
         inbound: StdMutex::new(None),
         runtime: StdMutex::new(None),
@@ -226,6 +229,7 @@ fn deliver_and_shutdown_validate_their_arguments_and_closed_state() {
         TB_BAD_ARGUMENT
     );
     let state = RuntimeState {
+        owner: None,
         host: HostCalls(host(b"{}")),
         inbound: StdMutex::new(None),
         runtime: StdMutex::new(None),
@@ -484,9 +488,8 @@ fn configured_reinitializations_are_serialized_bounded_and_keep_the_runtime_aliv
     assert_eq!(unsafe { (out.shutdown)(out.module_ctx, 10) }, TB_OK);
     assert_eq!(unsafe { (out.shutdown)(out.module_ctx, 10) }, TB_CLOSED);
 
-    // The first start above installed this module copy's global subscriber, so
-    // a second dynamic start cannot replace it and refuses with `TB_CLOSED`
-    // rather than running a module with the wrong logging hook.
+    // A stopped instance does not own the next instance's execution context.
+    // Starting the same SDK again must succeed without retaining its log hook.
     let mut second = TbModuleVtable::default();
     let again = self::host(config);
     assert_eq!(
@@ -499,8 +502,9 @@ fn configured_reinitializations_are_serialized_bounded_and_keep_the_runtime_aliv
                 |_, _| async { Ok(()) },
             )
         },
-        TB_CLOSED
+        TB_OK
     );
+    assert_eq!(unsafe { (second.shutdown)(second.module_ctx, 1000) }, TB_OK);
 }
 
 /// Startup refuses a host vtable it cannot trust, before it builds anything.
@@ -600,6 +604,7 @@ fn deliver_reports_closed_when_the_modules_queue_receiver_is_gone() {
     let (tx, rx) = mpsc::channel::<(Vec<u8>, bool)>(1);
     drop(rx);
     let state = RuntimeState {
+        owner: None,
         host: HostCalls(host(b"{}")),
         inbound: StdMutex::new(Some(tx)),
         runtime: StdMutex::new(None),
@@ -626,6 +631,7 @@ fn reinitialize_validates_its_arguments_and_reports_closed_without_a_handler() {
         TB_BAD_ARGUMENT
     );
     let state = RuntimeState {
+        owner: None,
         host: HostCalls(host(b"{}")),
         inbound: StdMutex::new(None),
         runtime: StdMutex::new(None),
@@ -794,6 +800,7 @@ async fn admission_never_promotes_a_frame_already_queued_without_provenance() {
     table.broker_routing = Some(atomic_routing_assertion);
     let (sender, receiver) = mpsc::channel(2);
     let state = RuntimeState {
+        owner: None,
         host: HostCalls(table),
         inbound: StdMutex::new(Some(sender)),
         runtime: StdMutex::new(None),
@@ -890,6 +897,7 @@ async fn unverified_native_frames_preserve_distinct_stream_owners_and_unverified
             .unwrap() = Some(outgoing_tx);
         let (sender, receiver) = mpsc::channel(2);
         let state = RuntimeState {
+            owner: None,
             host: HostCalls(table),
             inbound: StdMutex::new(Some(sender)),
             runtime: StdMutex::new(None),
