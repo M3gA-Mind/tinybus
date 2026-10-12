@@ -332,8 +332,8 @@ async fn compiled_native_terminal_owns_initial_cancellation_panics_join_and_stal
     assert!(result.is_err(), "source Fault before vtable publication must reject init");
     assert!(entered && settled, "actual SDK finish and resource Drop must settle independently");
     for flags in [flags_before_drop, flags_after_host_drop, final_flags] {
-        assert_ne!(flags & TB_NATIVE_TERMINAL_FAULT, 0);
-        assert_eq!(flags & TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0,
+        assert_ne!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
+        assert_eq!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0,
             "no accepted vtable means no host physical-worker evidence");
     }
     assert_eq!(seen.iter().filter(|event| event.0 == 3).count(), 1);
