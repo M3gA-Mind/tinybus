@@ -1530,3 +1530,32 @@ async fn wait_physical_cleanup(transport: &ModuleTransport) {
         }
     }).await.unwrap();
 }
+
+#[tokio::test]
+async fn observing_fault_owned_job_does_not_create_ordinary_stop_marker() {
+    let (transport, host) = ModuleTransport::new("fault-owner".into(), vec![]);
+    transport.reject_worker_spawn.store(true, Ordering::Release);
+    transport.defer_initialize(initialize_ok, host);
+    assert!(transport.ensure_initialized().await.is_err());
+    assert!(!transport.stop_task_spawned());
+    assert!(matches!(transport.clone().stop(Duration::from_secs(1)).await, Err(StopError::NotStarted(_))));
+    assert!(!transport.stop_task_spawned(), "fault-owned uncertainty cannot become an ordinary handoff");
+}
+
+#[tokio::test]
+async fn ordinary_shutdown_retains_non_ok_return_without_physical_success() {
+    let _lock = VTABLE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let (transport, host) = ModuleTransport::new("shutdown-status".into(), vec![]);
+    transport.defer_initialize(initialize_ok, host);
+    transport.ensure_initialized().await.unwrap();
+    SHUTDOWN_CODE.store(TB_TIMEOUT, Ordering::Release);
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    let result = transport.clone().stop(Duration::from_secs(1)).await;
+    SHUTDOWN_CODE.store(TB_OK, Ordering::Release);
+    assert_eq!(result.unwrap(), TB_TIMEOUT, "ordinary public return remains compatible");
+    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 2);
+    assert_eq!(transport.context.physical.lock().unwrap().cleanup, CleanupState::Uncertain);
+    assert!(transport.stop_task_spawned());
+    assert!(transport.is_stopped(), "legacy stopped is separate from physical-success proof");
+    assert!(!transport.is_faulted());
+}
