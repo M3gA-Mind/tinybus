@@ -1513,7 +1513,10 @@ unsafe extern "C" fn native_entered(ctx: *mut c_void, host: *const TbHostVtable)
 }
 unsafe extern "C" fn native_joined(ctx: *mut c_void) {
     let barrier = unsafe { &*ctx.cast::<NativeBarrier>() };
-    let mut state = barrier.state.lock().unwrap();
+    let mut state = barrier
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert!(!state.2, "one actual native shutdown/join");
     state.2 = true;
     barrier.joined.notify_one();
@@ -1525,9 +1528,19 @@ unsafe extern "C" fn native_joined(ctx: *mut c_void) {
         .take();
     // This artificial gate runs after the fixture's actual worker join. A failed
     // Rust assertion may disconnect it; never unwind through the C callback.
+    finish_native_control(gate);
+}
+fn finish_native_control(gate: Option<std::sync::mpsc::Receiver<()>>) {
     if let Some(gate) = gate {
         let _ = gate.recv();
     }
+}
+#[test]
+fn disconnected_artificial_finish_gate_does_not_unwind() {
+    let (release, receive) = std::sync::mpsc::channel();
+    drop(release);
+    let result = std::panic::catch_unwind(|| finish_native_control(Some(receive)));
+    assert!(result.is_ok());
 }
 pub(crate) fn native_fixture() -> (
     Arc<ModuleTransport>,

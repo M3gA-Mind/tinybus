@@ -645,6 +645,49 @@ fn controlled_release_wakes_entry_and_releases_channels_on_early_unwind() {
     );
 }
 
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_early_unwind_releases_entry_and_reclaims_after_callback_return() {
+    use super::super::super::transport::tests::native_fixture;
+    let (transport, host, init, barrier) = native_fixture();
+    let weak = Arc::downgrade(&barrier);
+    let mut cleanup = ControlledRelease::new(barrier.clone());
+    cleanup.transport = Some(transport.clone());
+    let (finish, receive) = std::sync::mpsc::channel();
+    cleanup.finish = Some(finish);
+    *barrier.finish_gate.lock().unwrap() = Some(receive);
+    transport.defer_initialize(init, host);
+    let initializing = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.ensure_initialized().await }
+    });
+    let entered = tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified()).await;
+    // Deliberate ordinary Rust unwind exercises the guard while actual C entry
+    // is blocked on its condition variable. No panic crosses a C boundary.
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _cleanup = cleanup;
+        panic!("early controlled fixture failure");
+    }));
+    let initialized = initializing.await;
+    let stopped = transport.clone().stop(Duration::from_secs(2)).await;
+    let callback_entered_after_worker_join = barrier.state.lock().unwrap().2;
+    drop(barrier);
+    drop(transport);
+    let reclaimed = tokio::time::timeout(Duration::from_secs(2), async {
+        while weak.strong_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // Stop completion, rather than callback entry or abort, proves actual return.
+    assert!(entered.is_ok());
+    assert!(unwind.is_err());
+    assert!(initialized.is_ok());
+    assert!(stopped.is_ok());
+    assert!(callback_entered_after_worker_join);
+    assert!(reclaimed.is_ok());
+}
+
 // Manually polling the public future lets ordinary shutdown commit while the
 // loader is suspended; no scheduler race decides which cancellation is tested.
 async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: bool) {
@@ -1052,14 +1095,25 @@ async fn native_callback_setup_failure_race(panic_setup: bool) {
     let attachment = await_native_attach(&attached, &mut load, &mut completed).await;
     if attachment != AttachOutcome::Attached {
         cleanup.release();
-        // Before attachment C is paused. Preserve the original finite cause
-        // even if synchronous admission delays cooperative abort completion.
-        let completion = match completed {
-            Some(result) => result,
-            None => load.await,
-        };
-        drop(completion);
-        panic!("native fixture attachment: {attachment:?}");
+        // Report the original finite cause before cleanup: synchronous admission
+        // cannot be interrupted by abort. Do not turn it into a readiness failure.
+        eprintln!("native fixture attachment: {attachment:?}");
+        if let Some(completion) = completed {
+            drop(completion);
+        } else if tokio::time::timeout(Duration::from_secs(2), &mut load)
+            .await
+            .is_err()
+        {
+            // Pending ownership is explicit, not a quiescence claim. The task
+            // consumes eventual completion and keeps the real staging, binding,
+            // host and controller alive; transport's physical anchor also remains.
+            tokio::spawn(async move {
+                let _owners = (_dir, host, binding, barrier);
+                let _ = load.await;
+            });
+            panic!("native fixture attachment: {attachment:?}; cleanup pending");
+        }
+        panic!("native fixture attachment: {attachment:?}; loader completion consumed");
     }
     let transport = host.inner.loaded.lock().unwrap()[0].transport.clone();
     cleanup.transport = Some(transport.clone());
