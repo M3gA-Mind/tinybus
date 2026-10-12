@@ -274,6 +274,7 @@ async fn a_shutdown_task_timeout_is_distinguished_from_a_lifecycle_lock_timeout(
     ));
     assert!(SHUTDOWN_ENTERED.load(Ordering::Acquire));
     SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    wait_physical_cleanup(&transport).await;
 }
 
 #[tokio::test]
@@ -502,6 +503,7 @@ async fn delivery_maps_a_faulted_transport_a_missing_module_and_module_refusals(
         transport.deliver_now(call()).await,
         Err(Error::ConnectionClosed)
     ));
+    wait_physical_cleanup(&transport).await;
 }
 
 #[test]
@@ -1514,4 +1516,17 @@ async fn actual_native_eager_fault_denies_while_config_remains_borrowed_then_joi
     let _physical_exit = transport.lifecycle.lock().await;
     assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 14);
     assert!(transport.context.config.lock().unwrap().is_empty());
+}
+
+
+async fn wait_physical_cleanup(transport: &ModuleTransport) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let changed = transport.context.physical_notify.notified();
+            let terminal = matches!(transport.context.physical.lock().unwrap().cleanup,
+                CleanupState::Complete | CleanupState::Uncertain | CleanupState::NoCallbackRequired);
+            if terminal { return; }
+            changed.await;
+        }
+    }).await.unwrap();
 }

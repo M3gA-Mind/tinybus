@@ -1022,7 +1022,6 @@ impl Transport for ModuleTransport {
                 self.context.init_failed.store(true, Ordering::Release);
                 self.context.faulted.store(true, Ordering::Release);
             }
-            self.request_terminal(true);
             self.context.ready_notify.notify_waiters();
             if message.header.kind == MessageKind::MethodCall {
                 let error = Error::ModuleUnavailable {
@@ -1042,8 +1041,10 @@ impl Transport for ModuleTransport {
                         let _ = sender.try_send(bytes);
                     }
                 }
+                self.request_terminal(true);
                 return Ok(());
             }
+            self.request_terminal(true);
             return Err(Error::ConnectionClosed);
         }
         let is_call = message.header.kind == MessageKind::MethodCall;
