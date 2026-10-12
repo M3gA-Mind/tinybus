@@ -1311,7 +1311,7 @@ struct TerminalTransport {
     inner: ModuleTransport,
     _owner: terminal::SdkOwner,
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "__native-fixture-support"))]
 impl Drop for TerminalTransport {
     fn drop(&mut self) {
         self._owner.record_transport_drop_for_test();

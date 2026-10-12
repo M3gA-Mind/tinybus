@@ -132,7 +132,14 @@ impl Future for SetupFuture {
             self.controller.observe(11);
             self.controller.emit(2, u32::from(self.mode));
         }
+        if self.mode == 41 || self.mode == 43 || self.mode == 45 {
+            self.controller.emit(24, u32::from(self.mode));
+        }
         match self.mode {
+            43 => Poll::Ready(Err(tinybus::Error::failed(
+                "ready native reinit source error",
+            ))),
+            45 => std::panic::panic_any(PrimaryPayload(*self.controller.controls.lock().unwrap())),
             0 => Poll::Ready(Ok(())),
             2 => panic!("controlled native setup poll"),
             5 => Poll::Ready(Err(tinybus::Error::failed("controlled native setup error"))),
@@ -142,6 +149,9 @@ impl Future for SetupFuture {
 }
 impl Drop for SetupFuture {
     fn drop(&mut self) {
+        if self.mode == 42 {
+            self.controller.emit(25, 0);
+        }
         self.controller.observe(14);
         self.controller.emit(
             4,
@@ -154,7 +164,7 @@ type FixtureSetup = Box<dyn Fn(Connection, Config) -> FixtureFuture + Send + Syn
 fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)> {
     FACTORIES.fetch_add(1, Ordering::AcqRel);
     let factory_mode = NEXT_FACTORY_MODE.swap(0, Ordering::AcqRel);
-    if factory_mode == 3 || (20..=29).contains(&factory_mode) {
+    if factory_mode == 3 || (20..=29).contains(&factory_mode) || factory_mode == 46 {
         RETAINED_VIEWS.lock().unwrap().push(view.clone());
     }
     let early = EARLY
@@ -179,6 +189,7 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
         worker: Mutex::new(None),
     });
     controller.observe(10);
+    controller.observe(27);
     #[cfg(feature = "__native-fixture-support")]
     match factory_mode {
         20 => controller.view.__fixture_reject_worker_spawn(),
@@ -198,6 +209,8 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
     let setup = move |_: Connection, config: Config| {
         let controller = capture.controller();
         controller.observe(16);
+        controller.emit(26, u32::from(tokio::runtime::Handle::try_current().is_ok()));
+        controller.observe(28);
         if config.test_controls.len() != size_of::<Controls>() {
             return Box::pin(async { Err(tinybus::Error::failed("bad test controls")) })
                 as Pin<Box<dyn Future<Output = Result<()>> + Send>>;
@@ -248,6 +261,12 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
             );
         }
         drop(worker);
+        if config.mode == 40 || config.mode == 44 {
+            controller.emit(23, u32::from(config.mode));
+        }
+        if config.mode == 44 {
+            std::panic::panic_any(PrimaryPayload(*controller.controls.lock().unwrap()));
+        }
         if config.mode == 4 {
             panic!("controlled native setup construction");
         }
@@ -523,4 +542,30 @@ pub extern "C" fn terminal_test_external_join() -> bool {
     let joined = worker.is_some_and(|worker| worker.join().unwrap_or(false));
     controller.emit(21, u32::from(joined));
     joined
+}
+
+/// Invoke the exact exported SDK reinitializer with a previously observed token.
+/// # Safety
+/// Input must remain readable throughout this synchronous callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn terminal_test_reinit(token: usize, ptr: *const u8, len: usize) -> i32 {
+    let table = *LATEST.lock().unwrap();
+    table
+        .and_then(|table| table.0.reinitialize)
+        .map_or(TB_CLOSED, |reinit| unsafe {
+            reinit(std::ptr::with_exposed_provenance_mut(token), ptr, len)
+        })
+}
+/// Current SDK owner observation on an external caller, with no scope installed.
+#[unsafe(no_mangle)]
+pub extern "C" fn terminal_test_unowned() -> bool {
+    #[cfg(feature = "__native-fixture-support")]
+    {
+        let views = RETAINED_VIEWS.lock().unwrap().clone();
+        views.iter().all(|view| !view.__fixture_owner_is_current())
+    }
+    #[cfg(not(feature = "__native-fixture-support"))]
+    {
+        true
+    }
 }
