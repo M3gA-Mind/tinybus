@@ -1,8 +1,8 @@
 //! Local, exact-instance confidential callbacks; never artifact attestation.
 
 use super::*;
-use crate::module::transport::AdmissionTermination;
 use crate::message::Header;
+use crate::module::transport::AdmissionTermination;
 use crate::transport::memory::MemoryTransport;
 use crate::{CallContext, Connection, Interface, InterfaceName, MemberName, ObjectPath};
 use async_trait::async_trait;
@@ -557,8 +557,14 @@ impl ModuleHost {
             rollback.transport = Some(transport.clone());
             #[cfg(test)]
             {
-                let observer = binding.after_attach.lock().expect("test attach observer").take();
-                if let Some(observer) = observer { observer(); }
+                let observer = binding
+                    .after_attach
+                    .lock()
+                    .expect("test attach observer")
+                    .take();
+                if let Some(observer) = observer {
+                    observer();
+                }
             }
             let mut loaded = self.inner.loaded.lock().expect("module list lock");
             let module = loaded
@@ -599,20 +605,24 @@ impl ModuleHost {
         let failure = match initialized {
             Err(Error::ConnectionClosed) => Some(AdmissionTermination::Canceled),
             Err(_) => Some(AdmissionTermination::Failed),
-            Ok(()) => match tokio::time::timeout(
-                Duration::from_secs(5), transport.wait_ready()
-            ).await {
-                Err(_) => Some(AdmissionTermination::Failed),
-                Ok(()) if !transport.is_ready() => Some(AdmissionTermination::Canceled),
-                Ok(()) => None,
-            },
+            Ok(()) => {
+                match tokio::time::timeout(Duration::from_secs(5), transport.wait_ready()).await {
+                    Err(_) => Some(AdmissionTermination::Failed),
+                    Ok(()) if !transport.is_ready() => Some(AdmissionTermination::Canceled),
+                    Ok(()) => None,
+                }
+            }
         };
         if let Some(cause) = failure {
             rollback.cause = cause;
         }
         #[cfg(test)]
         {
-            let observer = binding.before_load_decision.lock().expect("test decision observer").take();
+            let observer = binding
+                .before_load_decision
+                .lock()
+                .expect("test decision observer")
+                .take();
             if let Some((entered, release)) = observer {
                 entered.notify_one();
                 release.await.expect("test decision observer released");
@@ -674,9 +684,10 @@ impl Drop for LoadRollback<'_> {
         if self.committed {
             return;
         }
-        let fault = self.transport.as_ref().map(|transport| {
-            transport.commit_admission_termination(self.cause)
-        });
+        let fault = self
+            .transport
+            .as_ref()
+            .map(|transport| transport.commit_admission_termination(self.cause));
         self.binding.revoke();
         self.binding.transport.close_outbound();
         self.binding

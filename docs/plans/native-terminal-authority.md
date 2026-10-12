@@ -195,6 +195,25 @@ before scheduling and never invokes C recursively, joins or waits. Rollback and
 Host Drop commit all flags before revocation, release router/loaded locks and
 route through retained cleanup. No lifecycle-bypassing synchronous Drop cleanup.
 
+Callback-load admission carries an explicit Failed versus Canceled cause.
+Actual setup Err/unwind, initialization error and actual readiness deadline are
+Failed even when ordinary stop races them. After successful setup, waiter Drop,
+admission-gate rejection and terminal-caused not-ready/final-commit cancellation
+preserve already committed ordinary StopIntent without adding Fault. Live
+abandonment still faults; real Fault remains sticky. Apply the selected cause
+before revocation and to retained cleanup, including nested observer release.
+The final load liveness check rejects actual admission closure even while the
+legacy Ready bit remains set and opaque shutdown has not returned.
+
+Bounded cfg(test) admission/decision observers and fixture JSON Controls encode
+test barriers only, never production authority. The declared native fixture emits
+actual Ready during opaque init when requested. Tests hold actual shutdown return
+after the independent worker joins, prove ordinary cancellation flags2 and eventual
+TB_OK flags10, and distinguish genuine deadline/actual host_fault flags6/14.
+A host setup unwind test proves Rust rollback classification, not module catch-time
+panic containment or Task4 hooks. Setup rejection before gate release proves C never
+entered and makes no physical-join claim.
+
 Normal stop remains deadline-bound while obtaining the actual owned lifecycle
 guard. Before acquisition it owns no ordinary intent, job or stop_task_spawned
 marker; cancellation/deadline is NotStarted and remains live absent real fault.

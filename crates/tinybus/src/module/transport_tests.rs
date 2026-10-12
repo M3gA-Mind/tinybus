@@ -2081,8 +2081,14 @@ pub(crate) fn native_fixture_json(transport: &ModuleTransport) -> serde_json::Va
 async fn rejected_observer_after_ordinary_stop_preserves_nonfault_cause() {
     let (transport, view) = ModuleTransport::new("ordinary-cancellation".into(), vec![]);
     let _ = transport.clone().stop(Duration::from_secs(1)).await;
-    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 2);
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        2
+    );
     transport.release_initialization(false);
     assert!(!transport.is_faulted());
-    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 2);
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        2
+    );
 }

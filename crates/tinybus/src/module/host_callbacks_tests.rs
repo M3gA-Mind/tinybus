@@ -561,30 +561,44 @@ fn configuration_fingerprints_preserve_json_equality_without_normalizing_strings
 // Manually polling the public future lets ordinary shutdown commit while the
 // loader is suspended; no scheduler race decides which cancellation is tested.
 async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: bool) {
-    use std::future::Future;
     use super::super::super::transport::tests::{native_fixture, native_fixture_json};
+    use std::future::Future;
     let (unused, _, _, barrier) = native_fixture();
     let config = native_fixture_json(&unused);
     drop(unused);
-    let artifact = std::path::PathBuf::from(
-        std::env::var_os("TINYBUS_TEST_CONTROLLED_INIT_MODULE").unwrap());
+    let artifact =
+        std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_CONTROLLED_INIT_MODULE").unwrap());
     let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
     let (_dir, artifact) = super::super::tests::staged_module(&artifact, &hash);
     let host = ModuleHost::new(Broker::new());
     let binding = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
     let (entered, _) = tokio::sync::mpsc::channel(1);
-    binding.serve_at(endpoint().path, BlockingCallback {
-        entered,
-        release: Arc::new(tokio::sync::Semaphore::new(0)),
-        published: Arc::new(AtomicUsize::new(0)),
-        guard: binding.guard(),
-    }).await.unwrap();
-    let mut load = Some(Box::pin(host.load_file_with_host_callbacks(&artifact, config, &binding)));
+    binding
+        .serve_at(
+            endpoint().path,
+            BlockingCallback {
+                entered,
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+                published: Arc::new(AtomicUsize::new(0)),
+                guard: binding.guard(),
+            },
+        )
+        .await
+        .unwrap();
+    let mut load = Some(Box::pin(
+        host.load_file_with_host_callbacks(&artifact, config, &binding),
+    ));
     std::future::poll_fn(|cx| {
-        assert!(load.as_mut().unwrap().as_mut().poll(cx).is_pending(), "loader awaits real C init");
+        assert!(
+            load.as_mut().unwrap().as_mut().poll(cx).is_pending(),
+            "loader awaits real C init"
+        );
         std::task::Poll::Ready(())
-    }).await;
-    tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified()).await.unwrap();
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified())
+        .await
+        .unwrap();
     let transport = host.inner.loaded.lock().unwrap()[0].transport.clone();
     let view = barrier.state.lock().unwrap().0.unwrap();
     barrier.state.lock().unwrap().1 = true;
@@ -592,15 +606,24 @@ async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: 
     transport.ensure_initialized().await.unwrap();
     // Advance the public future to its real withheld-Ready observation.
     std::future::poll_fn(|cx| {
-        assert!(load.as_mut().unwrap().as_mut().poll(cx).is_pending(), "fixture withholds Ready");
+        assert!(
+            load.as_mut().unwrap().as_mut().poll(cx).is_pending(),
+            "fixture withholds Ready"
+        );
         std::task::Poll::Ready(())
-    }).await;
+    })
+    .await;
     let (finish, receive) = std::sync::mpsc::channel();
     *barrier.finish_gate.lock().unwrap() = Some(receive);
     let stopping = transport.clone();
     let stop = tokio::spawn(async move { stopping.stop(Duration::from_secs(2)).await });
-    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified()).await.unwrap();
-    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 2);
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        2
+    );
     let load_result = if reject_gate {
         transport.release_initialization(false);
         drop(load.take());
@@ -610,12 +633,11 @@ async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: 
         None
     } else {
         // Real not-ready branch awaits close, whose native return is held.
-        std::future::poll_fn(|cx| {
-            match load.as_mut().unwrap().as_mut().poll(cx) {
-                std::task::Poll::Pending => std::task::Poll::Ready(None),
-                std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
-            }
-        }).await
+        std::future::poll_fn(|cx| match load.as_mut().unwrap().as_mut().poll(cx) {
+            std::task::Poll::Pending => std::task::Poll::Ready(None),
+            std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
+        })
+        .await
     };
     let held_flags = unsafe { view.native_terminal_state.unwrap()(view.host_ctx) };
     let held_fault = transport.is_faulted();
@@ -629,7 +651,10 @@ async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: 
     }
     assert_eq!(held_flags, 2, "ordinary cancellation cannot invent Fault");
     assert!(!held_fault);
-    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 10);
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        10
+    );
     assert!(barrier.state.lock().unwrap().2);
 }
 
@@ -652,12 +677,18 @@ async fn actual_native_callback_gate_rejection_after_ordinary_stop_preserves_cau
 async fn served_native_binding(host: &ModuleHost) -> HostCallbackBinding {
     let binding = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
     let (entered, _) = tokio::sync::mpsc::channel(1);
-    binding.serve_at(endpoint().path, BlockingCallback {
-        entered,
-        release: Arc::new(tokio::sync::Semaphore::new(0)),
-        published: Arc::new(AtomicUsize::new(0)),
-        guard: binding.guard(),
-    }).await.unwrap();
+    binding
+        .serve_at(
+            endpoint().path,
+            BlockingCallback {
+                entered,
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+                published: Arc::new(AtomicUsize::new(0)),
+                guard: binding.guard(),
+            },
+        )
+        .await
+        .unwrap();
     binding
 }
 
@@ -667,8 +698,8 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
     let mut config = native_fixture_json(&unused);
     config["test_ready"] = serde_json::json!(ready);
     drop(unused);
-    let artifact = std::path::PathBuf::from(
-        std::env::var_os("TINYBUS_TEST_CONTROLLED_INIT_MODULE").unwrap());
+    let artifact =
+        std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_CONTROLLED_INIT_MODULE").unwrap());
     let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
     let (_dir, artifact) = super::super::tests::staged_module(&artifact, &hash);
     let host = Arc::new(ModuleHost::new(Broker::new()));
@@ -679,27 +710,38 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
     let loading_host = host.clone();
     let loading_binding = binding.clone();
     let load = tokio::spawn(async move {
-        loading_host.load_file_with_host_callbacks(artifact, config, &loading_binding).await
+        loading_host
+            .load_file_with_host_callbacks(artifact, config, &loading_binding)
+            .await
     });
     // Keep the paused runtime runnable until actual C entry/publication. This
     // prevents virtual time from auto-advancing the initializer's deadline.
-    while barrier.state.lock().unwrap().0.is_none() { tokio::task::yield_now().await; }
+    while barrier.state.lock().unwrap().0.is_none() {
+        tokio::task::yield_now().await;
+    }
     let transport = host.inner.loaded.lock().unwrap()[0].transport.clone();
     let view = barrier.state.lock().unwrap().0.unwrap();
     barrier.state.lock().unwrap().1 = true;
     barrier.changed.notify_all();
     // Poll until native initialization is genuinely published, without an idle
     // paused timer deciding the deadline before the native owner can run.
-    while !transport.init_started() { tokio::task::yield_now().await; }
+    while !transport.init_started() {
+        tokio::task::yield_now().await;
+    }
     // init_started precedes actual publication; the observer result is the proof.
     let initialized = transport.ensure_initialized();
     tokio::pin!(initialized);
-    std::future::poll_fn(|cx| {
-        match std::future::Future::poll(initialized.as_mut(), cx) {
+    std::future::poll_fn(
+        |cx| match std::future::Future::poll(initialized.as_mut(), cx) {
             std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
-            std::task::Poll::Pending => { cx.waker().wake_by_ref(); std::task::Poll::Pending }
-        }
-    }).await.unwrap();
+            std::task::Poll::Pending => {
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        },
+    )
+    .await
+    .unwrap();
     if !ready {
         // Real wait_ready deadline, not a fake readiness flag. Let the public
         // future install its timer before advancing past the actual bound.
@@ -712,11 +754,21 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
     *barrier.finish_gate.lock().unwrap() = Some(receive);
     let stopping = transport.clone();
     let stop = tokio::spawn(async move { stopping.stop(Duration::from_secs(2)).await });
-    while !barrier.state.lock().unwrap().2 { tokio::task::yield_now().await; }
-    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 2);
+    while !barrier.state.lock().unwrap().2 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        2
+    );
     if native_fault {
-        unsafe { (view.fault)(view.host_ctx, std::ptr::null(), 0); }
-        assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 6);
+        unsafe {
+            (view.fault)(view.host_ctx, std::ptr::null(), 0);
+        }
+        assert_eq!(
+            unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+            6
+        );
     }
     resume.send(()).unwrap();
     // Rollback revokes before awaiting physical close or returning failure.
@@ -726,13 +778,17 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
     let held = unsafe { view.native_terminal_state.unwrap()(view.host_ctx) };
     finish.send(()).unwrap();
     // Keep virtual time runnable through the actual opaque return.
-    while !stop.is_finished() { tokio::task::yield_now().await; }
+    while !stop.is_finished() {
+        tokio::task::yield_now().await;
+    }
     let stopped = stop.await.unwrap();
     assert!(stopped.is_ok(), "actual stop: {stopped:?}");
     assert!(load.await.unwrap().is_err());
     assert_eq!(held, if ready && !native_fault { 2 } else { 6 });
-    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
-        if ready && !native_fault { 10 } else { 14 });
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        if ready && !native_fault { 10 } else { 14 }
+    );
     assert_eq!(transport.is_faulted(), !ready || native_fault);
 }
 
@@ -750,4 +806,73 @@ async fn actual_native_readiness_deadline_still_faults_after_ordinary_stop() {
 #[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
 async fn actual_native_fault_at_ready_commit_dominates_ordinary_stop() {
     native_callback_decision_race(true, true).await;
+}
+
+async fn native_callback_setup_failure_race(panic_setup: bool) {
+    use super::super::super::transport::tests::{native_fixture, native_fixture_json};
+    let (unused, _, _, barrier) = native_fixture();
+    let config = native_fixture_json(&unused);
+    drop(unused);
+    let artifact =
+        std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_CONTROLLED_INIT_MODULE").unwrap());
+    let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
+    let (_dir, artifact) = super::super::tests::staged_module(&artifact, &hash);
+    let host = Arc::new(ModuleHost::new(Broker::new()));
+    let binding = Arc::new(served_native_binding(&host).await);
+    let attached = Arc::new(Notify::new());
+    let seen = attached.clone();
+    let (resume, release) = std::sync::mpsc::channel();
+    *binding.after_attach.lock().unwrap() = Some(Box::new(move || {
+        seen.notify_one();
+        release.recv().unwrap();
+        assert!(
+            !panic_setup,
+            "actual Rust unwind during host callback setup"
+        );
+    }));
+    let loading_host = host.clone();
+    let loading_binding = binding.clone();
+    let load = tokio::spawn(async move {
+        loading_host
+            .load_file_with_host_callbacks(artifact, config, &loading_binding)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), attached.notified())
+        .await
+        .unwrap();
+    let transport = host.inner.loaded.lock().unwrap()[0].transport.clone();
+    // Actual ordinary lifecycle ownership, before the callback initialization
+    // gate opens. This instance proves C never entered, rather than any join.
+    let _ = transport.clone().stop(Duration::from_secs(2)).await;
+    assert!(!transport.is_faulted());
+    if !panic_setup {
+        // Public revocation makes real setup return its concurrently-used error.
+        binding.revoke();
+    }
+    resume.send(()).unwrap();
+    let result = load.await;
+    if panic_setup {
+        assert!(result.unwrap_err().is_panic());
+    } else {
+        assert!(result.unwrap().is_err());
+    }
+    assert!(
+        transport.is_faulted(),
+        "genuine setup failure upgrades ordinary stop"
+    );
+    assert!(
+        barrier.state.lock().unwrap().0.is_none(),
+        "C initializer never entered"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_callback_setup_error_still_faults_after_ordinary_stop() {
+    native_callback_setup_failure_race(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_callback_setup_unwind_still_faults_after_ordinary_stop() {
+    native_callback_setup_failure_race(true).await;
 }
