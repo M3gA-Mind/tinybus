@@ -138,3 +138,7 @@ impl tracing::Subscriber for LiveSubscriber {
         self.inner.exit(span);
     }
 }
+
+#[cfg(test)]
+#[path = "execution_context_tests.rs"]
+mod tests;
