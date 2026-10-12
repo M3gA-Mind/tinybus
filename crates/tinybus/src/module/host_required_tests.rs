@@ -208,7 +208,7 @@ async fn a_real_required_artifact_is_refused_then_admitted_and_serves_confidenti
             vec![
                 RequiredInterface::new(
                     InterfaceName::new(address.as_str()).unwrap(),
-                    VersionRange::new(Version::new(1, 0, 0), Some(Version::new(2, 0, 0))),
+                    VersionRange::new(Version::new(0, 1, 0), Some(Version::new(0, 2, 0))),
                     vec![MemberName::new(method).unwrap()],
                 )
                 .unwrap(),
