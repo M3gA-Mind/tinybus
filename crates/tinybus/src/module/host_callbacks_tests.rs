@@ -578,9 +578,9 @@ async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: 
         published: Arc::new(AtomicUsize::new(0)),
         guard: binding.guard(),
     }).await.unwrap();
-    let mut load = Box::pin(host.load_file_with_host_callbacks(&artifact, config, &binding));
+    let mut load = Some(Box::pin(host.load_file_with_host_callbacks(&artifact, config, &binding)));
     std::future::poll_fn(|cx| {
-        assert!(load.as_mut().poll(cx).is_pending(), "loader awaits real C init");
+        assert!(load.as_mut().unwrap().as_mut().poll(cx).is_pending(), "loader awaits real C init");
         std::task::Poll::Ready(())
     }).await;
     tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified()).await.unwrap();
@@ -591,7 +591,7 @@ async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: 
     transport.ensure_initialized().await.unwrap();
     // Advance the public future to its real withheld-Ready observation.
     std::future::poll_fn(|cx| {
-        assert!(load.as_mut().poll(cx).is_pending(), "fixture withholds Ready");
+        assert!(load.as_mut().unwrap().as_mut().poll(cx).is_pending(), "fixture withholds Ready");
         std::task::Poll::Ready(())
     }).await;
     let (finish, receive) = std::sync::mpsc::channel();
@@ -602,15 +602,15 @@ async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: 
     assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 2);
     let load_result = if reject_gate {
         transport.release_initialization(false);
-        drop(load);
+        drop(load.take());
         None
     } else if drop_load {
-        drop(load);
+        drop(load.take());
         None
     } else {
         // Real not-ready branch awaits close, whose native return is held.
         std::future::poll_fn(|cx| {
-            match load.as_mut().poll(cx) {
+            match load.as_mut().unwrap().as_mut().poll(cx) {
                 std::task::Poll::Pending => std::task::Poll::Ready(None),
                 std::task::Poll::Ready(result) => std::task::Poll::Ready(Some(result)),
             }
@@ -620,7 +620,12 @@ async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: 
     let held_fault = transport.is_faulted();
     finish.send(()).unwrap(); // Always release opaque C before RED assertions.
     assert!(stop.await.unwrap().is_ok());
-    if let Some(result) = load_result { assert!(result.is_err()); }
+    if let Some(result) = load_result {
+        assert!(result.is_err());
+        drop(load.take());
+    } else if let Some(load) = load {
+        assert!(load.await.is_err());
+    }
     assert_eq!(held_flags, 2, "ordinary cancellation cannot invent Fault");
     assert!(!held_fault);
     assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 10);
