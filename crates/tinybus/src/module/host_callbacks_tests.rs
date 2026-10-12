@@ -55,9 +55,9 @@ fn directed_signals_target_only_the_live_bound_module_and_declared_member() {
     let capability = state(module_peer.clone(), binding_peer.clone());
     router.add_host_callbacks(capability.clone()).unwrap();
 
-    let path = "/callback".parse().unwrap();
-    let interface = "org.example.Callback".parse().unwrap();
-    let member = "WatchChanged".parse().unwrap();
+    let path: crate::ObjectPath = "/callback".parse().unwrap();
+    let interface: crate::InterfaceName = "org.example.Callback".parse().unwrap();
+    let member: crate::MemberName = "WatchChanged".parse().unwrap();
     let mut message = Message::directed_signal(
         module_peer.clone(),
         path.clone(),
