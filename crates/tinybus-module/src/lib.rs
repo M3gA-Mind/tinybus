@@ -1336,6 +1336,7 @@ unsafe extern "C" fn terminal_deliver(ctx: *mut c_void, ptr: *const u8, len: usi
     let Some(state) = terminal::TerminalState::lookup(ctx) else {
         return TB_CLOSED;
     };
+    let _scope = state.owner.as_ref().map(ExecutionOwner::enter);
     if !state.is_live() {
         return TB_CLOSED;
     }

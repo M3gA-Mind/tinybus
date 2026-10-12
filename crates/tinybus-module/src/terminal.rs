@@ -618,19 +618,19 @@ impl TerminalState {
         // spend the controller's still-uninvoked physical finish callback.
         let execution_settled = self.settle_execution();
         let retirement_failed = self.lock().retirement_failed;
-        let setup_settled = if execution_settled && !retirement_failed {
+        let disposal_failed = if execution_settled && !retirement_failed {
             match catch_unwind(AssertUnwindSafe(|| self.dispose_setup())) {
-                Ok(()) => true,
+                Ok(()) => false,
                 Err(payload) => {
                     self.source_panic(PayloadKind::Cleanup, payload);
-                    false
+                    true
                 }
             }
         } else {
-            execution_settled
+            retirement_failed
         };
         let finish = self.lock().finish.take();
-        let completed = if setup_settled {
+        let completed = if execution_settled {
             if let Some(owner) = &self.owner {
                 owner.stop();
             }
@@ -644,11 +644,11 @@ impl TerminalState {
                 }
             }
         } else {
-            // If setup destruction could not be proved, keep the original uninvoked finish owner.
+            // If actual task settlement could not be proved, retain the original finish owner.
             self.lock().finish = finish;
             TerminalCompletion::Uncertain
         };
-        let released = if completed == TerminalCompletion::PhysicallyStopped && !retirement_failed {
+        let released = if completed == TerminalCompletion::PhysicallyStopped && !disposal_failed {
             match catch_unwind(AssertUnwindSafe(|| self.release_resources())) {
                 Ok(released) => released,
                 Err(payload) => {
