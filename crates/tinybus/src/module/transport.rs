@@ -67,6 +67,8 @@ pub(crate) struct ModuleTransport {
     callbacks: CallbackGate,
     initialization_gate: StdMutex<Option<bool>>,
     initialization_gate_changed: Notify,
+    #[cfg(test)]
+    reject_worker_spawn: AtomicBool,
 }
 
 // Reservations cover physical callback execution, including signals. They are
@@ -234,6 +236,8 @@ impl ModuleTransport {
             callbacks: CallbackGate::default(),
             initialization_gate: StdMutex::new(Some(true)),
             initialization_gate_changed: Notify::new(),
+            #[cfg(test)]
+            reject_worker_spawn: AtomicBool::new(false),
         });
         *context.owner.lock().expect("physical owner lock") = Arc::downgrade(&transport);
         let config = context.config.lock().expect("module config lock");
@@ -450,9 +454,19 @@ impl ModuleTransport {
 
     fn submit_job(job: Arc<PhysicalJob>) {
         let submitted = job.clone();
-        if std::thread::Builder::new().name("tinybus-physical".into())
-            .spawn(move || submitted.run()).is_err()
-        {
+        #[cfg(test)]
+        let rejected = job.transport.reject_worker_spawn.load(Ordering::Acquire);
+        #[cfg(not(test))]
+        let rejected = false;
+        let spawn = if rejected {
+            // Model Builder rejecting and dropping the submitted closure: only
+            // the independent context anchor can preserve its physical owner.
+            drop(submitted);
+            Err(std::io::Error::other("controlled worker rejection"))
+        } else {
+            std::thread::Builder::new().name("tinybus-physical".into()).spawn(move || submitted.run())
+        };
+        if spawn.is_err() {
             let transport = &job.transport;
             transport.commit_terminal(true);
             let mut state = transport.context.physical.lock().expect("physical state lock");
@@ -518,7 +532,15 @@ impl ModuleTransport {
             let mut state = self.context.physical.lock().expect("physical state lock");
             state.init = if result.is_ok() { InitState::ExternalValid } else { InitState::PublishedRejected };
             state.result = Some(if result.is_ok() { Ok(()) } else { Err(InitFailure::Failed("module returned an invalid vtable".into())) });
-            if result.is_err() { state.cleanup = CleanupState::Uncertain; }
+            if result.is_err() {
+                state.cleanup = CleanupState::Uncertain;
+                if state.job.is_none() {
+                    state.job = self.self_ref.upgrade().map(|transport| Arc::new(PhysicalJob {
+                        transport, initializer: StdMutex::new(None), guard: StdMutex::new(None),
+                        deadline: MODULE_INIT_DEADLINE,
+                    }));
+                }
+            }
         }
         self.notify_physical();
         drop(guard);
