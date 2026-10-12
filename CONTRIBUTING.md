@@ -8,3 +8,10 @@ changes.
 
 TinyBus follows the shared module CI and release contract maintained in
 [tinyhumansai/.github](https://github.com/tinyhumansai/.github/blob/main/docs/module-ci-contract.md).
+
+## Releasing
+
+Merge version changes through a PR, then push a vX.Y.Z tag at the merged commit,
+or dispatch Release with an existing tag. TinyBus is the loader SDK, not a
+loadable module, so its shared SDK release publishes source and checksum.toml.
+Its required CI still exercises real module fixtures on Linux, macOS and Windows.
