@@ -720,32 +720,33 @@ async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: 
     let mut load = Some(Box::pin(
         host.load_file_with_host_callbacks(&artifact, config, &binding),
     ));
-    std::future::poll_fn(|cx| {
-        assert!(
-            load.as_mut().unwrap().as_mut().poll(cx).is_pending(),
-            "loader awaits real C init"
-        );
-        std::task::Poll::Ready(())
-    })
-    .await;
-    tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified())
-        .await
-        .unwrap();
+    let first =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(load.as_mut().unwrap().as_mut().poll(cx)))
+            .await;
+    if let std::task::Poll::Ready(completion) = first {
+        cleanup.release();
+        drop(completion);
+        drop(load.take()); // already completed, no pending owner is discarded
+        panic!("native fixture completed before C entry");
+    }
+    let entered = tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified()).await;
+    if entered.is_err() {
+        cleanup.release();
+        let completion = load.take().unwrap().await;
+        drop(completion);
+        panic!("native fixture entry watchdog expired; loader completion consumed");
+    }
     let transport = host.inner.loaded.lock().unwrap()[0].transport.clone();
     cleanup.transport = Some(transport.clone());
     let view = barrier.state.lock().unwrap().0.unwrap();
     barrier.state.lock().unwrap().1 = true;
     barrier.changed.notify_all();
-    transport.ensure_initialized().await.unwrap();
+    let initialized = transport.ensure_initialized().await;
     // Advance the public future to its real withheld-Ready observation.
-    std::future::poll_fn(|cx| {
-        assert!(
-            load.as_mut().unwrap().as_mut().poll(cx).is_pending(),
-            "fixture withholds Ready"
-        );
-        std::task::Poll::Ready(())
-    })
-    .await;
+    let withheld =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(load.as_mut().unwrap().as_mut().poll(cx)))
+            .await;
+    let was_withheld = withheld.is_pending();
     let (finish, receive) = std::sync::mpsc::channel();
     *barrier.finish_gate.lock().unwrap() = Some(receive);
     cleanup.finish = Some(finish);
@@ -755,7 +756,9 @@ async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: 
         .await
         .unwrap();
     let stopped_flags = unsafe { view.native_terminal_state.unwrap()(view.host_ctx) };
-    let load_result = if reject_gate {
+    let load_result = if let std::task::Poll::Ready(result) = withheld {
+        Some(result)
+    } else if reject_gate {
         transport.release_initialization(false);
         drop(load.take());
         None
@@ -783,6 +786,8 @@ async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: 
         None
     };
     cleanup.transport = None;
+    assert!(initialized.is_ok());
+    assert!(was_withheld, "fixture withholds Ready");
     assert!(stopped.unwrap().is_ok());
     if let Some(result) = loaded {
         assert!(result.is_err());
@@ -874,17 +879,17 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
     // init_started precedes actual publication; the observer result is the proof.
     let initialized = transport.ensure_initialized();
     tokio::pin!(initialized);
-    std::future::poll_fn(
-        |cx| match std::future::Future::poll(initialized.as_mut(), cx) {
-            std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
-            std::task::Poll::Pending => {
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }
-        },
-    )
-    .await
-    .unwrap();
+    let initialization =
+        std::future::poll_fn(
+            |cx| match std::future::Future::poll(initialized.as_mut(), cx) {
+                std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
+                std::task::Poll::Pending => {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            },
+        )
+        .await;
     if !ready {
         // Real wait_ready deadline, not a fake readiness flag. Let the public
         // future install its timer before advancing past the actual bound.
@@ -923,6 +928,7 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
     let stopped = stop.await;
     let loaded = load.await;
     cleanup.transport = None;
+    assert!(initialization.is_ok());
     assert!(resumed.is_ok());
     assert!(stopped.unwrap().is_ok());
     assert!(loaded.unwrap().is_err());
