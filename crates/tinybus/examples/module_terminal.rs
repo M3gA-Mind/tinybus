@@ -48,6 +48,15 @@ struct Controller {
     worker: Mutex<Option<std::thread::JoinHandle<bool>>>,
 }
 impl Controller {
+    fn observe(&self, event: u32) {
+        #[cfg(feature = "__native-fixture-support")]
+        self.emit(event, u32::from(self.view.__fixture_owner_is_current())
+            | (u32::from(self.view.__fixture_owner_is_stopped()) << 1)
+            | (u32::from(self.view.__fixture_request_done()) << 2)
+            | (u32::from(self.view.__fixture_sdk_owners() != 0) << 3));
+        #[cfg(not(feature = "__native-fixture-support"))]
+        let _ = event;
+    }
     fn emit(&self, event: u32, value: u32) {
         let controls = *self
             .controls
@@ -60,6 +69,7 @@ impl Controller {
 }
 impl Drop for Controller {
     fn drop(&mut self) {
+        self.observe(15);
         self.emit(
             6,
             u32::from(std::thread::current().name() == Some("tinybus-terminal")),
@@ -77,6 +87,7 @@ impl Future for SetupFuture {
     fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<()>> {
         if self.first {
             self.first = false;
+            self.controller.observe(11);
             self.controller.emit(2, u32::from(self.mode));
         }
         match self.mode {
@@ -89,6 +100,7 @@ impl Future for SetupFuture {
 }
 impl Drop for SetupFuture {
     fn drop(&mut self) {
+        self.controller.observe(14);
         self.controller.emit(
             4,
             u32::from(std::thread::current().name() == Some("tinybus-terminal")),
@@ -124,11 +136,19 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
         wake: (Mutex::new(false), Condvar::new()),
         worker: Mutex::new(None),
     });
+    controller.observe(10);
+    #[cfg(feature = "__native-fixture-support")]
+    match factory_mode {
+        20 => controller.view.__fixture_reject_worker_spawn(),
+        21..=28 => controller.view.__fixture_reject_startup((factory_mode - 20) as u8),
+        _ => {}
+    }
     if held_finish {
         controller.view.request_fault();
     }
     let (request, finish) = (controller.clone(), controller.clone());
     let setup = move |_: Connection, config: Config| {
+        controller.observe(16);
         if config.test_controls.len() != size_of::<Controls>() {
             return Box::pin(async { Err(tinybus::Error::failed("bad test controls")) })
                 as Pin<Box<dyn Future<Output = Result<()>> + Send>>;
@@ -188,6 +208,7 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
     };
     let hooks = RuntimeHooks::new(
         move |_| {
+            request.observe(12);
             *request
                 .wake
                 .0
@@ -200,6 +221,7 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
             }
         },
         move || {
+            finish.observe(13);
             if held_finish {
                 finish.emit(8, 0);
             }

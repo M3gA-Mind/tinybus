@@ -48,6 +48,8 @@ toml = { version = "1", optional = true }
 libc = { version = "0.2", optional = true }
 
 [features]
+# Explicit private native lifecycle fixture cohort; never part of defaults.
+__native-fixture-support = ["tinybus-module/__native-fixture-support"]
 # `uds` and `macros` are on by default because a bus you cannot connect to over
 # a socket, and an interface you have to hand-dispatch, are not what anyone is
 # installing. The CLI is opt-in: embedding the library should not pull in
