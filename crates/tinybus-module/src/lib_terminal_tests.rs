@@ -2244,3 +2244,171 @@ async fn compiled_native_retained_views_bound_256_and_release_only_at_actual_las
     assert_eq!(stale, Some(TB_CLOSED));
     assert_eq!(released_rest, 256);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a fresh-process privately pinned __native-fixture-support eight-artifact cohort"]
+async fn compiled_native_spawn_rejection_retains_received_runtime_task_and_original_finish() {
+    let path = std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_TERMINAL_MODULE").unwrap());
+    // Keep the library loaded while resolving its fixture controls.
+    let warm = native_fixture_host();
+    let (sender, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
+    let sender = Box::into_raw(Box::new(sender));
+    let controls = NativeControls {
+        ctx: sender.cast(),
+        event: native_event,
+    };
+    warm.load_file_with_config(&path, native_controls_config(0, &controls))
+        .unwrap();
+    let configure: unsafe extern "C" fn(
+        usize,
+        *mut c_void,
+        unsafe extern "C" fn(*mut c_void, u32, u32),
+    ) = unsafe { native_fixture_symbol(&path, c"terminal_test_factory_mode") };
+    let resources: extern "C" fn() -> u32 =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_resources") };
+    let join: extern "C" fn() -> bool =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_external_join") };
+    let (_, _, _, _, flags) = unsafe { terminal_fixture_symbols(&path) };
+    warm.shutdown(Duration::from_secs(5)).await;
+    while !matches!(receiver.recv_timeout(Duration::from_secs(5)), Ok((6, _))) {}
+    // The following control context is deliberately retained with the uncertain
+    // original SDK owner. The warm context is independent.
+    let (sender, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
+    let sender = Box::into_raw(Box::new(sender));
+    let controls = NativeControls {
+        ctx: sender.cast(),
+        event: native_event,
+    };
+    unsafe {
+        configure(20, sender.cast(), native_event);
+    }
+    let host = native_fixture_host();
+    host.load_file_with_config(&path, native_controls_config(1, &controls))
+        .unwrap();
+    let mut seen = Vec::new();
+    loop {
+        let event = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        seen.push(event);
+        if event.0 == 2 {
+            break;
+        }
+    }
+    host.shutdown(Duration::from_millis(30)).await;
+    // Physical spawn failed. Only this fixture cleanup joins its independently
+    // received controller; original finish and SDK settlement never run.
+    let externally_joined = join();
+    let held = resources();
+    host.shutdown(Duration::from_millis(30)).await;
+    drop(host);
+    let after = resources();
+    seen.extend(receiver.try_iter());
+    assert!(externally_joined);
+    assert_eq!(seen.iter().filter(|event| event.0 == 21).count(), 1);
+    assert_eq!(seen.iter().filter(|event| event.0 == 3).count(), 1);
+    assert!(!seen.iter().any(|event| matches!(event.0, 4 | 5 | 6 | 20)));
+    // Actual retained F, Runtime, transport, reinit callback, sole initial
+    // JoinHandle and already-polled owned future. No timeout/refund inference.
+    let expected = 1 | 8 | 16 | 32 | 64 | 256;
+    assert_eq!(held & expected, expected);
+    assert_eq!(after & expected, expected);
+    assert_ne!(flags() & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
+    assert_eq!(
+        flags() & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a fresh-process privately pinned __native-fixture-support eight-artifact cohort"]
+async fn compiled_native_startup_transfers_and_runtime_build_error_dispose_on_physical_worker() {
+    let path = std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_TERMINAL_MODULE").unwrap());
+    let warm = native_fixture_host();
+    let (sender, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
+    let sender = Box::into_raw(Box::new(sender));
+    let controls = NativeControls {
+        ctx: sender.cast(),
+        event: native_event,
+    };
+    warm.load_file_with_config(&path, native_controls_config(0, &controls))
+        .unwrap();
+    let configure: unsafe extern "C" fn(
+        usize,
+        *mut c_void,
+        unsafe extern "C" fn(*mut c_void, u32, u32),
+    ) = unsafe { native_fixture_symbol(&path, c"terminal_test_factory_mode") };
+    let resources: extern "C" fn() -> u32 =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_resources") };
+    let transport_drop: extern "C" fn() -> bool =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_transport_drop") };
+    let release: extern "C" fn() -> usize =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_release_views") };
+    let (_, _, drops, _, flags) = unsafe { terminal_fixture_symbols(&path) };
+    warm.shutdown(Duration::from_secs(5)).await;
+    while !matches!(receiver.recv_timeout(Duration::from_secs(5)), Ok((6, _))) {}
+    for (stage, expected) in [
+        (1, 129u32),
+        (2, 3),
+        (3, 7),
+        (4, 15),
+        (5, 31),
+        (6, 59),
+        (7, 123),
+        (8, 123),
+        (9, 7),
+    ] {
+        let (sender, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
+        let sender = Box::into_raw(Box::new(sender));
+        let controls = NativeControls {
+            ctx: sender.cast(),
+            event: native_event,
+        };
+        unsafe {
+            configure(20 + stage, sender.cast(), native_event);
+        }
+        let before = drops();
+        let host = native_fixture_host();
+        let result = host.load_file_with_config(&path, native_controls_config(1, &controls));
+        let mut seen = Vec::new();
+        // Both real F and SDK-owned C destruction plus controller last Drop
+        // settle before assertions. No task has entered trusted F at stages7/8.
+        while ![6, 19, 20]
+            .iter()
+            .all(|kind| seen.iter().any(|event: &(u32, u32)| event.0 == *kind))
+        {
+            seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while drops() == before || resources() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let dropped_transport = transport_drop();
+        host.shutdown(Duration::from_secs(5)).await;
+        drop(host);
+        let native = flags();
+        release();
+        seen.extend(receiver.try_iter());
+        unsafe {
+            drop(Box::from_raw(sender));
+        }
+        assert!(result.is_err(), "stage {stage}");
+        assert!(
+            seen.contains(&(22, expected)),
+            "received stage {stage}: {seen:?}"
+        );
+        assert_eq!(seen.iter().filter(|event| event.0 == 3).count(), 1);
+        assert_eq!(seen.iter().filter(|event| **event == (5, 1)).count(), 1);
+        assert!(seen.contains(&(6, 1)));
+        assert!(seen.contains(&(19, 1)));
+        assert!(seen.contains(&(20, 1)));
+        assert!(!seen.iter().any(|event| event.0 == 2));
+        assert_eq!(dropped_transport, (5..=8).contains(&stage), "stage {stage}");
+        assert_ne!(native & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
+        assert_eq!(
+            native & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+            0
+        );
+    }
+}
