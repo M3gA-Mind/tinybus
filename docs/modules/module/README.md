@@ -69,13 +69,23 @@ work; a timeout or host shutdown return does not prove it.
 The SDK retains setup futures across cancellation, destroys them on the
 physical cleanup thread, and drops callback captures outside resource locks.
 Reinitialization polls its result before terminal cancellation when both are
-ready. The runtime is destroyed on the physical thread. Surviving SDK resources,
+ready. Repeated successful reinitialization retires its previous future through
+one bounded cell on that same physical worker; the next setup starts only after
+the worker confirms disposal. Callback admission uses bookkeeping exclusion,
+with foreign invocation, request and destruction outside every resource lock.
+The runtime is destroyed on the physical thread. Surviving SDK resources,
 spawn failure, a hook panic, or unproved cleanup keep the owner uncertain and
 anchored. Seven separate primary panic cells retain request, finish, initial
 setup, reinitialize, factory, startup, and cleanup payloads. Native fault and
 request completion precede any payload disposal. After the first cleanup
 destructor panic, later resource owners remain attached rather than being
-destroyed during cleanup unwinding.
+destroyed during cleanup unwinding. Once actual setup execution has settled,
+the controller finish still runs once; retained or panicking SDK teardown keeps
+the result uncertain even if that controller finish succeeds. A counted observer
+retains the entire Connection through its last field and all cloned method
+observers. A destructor unwind explicitly reports native Fault even after
+diagnostic callbacks have been suppressed; a transport count or runtime timeout
+cannot certify whole-Connection destruction.
 
 Each SDK image has 256 instance slots. The existing opaque `module_ctx` contains
 a slot/generation address token, never a dereferenced pointer or extra ABI

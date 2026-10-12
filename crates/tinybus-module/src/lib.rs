@@ -1400,7 +1400,9 @@ unsafe extern "C" fn terminal_reinitialize(ctx: *mut c_void, ptr: *const u8, len
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let outcome = catch_unwind(AssertUnwindSafe(|| {
-        callback.as_ref().map_or(TB_CLOSED, |callback| callback(ptr, len))
+        callback
+            .as_ref()
+            .map_or(TB_CLOSED, |callback| callback(ptr, len))
     }));
     drop(callback); // non-last: cleanup still waits active_reinit
     let code = match outcome {

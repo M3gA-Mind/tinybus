@@ -201,16 +201,14 @@ mod controlled {
             let control = self.fixture.future_drop_control.lock().unwrap().take();
             if let Some((release, panic)) = control {
                 release.wait();
-                if panic { panic!("controlled prior reinit future Drop"); }
+                if panic {
+                    panic!("controlled prior reinit future Drop");
+                }
             }
         }
     }
-    fn factory(
-        view: NativeInstanceLiveness,
-    ) -> Result<(
-        impl Fn(Connection, Config) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
-        RuntimeHooks,
-    )> {
+    type FixtureSetup = Box<dyn Fn(Connection, Config) -> terminal::SetupFuture + Send + Sync>;
+    fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)> {
         let fixture = NEXT.lock().unwrap().take().unwrap();
         *fixture.view.lock().unwrap() = Some(view.clone());
         let (request, finish) = (fixture.clone(), fixture.clone());
@@ -271,7 +269,7 @@ mod controlled {
                 TerminalCompletion::PhysicallyStopped
             },
         );
-        Ok((setup, hooks))
+        Ok((Box::new(setup), hooks))
     }
     module_export_static! {
         terminal_setup_factory = factory, config = Config, worker_threads = 1,
@@ -634,8 +632,8 @@ async fn compiled_native_terminal_owns_initial_cancellation_panics_join_and_stal
         );
     }
     assert_eq!(seen.iter().filter(|event| event.0 == 3).count(), 1);
-    assert!(seen.iter().any(|event| *event == (5, 1)));
-    assert!(seen.iter().any(|event| *event == (6, 1)));
+    assert!(seen.contains(&(5, 1)));
+    assert!(seen.contains(&(6, 1)));
 }
 
 struct HeldNativeControls {
@@ -740,8 +738,14 @@ impl tinybus::Interface for TeardownObject {
     fn name(&self) -> tinybus::InterfaceName {
         "ai.tinyhumans.tinybus.Teardown".parse().unwrap()
     }
-    fn members(&self) -> Vec<tinybus::MemberName> { Vec::new() }
-    async fn call(&self, _: &tinybus::MemberName, _: serde_json::Value) -> Result<serde_json::Value> {
+    fn members(&self) -> Vec<tinybus::MemberName> {
+        Vec::new()
+    }
+    async fn call(
+        &self,
+        _: &tinybus::MemberName,
+        _: serde_json::Value,
+    ) -> Result<serde_json::Value> {
         Ok(serde_json::Value::Null)
     }
 }
@@ -750,7 +754,9 @@ impl Drop for TeardownObject {
         self.entered.send(()).unwrap();
         self.release.wait();
         self.settled.send(()).unwrap();
-        if self.panic { panic!("controlled ObjectTree teardown"); }
+        if self.panic {
+            panic!("controlled ObjectTree teardown");
+        }
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -758,32 +764,65 @@ async fn actual_connection_object_drop_after_runtime_timeout_denies_physical_com
     let _serial = controlled::TEST_LOCK.lock().await;
     let (fixture, events) = controlled::fixture();
     let broker = tinybus::broker::Broker::new();
-    broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+    broker
+        .clone()
+        .spawn(tinybus::transport::memory::MemoryBus::new());
     let host = Arc::new(tinybus::module::ModuleHost::new(broker));
-    host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":0})).unwrap();
+    host.attach_linked_with_config(
+        controlled::linked_module().unwrap(),
+        serde_json::json!({"mode":0}),
+    )
+    .unwrap();
     events.recv_timeout(Duration::from_secs(3)).unwrap();
     let view = fixture.view.lock().unwrap().take().unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (settled_tx, settled_rx) = std::sync::mpsc::channel();
     let release = Arc::new(std::sync::Barrier::new(2));
-    let connection = view.inner.resources.lock().unwrap().connection.lock().unwrap().clone().unwrap();
-    connection.serve_at("/teardown".parse().unwrap(), TeardownObject {
-        entered: entered_tx, release: release.clone(), settled: settled_tx, panic: false,
-    }).await.unwrap();
+    let connection = view
+        .inner
+        .resources
+        .lock()
+        .unwrap()
+        .connection
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap();
+    connection
+        .serve_at(
+            "/teardown".parse().unwrap(),
+            TeardownObject {
+                entered: entered_tx,
+                release: release.clone(),
+                settled: settled_tx,
+                panic: false,
+            },
+        )
+        .await
+        .unwrap();
     drop(connection);
     let stopping_host = host.clone();
-    let stopping = tokio::spawn(async move { stopping_host.shutdown(Duration::from_secs(8)).await; });
+    let stopping = tokio::spawn(async move {
+        stopping_host.shutdown(Duration::from_secs(8)).await;
+    });
     entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     stopping.await.unwrap(); // The SDK's real shutdown_timeout has elapsed.
     let completion = view.inner.wait(Duration::ZERO);
-    let flags = unsafe { (view.inner.host.0.native_terminal_state.unwrap())(view.inner.host.0.host_ctx) };
+    let flags =
+        unsafe { (view.inner.host.0.native_terminal_state.unwrap())(view.inner.host.0.host_ctx) };
     let still_anchored = terminal::TerminalState::lookup(view.inner.context()).is_some();
     // Release and settle actual foreign work before reporting a failed proof.
     release.wait();
     settled_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     assert_eq!(completion, TerminalCompletion::Uncertain);
-    assert_eq!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0);
-    assert!(still_anchored, "blocked whole-Connection teardown cannot refund admission");
+    assert_eq!(
+        flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+        0
+    );
+    assert!(
+        still_anchored,
+        "blocked whole-Connection teardown cannot refund admission"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -791,32 +830,65 @@ async fn actual_connection_object_drop_panic_fences_fault_after_owner_suppressio
     let _serial = controlled::TEST_LOCK.lock().await;
     let (fixture, events) = controlled::fixture();
     let broker = tinybus::broker::Broker::new();
-    broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+    broker
+        .clone()
+        .spawn(tinybus::transport::memory::MemoryBus::new());
     let host = Arc::new(tinybus::module::ModuleHost::new(broker));
-    host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":0})).unwrap();
+    host.attach_linked_with_config(
+        controlled::linked_module().unwrap(),
+        serde_json::json!({"mode":0}),
+    )
+    .unwrap();
     events.recv_timeout(Duration::from_secs(3)).unwrap();
     let view = fixture.view.lock().unwrap().take().unwrap();
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (settled_tx, settled_rx) = std::sync::mpsc::channel();
     let release = Arc::new(std::sync::Barrier::new(2));
-    let connection = view.inner.resources.lock().unwrap().connection.lock().unwrap().clone().unwrap();
-    connection.serve_at("/teardown".parse().unwrap(), TeardownObject {
-        entered: entered_tx, release: release.clone(), settled: settled_tx, panic: true,
-    }).await.unwrap();
+    let connection = view
+        .inner
+        .resources
+        .lock()
+        .unwrap()
+        .connection
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap();
+    connection
+        .serve_at(
+            "/teardown".parse().unwrap(),
+            TeardownObject {
+                entered: entered_tx,
+                release: release.clone(),
+                settled: settled_tx,
+                panic: true,
+            },
+        )
+        .await
+        .unwrap();
     drop(connection);
     let stopping_host = host.clone();
-    let stopping = tokio::spawn(async move { stopping_host.shutdown(Duration::from_secs(8)).await; });
+    let stopping = tokio::spawn(async move {
+        stopping_host.shutdown(Duration::from_secs(8)).await;
+    });
     entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     release.wait();
     settled_rx.recv_timeout(Duration::from_secs(3)).unwrap();
     stopping.await.unwrap(); // Runtime teardown settles the real panicking destructor.
     let completion = view.inner.wait(Duration::ZERO);
-    let flags = unsafe { (view.inner.host.0.native_terminal_state.unwrap())(view.inner.host.0.host_ctx) };
+    let flags =
+        unsafe { (view.inner.host.0.native_terminal_state.unwrap())(view.inner.host.0.host_ctx) };
     let still_anchored = terminal::TerminalState::lookup(view.inner.context()).is_some();
 
     assert_eq!(completion, TerminalCompletion::Uncertain);
-    assert_eq!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0);
-    assert!(still_anchored, "panicking Connection teardown cannot refund admission");
+    assert_eq!(
+        flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+        0
+    );
+    assert!(
+        still_anchored,
+        "panicking Connection teardown cannot refund admission"
+    );
     assert_ne!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
 }
 
@@ -825,24 +897,50 @@ async fn successful_repeated_reinit_disposes_prior_future_on_same_physical_worke
     let _serial = controlled::TEST_LOCK.lock().await;
     let (fixture, events) = controlled::fixture();
     let broker = tinybus::broker::Broker::new();
-    broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+    broker
+        .clone()
+        .spawn(tinybus::transport::memory::MemoryBus::new());
     let host = Arc::new(tinybus::module::ModuleHost::new(broker));
-    host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":0})).unwrap();
+    host.attach_linked_with_config(
+        controlled::linked_module().unwrap(),
+        serde_json::json!({"mode":0}),
+    )
+    .unwrap();
     events.recv_timeout(Duration::from_secs(3)).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
-        while !host.list().iter().any(|info| matches!(info.state, tinybus::module::ModuleState::Ready)) {
+        while !host
+            .list()
+            .iter()
+            .any(|info| matches!(info.state, tinybus::module::ModuleState::Ready))
+        {
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
-    let first = host.reinitialize("tinybus-module", serde_json::json!({"mode":0})).await;
-    let second = host.reinitialize("tinybus-module", serde_json::json!({"mode":0})).await;
+    })
+    .await
+    .unwrap();
+    let first = host
+        .reinitialize("tinybus-module", serde_json::json!({"mode":0}))
+        .await;
+    let second = host
+        .reinitialize("tinybus-module", serde_json::json!({"mode":0}))
+        .await;
     host.shutdown(Duration::from_secs(8)).await;
-    let drops: Vec<_> = events.try_iter().filter_map(|event| {
-        if let controlled::Event::FutureDrop(name) = event { Some(name) } else { None }
-    }).collect();
+    let drops: Vec<_> = events
+        .try_iter()
+        .filter_map(|event| {
+            if let controlled::Event::FutureDrop(name) = event {
+                Some(name)
+            } else {
+                None
+            }
+        })
+        .collect();
     assert!(first.is_ok() && second.is_ok());
     assert_eq!(drops.len(), 3);
-    assert!(drops.iter().all(|name| name == "tinybus-terminal"), "all completed futures must be destroyed by the sole physical worker: {drops:?}");
+    assert!(
+        drops.iter().all(|name| name == "tinybus-terminal"),
+        "all completed futures must be destroyed by the sole physical worker: {drops:?}"
+    );
     assert!(fixture.drop_off_lock.load(Ordering::Acquire));
 }
 
@@ -852,24 +950,46 @@ async fn actual_reinit_source_error_and_panic_request_outside_callback_exclusion
     for mode in [3, 2, 4] {
         let (fixture, events) = controlled::fixture();
         let broker = tinybus::broker::Broker::new();
-        broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+        broker
+            .clone()
+            .spawn(tinybus::transport::memory::MemoryBus::new());
         let host = Arc::new(tinybus::module::ModuleHost::new(broker));
-        host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":0})).unwrap();
+        host.attach_linked_with_config(
+            controlled::linked_module().unwrap(),
+            serde_json::json!({"mode":0}),
+        )
+        .unwrap();
         events.recv_timeout(Duration::from_secs(3)).unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
-            while !host.list().iter().any(|info| matches!(info.state, tinybus::module::ModuleState::Ready)) {
+            while !host
+                .list()
+                .iter()
+                .any(|info| matches!(info.state, tinybus::module::ModuleState::Ready))
+            {
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
-        let result = host.reinitialize("tinybus-module", serde_json::json!({"mode":mode})).await;
+        })
+        .await
+        .unwrap();
+        let result = host
+            .reinitialize("tinybus-module", serde_json::json!({"mode":mode}))
+            .await;
         host.shutdown(Duration::from_secs(8)).await;
         loop {
-            if matches!(events.recv_timeout(Duration::from_secs(5)).unwrap(), controlled::Event::Finish) { break; }
+            if matches!(
+                events.recv_timeout(Duration::from_secs(5)).unwrap(),
+                controlled::Event::Finish
+            ) {
+                break;
+            }
         }
         assert!(result.is_err());
         assert_eq!(fixture.requests.load(Ordering::SeqCst), 1);
         assert_eq!(fixture.joins.load(Ordering::SeqCst), 1);
-        assert!(fixture.request_off_lock.load(Ordering::Acquire), "source fault request held reinitializer mutex in mode {mode}");
+        assert!(
+            fixture.request_off_lock.load(Ordering::Acquire),
+            "source fault request held reinitializer mutex in mode {mode}"
+        );
     }
 }
 
@@ -877,30 +997,55 @@ async fn controlled_prior_reinit_drop(panic: bool) {
     let _serial = controlled::TEST_LOCK.lock().await;
     let (fixture, events) = controlled::fixture();
     let broker = tinybus::broker::Broker::new();
-    broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+    broker
+        .clone()
+        .spawn(tinybus::transport::memory::MemoryBus::new());
     let host = Arc::new(tinybus::module::ModuleHost::new(broker));
-    host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":0})).unwrap();
+    host.attach_linked_with_config(
+        controlled::linked_module().unwrap(),
+        serde_json::json!({"mode":0}),
+    )
+    .unwrap();
     events.recv_timeout(Duration::from_secs(3)).unwrap();
     tokio::time::timeout(Duration::from_secs(3), async {
-        while !host.list().iter().any(|info| matches!(info.state, tinybus::module::ModuleState::Ready)) {
+        while !host
+            .list()
+            .iter()
+            .any(|info| matches!(info.state, tinybus::module::ModuleState::Ready))
+        {
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
-    host.reinitialize("tinybus-module", serde_json::json!({"mode":0})).await.unwrap();
+    })
+    .await
+    .unwrap();
+    host.reinitialize("tinybus-module", serde_json::json!({"mode":0}))
+        .await
+        .unwrap();
     let _ = events.try_iter().count();
     let release = Arc::new(std::sync::Barrier::new(2));
     *fixture.future_drop_control.lock().unwrap() = Some((release.clone(), panic));
     let caller_host = host.clone();
-    let caller = tokio::spawn(async move { caller_host.reinitialize("tinybus-module", serde_json::json!({"mode":0})).await });
+    let caller = tokio::spawn(async move {
+        caller_host
+            .reinitialize("tinybus-module", serde_json::json!({"mode":0}))
+            .await
+    });
     let entered = events.recv_timeout(Duration::from_secs(3)).unwrap();
     let view = fixture.view.lock().unwrap().as_ref().unwrap().clone();
     view.inner.signal(TerminalReason::Stop);
     let not_finished_while_blocked = fixture.joins.load(Ordering::SeqCst) == 0;
-    let no_next_setup = !events.try_iter().any(|event| matches!(event, controlled::Event::Poll(_)));
+    let no_next_setup = !events
+        .try_iter()
+        .any(|event| matches!(event, controlled::Event::Poll(_)));
     release.wait();
     let result = caller.await.unwrap();
     loop {
-        if matches!(events.recv_timeout(Duration::from_secs(5)).unwrap(), controlled::Event::Finish) { break; }
+        if matches!(
+            events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            controlled::Event::Finish
+        ) {
+            break;
+        }
     }
     host.shutdown(Duration::from_secs(8)).await;
     let completion = view.inner.wait(Duration::from_secs(5));
@@ -915,7 +1060,12 @@ async fn controlled_prior_reinit_drop(panic: bool) {
         assert_eq!(completion, TerminalCompletion::Uncertain);
         assert!(view.inner.has_fault());
         assert!(terminal::TerminalState::lookup(view.inner.context()).is_some());
-        assert!(!events.try_iter().any(|event| matches!(event, controlled::Event::FactoryDrop(_))), "remaining foreign captures must stay anchored after first cleanup panic");
+        assert!(
+            !events
+                .try_iter()
+                .any(|event| matches!(event, controlled::Event::FactoryDrop(_))),
+            "remaining foreign captures must stay anchored after first cleanup panic"
+        );
     }
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

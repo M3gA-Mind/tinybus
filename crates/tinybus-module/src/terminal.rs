@@ -519,7 +519,9 @@ impl TerminalState {
         self.changed.notify_all();
     }
     pub fn retire_reinit(self: &Arc<Self>, future: Option<SetupFuture>) -> bool {
-        let Some(future) = future else { return true; };
+        let Some(future) = future else {
+            return true;
+        };
         {
             let mut control = self.lock();
             // active_reinit admits one caller. It cannot construct the next
@@ -531,7 +533,10 @@ impl TerminalState {
         self.changed.notify_all();
         let mut control = self.lock();
         while control.prior_pending && control.finish_state != FinishState::SpawnFailed {
-            control = self.changed.wait(control).unwrap_or_else(std::sync::PoisonError::into_inner);
+            control = self
+                .changed
+                .wait(control)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
         !control.retirement_failed && control.finish_state != FinishState::SpawnFailed
     }
@@ -605,14 +610,22 @@ impl TerminalState {
                 self.changed.notify_all();
                 continue;
             }
-            if control.published && !control.active_reinit && !matches!(
-                control.request_state, RequestState::Idle | RequestState::Running
-            ) {
+            if control.published
+                && !control.active_reinit
+                && !matches!(
+                    control.request_state,
+                    RequestState::Idle | RequestState::Running
+                )
+            {
                 control.finish_state = FinishState::Running;
                 break;
             }
-            drop(self.changed.wait(control).unwrap_or_else(std::sync::PoisonError::into_inner));
-        };
+            drop(
+                self.changed
+                    .wait(control)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+        }
         // Execution settlement is distinct from foreign capture destruction.
         // A failed prior retirement retains all later captures, but does not
         // spend the controller's still-uninvoked physical finish callback.
@@ -720,8 +733,15 @@ impl TerminalState {
         // The worker already observed active_reinit=false. Every last capture
         // is taken mechanically and destroyed after all bookkeeping unlocks.
         let (reinitialize, future, reinit_future) = {
-            let resources = self.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            (resources.reinitialize.clone(), resources.initial_future.clone(), resources.reinit_future.clone())
+            let resources = self
+                .resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                resources.reinitialize.clone(),
+                resources.initial_future.clone(),
+                resources.reinit_future.clone(),
+            )
         };
         if let Some(owner) = &self.owner {
             owner.stop();
