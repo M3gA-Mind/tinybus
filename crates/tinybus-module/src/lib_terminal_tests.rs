@@ -2980,6 +2980,24 @@ async fn compiled_native_nested_factory_reinit_restore_exact_owner_and_suppress_
 async fn compiled_native_first_foreign_cleanup_panic_keeps_later_resources_and_attempts_original_finish()
  {
     let path = std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_TERMINAL_MODULE").unwrap());
+    let warm = native_fixture_host();
+    let (warm_events, warm_receiver) = std::sync::mpsc::channel::<(u32, u32)>();
+    let warm_events = Box::into_raw(Box::new(warm_events));
+    let warm_controls = NativeControls {
+        ctx: warm_events.cast(),
+        event: native_event,
+    };
+    warm.load_file_with_config(&path, native_controls_config(0, &warm_controls))
+        .unwrap();
+    let configure: NativeConfigure =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_factory_mode") };
+    let resources: extern "C" fn() -> u32 =
+        unsafe { native_fixture_symbol(&path, c"terminal_test_resources") };
+    warm.shutdown(Duration::from_secs(5)).await;
+    while !matches!(
+        warm_receiver.recv_timeout(Duration::from_secs(5)),
+        Ok((6, _))
+    ) {}
     let (events, receiver) = std::sync::mpsc::channel();
     // This callback owner deliberately stays retained with the SDK's uncertain
     // untouched later F/Runtime/callback resources after the first Drop failure.
@@ -2992,6 +3010,9 @@ async fn compiled_native_first_foreign_cleanup_panic_keeps_later_resources_and_a
         ctx: barrier.cast(),
         event: native_barrier_event,
     };
+    unsafe {
+        configure(46, barrier.cast(), native_barrier_event);
+    }
     let host = native_fixture_host();
     host.load_file_with_config(&path, native_controls_config(47, &controls))
         .unwrap();
@@ -3015,8 +3036,10 @@ async fn compiled_native_first_foreign_cleanup_panic_keeps_later_resources_and_a
     host.shutdown(Duration::from_millis(30)).await;
     drop(host);
     let after = flags();
+    let held_resources = resources();
     seen.extend(receiver.try_iter());
     assert!(!finished_early);
+    assert_eq!(held_resources & (1 | 8 | 16 | 32), 1 | 8 | 16 | 32);
     assert_eq!(
         before_release & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
         0
