@@ -245,6 +245,7 @@ async fn compiled_native_terminal_owns_initial_cancellation_panics_join_and_stal
     let pins = std::fs::read_to_string(path.parent().unwrap().join("modules.toml")).unwrap();
     assert!(pins.contains(&format!("\"{name}\" = \"{digest}\"")));
     let mut old_context = None;
+    let mut dropped_total = 0;
     for mode in [1u8, 0, 2, 4] {
         let (events, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
         // If a controlled failure cannot prove teardown, conservatively retain
@@ -257,7 +258,7 @@ async fn compiled_native_terminal_owns_initial_cancellation_panics_join_and_stal
         let host = Arc::new(tinybus::module::ModuleHost::new(broker));
         host.load_file_with_config(&path, serde_json::json!({"mode":mode,"test_controls":encoded})).unwrap();
         let (context, old_probe, drops) = unsafe { terminal_fixture_symbols(&path) };
-        let dropped_before = drops();
+        let dropped_before = dropped_total;
         let actual_context = context();
         let first = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
         let stale_result = old_context.map(|token| old_probe(token));
@@ -267,9 +268,10 @@ async fn compiled_native_terminal_owns_initial_cancellation_panics_join_and_stal
         tokio::time::timeout(Duration::from_secs(5), async {
             while drops() == dropped_before { tokio::task::yield_now().await; }
         }).await.unwrap();
+        dropped_total = drops();
         unsafe { drop(Box::from_raw(events)); }
         // All actual controller workers and SDK captures are destroyed before assertions.
-        if let Some(code) = stale_result { assert_eq!(code, TB_CLOSED); }
+        if let Some(code) = stale_result { assert_eq!(code, TB_CLOSED, "retired successful context must not act on replacement mode {mode}"); }
         assert_eq!(seen.iter().filter(|(event, _)| *event == 3).count(), 1);
         assert_eq!(seen.iter().filter(|(event, value)| *event == 5 && *value == 1).count(), 1);
         assert_eq!(seen.iter().filter(|(event, value)| *event == 7 && *value == 1).count(), 1);
@@ -279,7 +281,7 @@ async fn compiled_native_terminal_owns_initial_cancellation_panics_join_and_stal
             let finish = seen.iter().position(|(event, _)| *event == 5).unwrap();
             assert!(drop < finish);
         }
-        old_context = Some(actual_context);
+        if mode == 1 { old_context = Some(actual_context); }
     }
 }
 
