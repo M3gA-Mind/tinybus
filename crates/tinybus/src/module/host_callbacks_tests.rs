@@ -1016,6 +1016,8 @@ enum AttachOutcome {
     Attached,
     LoadSucceeded,
     LoadRefused,
+    LoadConnectionClosed,
+    LoadFailed,
     LoadPanicked,
     LoadCanceled,
     WatchdogExpired,
@@ -1035,7 +1037,9 @@ async fn await_native_attach<T>(
         result = &mut *load => {
             let category = match &result {
                 Ok(Ok(_)) => AttachOutcome::LoadSucceeded,
-                Ok(Err(_)) => AttachOutcome::LoadRefused,
+                Ok(Err(Error::ModuleRefused { .. })) => AttachOutcome::LoadRefused,
+                Ok(Err(Error::ConnectionClosed)) => AttachOutcome::LoadConnectionClosed,
+                Ok(Err(_)) => AttachOutcome::LoadFailed,
                 Err(error) if error.is_cancelled() => AttachOutcome::LoadCanceled,
                 Err(_) => AttachOutcome::LoadPanicked,
             };
@@ -1089,8 +1093,34 @@ async fn setup_attachment_wait_reports_an_early_load_failure() {
     let mut completed = None;
     let outcome = await_native_attach(&attached, &mut load, &mut completed).await;
     let result = completed.unwrap();
-    assert_eq!(outcome, AttachOutcome::LoadRefused);
+    assert_eq!(outcome, AttachOutcome::LoadConnectionClosed);
     assert!(matches!(result, Ok(Err(Error::ConnectionClosed))));
+}
+
+#[tokio::test]
+async fn setup_attachment_wait_preserves_actual_admission_refusal_before_c_entry() {
+    let host = Arc::new(ModuleHost::new(Broker::new()));
+    let binding = Arc::new(served_native_binding(&host).await);
+    let attached = Notify::new();
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("absent-module.so");
+    let mut load = tokio::spawn({
+        let host = host.clone();
+        let binding = binding.clone();
+        async move {
+            host.load_file_with_host_callbacks(missing, serde_json::json!({}), &binding)
+                .await
+        }
+    });
+    let mut completed = None;
+    let outcome = await_native_attach(&attached, &mut load, &mut completed).await;
+    let completion = completed.unwrap();
+    assert_eq!(outcome, AttachOutcome::LoadRefused);
+    assert!(matches!(completion, Ok(Err(Error::ModuleRefused { .. }))));
+    assert!(
+        host.list().is_empty(),
+        "refusal cannot attach or publish Ready"
+    );
 }
 
 #[tokio::test(start_paused = true)]
