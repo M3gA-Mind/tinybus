@@ -12,6 +12,7 @@ static DROPPED: AtomicUsize = AtomicUsize::new(0);
 static EARLY: Mutex<Option<Controls>> = Mutex::new(None);
 static NEXT_FACTORY_MODE: AtomicUsize = AtomicUsize::new(0);
 static FACTORIES: AtomicUsize = AtomicUsize::new(0);
+static EXTERNAL_CONTROLLER: Mutex<Option<std::sync::Weak<Controller>>> = Mutex::new(None);
 static RETAINED_VIEWS: Mutex<Vec<NativeInstanceLiveness>> = Mutex::new(Vec::new());
 #[derive(Clone, Copy)]
 struct NativeQuery {
@@ -104,6 +105,20 @@ impl Drop for Controller {
         DROPPED.fetch_add(1, Ordering::Release);
     }
 }
+struct FactoryCapture(Arc<Controller>);
+impl FactoryCapture {
+    fn controller(&self) -> &Arc<Controller> {
+        &self.0
+    }
+}
+impl Drop for FactoryCapture {
+    fn drop(&mut self) {
+        self.0.emit(
+            20,
+            u32::from(std::thread::current().name() == Some("tinybus-terminal")),
+        );
+    }
+}
 struct SetupFuture {
     controller: Arc<Controller>,
     mode: u8,
@@ -139,7 +154,7 @@ type FixtureSetup = Box<dyn Fn(Connection, Config) -> FixtureFuture + Send + Syn
 fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)> {
     FACTORIES.fetch_add(1, Ordering::AcqRel);
     let factory_mode = NEXT_FACTORY_MODE.swap(0, Ordering::AcqRel);
-    if factory_mode == 3 {
+    if factory_mode == 3 || (20..=29).contains(&factory_mode) {
         RETAINED_VIEWS.lock().unwrap().push(view.clone());
     }
     let early = EARLY
@@ -167,16 +182,21 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
     #[cfg(feature = "__native-fixture-support")]
     match factory_mode {
         20 => controller.view.__fixture_reject_worker_spawn(),
-        21..=28 => controller
+        21..=29 => controller
             .view
             .__fixture_reject_startup((factory_mode - 20) as u8),
         _ => {}
+    }
+    if factory_mode == 20 {
+        *EXTERNAL_CONTROLLER.lock().unwrap() = Some(Arc::downgrade(&controller));
     }
     if held_finish {
         controller.view.request_fault();
     }
     let (request, finish) = (controller.clone(), controller.clone());
+    let capture = FactoryCapture(controller);
     let setup = move |_: Connection, config: Config| {
+        let controller = capture.controller();
         controller.observe(16);
         if config.test_controls.len() != size_of::<Controls>() {
             return Box::pin(async { Err(tinybus::Error::failed("bad test controls")) })
@@ -240,6 +260,8 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
     let hooks = RuntimeHooks::new(
         move |_| {
             request.observe(12);
+            #[cfg(feature = "__native-fixture-support")]
+            request.emit(22, request.view.__fixture_resources());
             *request
                 .wake
                 .0
@@ -458,4 +480,47 @@ pub extern "C" fn terminal_test_release_one_view() -> bool {
     let released = view.is_some();
     drop(view);
     released
+}
+
+/// Observes resources of the last genuinely escaped factory view.
+#[unsafe(no_mangle)]
+pub extern "C" fn terminal_test_resources() -> u32 {
+    #[cfg(feature = "__native-fixture-support")]
+    {
+        let view = RETAINED_VIEWS.lock().unwrap().last().cloned();
+        view.map_or(0, |view| view.__fixture_resources())
+    }
+    #[cfg(not(feature = "__native-fixture-support"))]
+    {
+        0
+    }
+}
+/// Observes actual received transport disposal, independently of finish.
+#[unsafe(no_mangle)]
+pub extern "C" fn terminal_test_transport_drop() -> bool {
+    #[cfg(feature = "__native-fixture-support")]
+    {
+        let view = RETAINED_VIEWS.lock().unwrap().last().cloned();
+        view.is_some_and(|view| view.__fixture_transport_dropped_on_physical_worker())
+    }
+    #[cfg(not(feature = "__native-fixture-support"))]
+    {
+        false
+    }
+}
+/// Explicit fixture cleanup after SDK spawn rejection; never claims SDK finish.
+#[unsafe(no_mangle)]
+pub extern "C" fn terminal_test_external_join() -> bool {
+    let controller = EXTERNAL_CONTROLLER
+        .lock()
+        .unwrap()
+        .take()
+        .and_then(|weak| weak.upgrade());
+    let Some(controller) = controller else {
+        return false;
+    };
+    let worker = controller.worker.lock().unwrap().take();
+    let joined = worker.is_some_and(|worker| worker.join().unwrap_or(false));
+    controller.emit(21, u32::from(joined));
+    joined
 }

@@ -93,6 +93,16 @@ impl NativeInstanceLiveness {
     pub fn __fixture_reject_startup(&self, stage: u8) {
         self.inner.reject_startup_for_test(stage);
     }
+    #[doc(hidden)]
+    #[cfg(feature = "__native-fixture-support")]
+    pub fn __fixture_resources(&self) -> u32 {
+        self.inner.resources_for_fixture()
+    }
+    #[doc(hidden)]
+    #[cfg(feature = "__native-fixture-support")]
+    pub fn __fixture_transport_dropped_on_physical_worker(&self) -> bool {
+        self.inner.transport_drop_thread.lock().unwrap().as_deref() == Some("tinybus-terminal")
+    }
     /// Persist genuine fault and close independent native admission first.
     pub fn request_fault(&self) {
         self.inner.signal(TerminalReason::Fault);
@@ -265,7 +275,7 @@ pub(super) struct TerminalState {
     reject_worker_spawn: AtomicBool,
     #[cfg(any(test, feature = "__native-fixture-support"))]
     startup_failure_stage: AtomicU8,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "__native-fixture-support"))]
     transport_drop_thread: StdMutex<Option<String>>,
     lease: SlotLease,
     token: usize,
@@ -276,7 +286,7 @@ pub(super) struct SdkOwner {
     state: Arc<TerminalState>,
 }
 impl SdkOwner {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "__native-fixture-support"))]
     pub(super) fn record_transport_drop_for_test(&self) {
         *self.state.transport_drop_thread.lock().unwrap() = Some(
             std::thread::current()
@@ -365,7 +375,7 @@ impl TerminalState {
             reject_worker_spawn: AtomicBool::new(false),
             #[cfg(any(test, feature = "__native-fixture-support"))]
             startup_failure_stage: AtomicU8::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "__native-fixture-support"))]
             transport_drop_thread: StdMutex::new(None),
             lease: SlotLease {
                 admission: Arc::downgrade(admission),
@@ -631,6 +641,30 @@ impl TerminalState {
     #[cfg(test)]
     pub(super) fn transport_drop_thread_for_test(&self) -> Option<String> {
         self.transport_drop_thread.lock().unwrap().clone()
+    }
+    #[cfg(feature = "__native-fixture-support")]
+    fn resources_for_fixture(&self) -> u32 {
+        let resources = self.resources.lock().unwrap();
+        let flags = [
+            resources.retained_factory.is_some(),
+            resources.setup.is_some(),
+            resources.reinitializer_factory.is_some(),
+            resources.runtime.is_some(),
+            resources.transport.is_some(),
+            resources.reinitialize.lock().unwrap().is_some(),
+            resources.initial.is_some(),
+            resources.config.is_some(),
+            resources.initial_future.lock().unwrap().is_some(),
+            resources.reinit_future.lock().unwrap().is_some(),
+        ];
+        flags
+            .iter()
+            .enumerate()
+            .fold(0, |mask, (index, held)| mask | (u32::from(*held) << index))
+    }
+    #[cfg(any(test, feature = "__native-fixture-support"))]
+    pub(super) fn reject_runtime_build_for_fixture(&self) -> bool {
+        self.startup_failure_stage.load(Ordering::Acquire) == 9
     }
     #[cfg(any(test, feature = "__native-fixture-support"))]
     pub(super) fn reject_startup_for_test(&self, stage: u8) {

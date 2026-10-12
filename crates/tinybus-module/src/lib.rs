@@ -596,7 +596,17 @@ where
             owner.configure(&mut builder);
         }
 
-        let runtime = match builder.worker_threads(worker_threads).enable_all().build() {
+        #[cfg(any(test, feature = "__native-fixture-support"))]
+        let build_result = if state.reject_runtime_build_for_fixture() {
+            Err(std::io::Error::other(
+                "controlled terminal runtime build failure",
+            ))
+        } else {
+            builder.worker_threads(worker_threads).enable_all().build()
+        };
+        #[cfg(not(any(test, feature = "__native-fixture-support")))]
+        let build_result = builder.worker_threads(worker_threads).enable_all().build();
+        let runtime = match build_result {
             Ok(runtime) => runtime,
             Err(_) => return TB_CLOSED,
         };
@@ -1672,7 +1682,17 @@ where
         if let Some(owner) = &state.owner {
             owner.configure(&mut builder);
         }
-        let runtime = match builder.worker_threads(worker_threads).enable_all().build() {
+        #[cfg(any(test, feature = "__native-fixture-support"))]
+        let build_result = if state.reject_runtime_build_for_fixture() {
+            Err(std::io::Error::other(
+                "controlled terminal runtime build failure",
+            ))
+        } else {
+            builder.worker_threads(worker_threads).enable_all().build()
+        };
+        #[cfg(not(any(test, feature = "__native-fixture-support")))]
+        let build_result = builder.worker_threads(worker_threads).enable_all().build();
+        let runtime = match build_result {
             Ok(runtime) => runtime,
             Err(_) => {
                 state.signal(TerminalReason::SetupFailed);
