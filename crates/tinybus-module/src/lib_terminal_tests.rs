@@ -195,3 +195,111 @@ async fn actual_linked_setup_construction_and_poll_panics_still_finish_real_work
         }
     }
 }
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NativeControls { ctx: *mut c_void, event: unsafe extern "C" fn(*mut c_void, u32, u32) }
+unsafe extern "C" fn native_event(ctx: *mut c_void, event: u32, value: u32) {
+    let sender = unsafe { &*ctx.cast::<std::sync::mpsc::Sender<(u32, u32)>>() };
+    let _ = sender.send((event, value));
+}
+// Only fixture symbols are looked up; TinyBus itself verifies/adopts the pinned
+// private artifact through the actual ModuleHost loader first. It remains mapped.
+#[cfg(unix)]
+unsafe fn terminal_fixture_symbols(path: &std::path::Path) -> (extern "C" fn() -> usize, extern "C" fn(usize) -> i32) {
+    use std::os::unix::ffi::OsStrExt;
+    #[cfg_attr(target_os = "linux", link(name = "dl"))]
+    unsafe extern "C" { fn dlopen(path: *const std::ffi::c_char, flags: i32) -> *mut c_void; fn dlsym(handle: *mut c_void, name: *const std::ffi::c_char) -> *mut c_void; }
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    let handle = unsafe { dlopen(path.as_ptr(), 2) };
+    assert!(!handle.is_null());
+    let context = unsafe { dlsym(handle, c"terminal_test_context".as_ptr()) };
+    let probe = unsafe { dlsym(handle, c"terminal_test_old_context".as_ptr()) };
+    assert!(!context.is_null() && !probe.is_null());
+    unsafe { (std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(context), std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> i32>(probe)) }
+}
+#[cfg(windows)]
+unsafe fn terminal_fixture_symbols(path: &std::path::Path) -> (extern "C" fn() -> usize, extern "C" fn(usize) -> i32) {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" { fn LoadLibraryW(path: *const u16) -> *mut c_void; fn GetProcAddress(handle: *mut c_void, name: *const u8) -> *mut c_void; }
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let handle = unsafe { LoadLibraryW(path.as_ptr()) };
+    assert!(!handle.is_null());
+    let context = unsafe { GetProcAddress(handle, c"terminal_test_context".as_ptr().cast()) };
+    let probe = unsafe { GetProcAddress(handle, c"terminal_test_old_context".as_ptr().cast()) };
+    assert!(!context.is_null() && !probe.is_null());
+    unsafe { (std::mem::transmute::<*mut c_void, extern "C" fn() -> usize>(context), std::mem::transmute::<*mut c_void, extern "C" fn(usize) -> i32>(probe)) }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires a privately pinned TINYBUS_TEST_TERMINAL_MODULE compiled cdylib"]
+async fn compiled_native_terminal_owns_initial_cancellation_panics_join_and_stale_context() {
+    let path = std::path::PathBuf::from(std::env::var_os("TINYBUS_TEST_TERMINAL_MODULE").unwrap());
+    let digest = tinybus::module::sha256_file(&path).unwrap();
+    let name = path.file_name().unwrap().to_str().unwrap();
+    let pins = std::fs::read_to_string(path.parent().unwrap().join("modules.toml")).unwrap();
+    assert!(pins.contains(&format!("\"{name}\" = \"{digest}\"")));
+    let mut old_context = None;
+    for mode in [1u8, 0, 2, 4] {
+        let (events, receiver) = std::sync::mpsc::channel::<(u32, u32)>();
+        let events = Box::new(events);
+        let controls = NativeControls { ctx: (&*events as *const std::sync::mpsc::Sender<(u32, u32)>).cast_mut().cast(), event: native_event };
+        let encoded = unsafe { std::slice::from_raw_parts((&controls as *const NativeControls).cast::<u8>(), size_of::<NativeControls>()) }.to_vec();
+        let broker = tinybus::broker::Broker::new();
+        broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+        let host = tinybus::module::ModuleHost::new(broker);
+        host.load_file_with_config(&path, serde_json::json!({"mode":mode,"test_controls":encoded})).unwrap();
+        let (context, old_probe) = unsafe { terminal_fixture_symbols(&path) };
+        let actual_context = context();
+        let first = receiver.recv_timeout(Duration::from_secs(5)).unwrap();
+        let stale_result = old_context.map(old_probe);
+        host.shutdown(Duration::from_secs(5)).await;
+        let mut seen = vec![first];
+        while !seen.iter().any(|(event, _)| *event == 6) { seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap()); }
+        // All actual controller workers and SDK captures are destroyed before assertions.
+        if let Some(code) = stale_result { assert_eq!(code, TB_CLOSED); }
+        assert_eq!(seen.iter().filter(|(event, _)| *event == 3).count(), 1);
+        assert_eq!(seen.iter().filter(|(event, value)| *event == 5 && *value == 1).count(), 1);
+        assert_eq!(seen.iter().filter(|(event, value)| *event == 7 && *value == 1).count(), 1);
+        assert!(seen.iter().any(|(event, value)| *event == 6 && *value == 1));
+        if mode != 4 {
+            let drop = seen.iter().position(|(event, value)| *event == 4 && *value == 1).unwrap();
+            let finish = seen.iter().position(|(event, _)| *event == 5).unwrap();
+            assert!(drop < finish);
+        }
+        old_context = Some(actual_context);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_linked_reinit_terminal_cancellation_settles_before_worker_join() {
+    let _serial = controlled::TEST_LOCK.lock().await;
+    let (fixture, events) = controlled::fixture();
+    let broker = tinybus::broker::Broker::new();
+    broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+    let host = tinybus::module::ModuleHost::new(broker);
+    host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":0})).unwrap();
+    let initial = events.recv_timeout(Duration::from_secs(3)).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !host.list().iter().any(|info| matches!(info.state, tinybus::module::ModuleState::Ready)) { tokio::task::yield_now().await; }
+    }).await.unwrap();
+    let reinit_host = host.clone();
+    let reinit = tokio::spawn(async move { reinit_host.reinitialize("tinybus-module", serde_json::json!({"mode":1})).await });
+    let entered = events.recv_timeout(Duration::from_secs(3)).unwrap();
+    let view = fixture.view.lock().unwrap().take().unwrap();
+    view.request_fault();
+    let reinit_result = reinit.await.unwrap();
+    host.shutdown(Duration::from_secs(5)).await;
+    let remainder: Vec<_> = events.try_iter().collect();
+    assert!(matches!(initial, controlled::Event::Poll(0)));
+    assert!(matches!(entered, controlled::Event::Poll(1)));
+    assert!(reinit_result.is_err());
+    assert_eq!(fixture.requests.load(Ordering::SeqCst), 1);
+    assert_eq!(fixture.joins.load(Ordering::SeqCst), 1);
+    assert!(!view.is_live());
+    let drops: Vec<_> = remainder.iter().enumerate().filter_map(|(index, event)| matches!(event, controlled::Event::FutureDrop(name) if name == "tinybus-terminal").then_some(index)).collect();
+    let finish = remainder.iter().position(|event| matches!(event, controlled::Event::Finish)).unwrap();
+    assert_eq!(drops.len(), 2);
+    assert!(drops.into_iter().all(|index| index < finish));
+}
