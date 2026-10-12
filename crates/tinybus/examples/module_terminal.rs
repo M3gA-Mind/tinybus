@@ -1,6 +1,8 @@
 //! Actual opted-in runtime fixture. Controls are trusted test-only C callbacks.
 use std::{ffi::c_void, future::Future, pin::Pin, sync::{Arc, Condvar, Mutex}, task::{Context, Poll}};
 use tinybus::{Connection, Result};
+use std::sync::atomic::{AtomicUsize, Ordering};
+static DROPPED: AtomicUsize = AtomicUsize::new(0);
 use tinybus::module::abi::*;
 use tinybus_module::{NativeInstanceLiveness, RuntimeHooks, TerminalCompletion};
 #[derive(serde::Deserialize)]
@@ -24,7 +26,7 @@ impl Controller {
     }
 }
 impl Drop for Controller {
-    fn drop(&mut self) { self.emit(6, u32::from(std::thread::current().name() == Some("tinybus-terminal"))); }
+    fn drop(&mut self) { self.emit(6, u32::from(std::thread::current().name() == Some("tinybus-terminal"))); DROPPED.fetch_add(1, Ordering::Release); }
 }
 struct SetupFuture { controller: Arc<Controller>, mode: u8, first: bool }
 impl Future for SetupFuture {
@@ -106,3 +108,7 @@ pub extern "C" fn terminal_test_old_context(token: usize) -> i32 {
     let table = *LATEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     table.map_or(TB_CLOSED, |table| unsafe { (table.0.shutdown)(std::ptr::with_exposed_provenance_mut(token), 1000) })
 }
+
+/// Test-only acquire fence after the final controller event callback returned.
+#[unsafe(no_mangle)]
+pub extern "C" fn terminal_test_drops() -> usize { DROPPED.load(Ordering::Acquire) }
