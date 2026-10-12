@@ -27,8 +27,9 @@ pub enum TerminalCompletion {
     /// The controller has fenced admission and joined its actual workers.
     /// This assertion alone proves neither SDK teardown nor backing last-Drop.
     PhysicallyStopped,
-    /// Actual controller cleanup could not be proved. The SDK retains the
-    /// uncertain owner; a deadline cannot convert this into successful cleanup.
+    /// Controller or SDK physical cleanup could not be proved. Even joined
+    /// workers can leave uncertain SDK resources. The SDK retains the owner;
+    /// a deadline cannot convert this into successful cleanup.
     Uncertain,
 }
 /// Controller callbacks supplied by the terminal factory.
