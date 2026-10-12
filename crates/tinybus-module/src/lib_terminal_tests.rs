@@ -703,3 +703,62 @@ async fn actual_linked_reinit_terminal_cancellation_settles_before_worker_join()
     assert_eq!(drops.len(), 2);
     assert!(drops.into_iter().all(|index| index < finish));
 }
+
+// A real served object, rather than a synthetic transport owner: Inner destroys
+// its transport before its ObjectTree, so the old count can reach zero here.
+struct TeardownObject {
+    entered: std::sync::mpsc::Sender<()>,
+    release: Arc<std::sync::Barrier>,
+    settled: std::sync::mpsc::Sender<()>,
+    panic: bool,
+}
+#[async_trait]
+impl tinybus::Interface for TeardownObject {
+    fn name(&self) -> tinybus::InterfaceName {
+        "ai.tinyhumans.tinybus.Teardown".parse().unwrap()
+    }
+    fn members(&self) -> Vec<tinybus::MemberName> { Vec::new() }
+    async fn call(&self, _: &tinybus::MemberName, _: serde_json::Value) -> Result<serde_json::Value> {
+        Ok(serde_json::Value::Null)
+    }
+}
+impl Drop for TeardownObject {
+    fn drop(&mut self) {
+        self.entered.send(()).unwrap();
+        self.release.wait();
+        self.settled.send(()).unwrap();
+        if self.panic { panic!("controlled ObjectTree teardown"); }
+    }
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_connection_object_drop_after_runtime_timeout_denies_physical_completion() {
+    let _serial = controlled::TEST_LOCK.lock().await;
+    let (fixture, events) = controlled::fixture();
+    let broker = tinybus::broker::Broker::new();
+    broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+    let host = Arc::new(tinybus::module::ModuleHost::new(broker));
+    host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":0})).unwrap();
+    events.recv_timeout(Duration::from_secs(3)).unwrap();
+    let view = fixture.view.lock().unwrap().take().unwrap();
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (settled_tx, settled_rx) = std::sync::mpsc::channel();
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let connection = view.inner.resources.lock().unwrap().connection.lock().unwrap().clone().unwrap();
+    connection.serve_at("/teardown".parse().unwrap(), TeardownObject {
+        entered: entered_tx, release: release.clone(), settled: settled_tx, panic: false,
+    }).await.unwrap();
+    drop(connection);
+    let stopping_host = host.clone();
+    let stopping = tokio::spawn(async move { stopping_host.shutdown(Duration::from_secs(8)).await; });
+    entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    stopping.await.unwrap(); // The SDK's real shutdown_timeout has elapsed.
+    let completion = view.inner.wait(Duration::ZERO);
+    let flags = unsafe { (view.inner.host.0.native_terminal_state.unwrap())(view.inner.host.0.host_ctx) };
+    let still_anchored = terminal::TerminalState::lookup(view.inner.context()).is_some();
+    // Release and settle actual foreign work before reporting a failed proof.
+    release.wait();
+    settled_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(completion, TerminalCompletion::Uncertain);
+    assert_eq!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0);
+    assert!(still_anchored, "blocked whole-Connection teardown cannot refund admission");
+}
