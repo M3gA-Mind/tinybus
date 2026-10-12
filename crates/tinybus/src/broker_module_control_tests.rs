@@ -91,7 +91,7 @@ async fn peer(broker: &Broker, controller: bool) -> Connection {
     } else {
         broker.attach(Arc::new(server));
     }
-    Connection::connect(client).await.unwrap()
+    Connection::connect(Box::new(client)).await.unwrap()
 }
 
 fn operations() -> Vec<(&'static str, Value)> {
@@ -119,7 +119,7 @@ async fn invoke(
     member: &str,
     args: Value,
     forged: Option<BusName>,
-) -> Result<Message> {
+) -> Result<Value> {
     let mut message = Message::method_call(
         BusName::new(crate::BUS_NAME).unwrap(),
         ObjectPath::new(crate::BUS_PATH).unwrap(),
@@ -174,7 +174,7 @@ async fn selected_controller_can_mutate_and_other_peers_can_inspect() {
     let listed = invoke(&stranger, "ListModules", serde_json::json!([]), None)
         .await
         .unwrap();
-    assert_eq!(listed.body, serde_json::json!([]));
+    assert_eq!(listed, serde_json::json!([]));
 }
 
 #[tokio::test]
