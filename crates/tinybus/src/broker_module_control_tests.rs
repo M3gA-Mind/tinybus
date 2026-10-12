@@ -19,7 +19,7 @@ impl RecordingControl {
             file: "fixture.so".into(),
             state: ModuleState::Ready,
             manifest: serde_json::from_value(serde_json::json!({
-                "schema": 1,
+                "tinybus_manifest": 1,
                 "module": {"name": "fixture", "version": "1.0.0"},
                 "bus_name": "ai.tinyhumans.Fixture",
                 "object_path": "/ai/tinyhumans/Fixture"
