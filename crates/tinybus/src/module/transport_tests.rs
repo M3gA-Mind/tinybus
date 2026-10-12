@@ -1050,6 +1050,8 @@ async fn queued_readiness_and_backpressure_retire_before_actual_shutdown_returns
         .lock()
         .await;
     let _release = ShutdownRelease;
+    // Reproduce the fixture state left by a preceding shutdown test.
+    SHUTDOWN_ENTERED.store(true, Ordering::Release);
     SHUTDOWN_BLOCKED.store(true, Ordering::Release);
     SHUTDOWN_ENTERED.store(false, Ordering::Release);
     DELIVERIES.store(0, Ordering::Release);
