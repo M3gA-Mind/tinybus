@@ -814,6 +814,16 @@ async fn actual_connection_object_drop_after_runtime_timeout_denies_physical_com
     // Release and settle actual foreign work before reporting a failed proof.
     release.wait();
     settled_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+    // Only the retained registry anchor and this test's view may remain.
+    // This waits for actual SDK Connection/task owners to finish dropping,
+    // rather than treating the object's last event as whole-Inner settlement.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while Arc::strong_count(&view.inner) > 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(completion, TerminalCompletion::Uncertain);
     assert_eq!(
         flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
@@ -880,6 +890,16 @@ async fn actual_connection_object_drop_panic_fences_fault_after_owner_suppressio
         unsafe { (view.inner.host.0.native_terminal_state.unwrap())(view.inner.host.0.host_ctx) };
     let still_anchored = terminal::TerminalState::lookup(view.inner.context()).is_some();
 
+    // Only the retained registry anchor and this test's view may remain.
+    // This waits for actual SDK Connection/task owners to finish dropping,
+    // rather than treating the object's last event as whole-Inner settlement.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while Arc::strong_count(&view.inner) > 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(completion, TerminalCompletion::Uncertain);
     assert_eq!(
         flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
