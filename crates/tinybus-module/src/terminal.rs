@@ -12,18 +12,30 @@ use tinybus::module::abi::{
 /// precedence over ordinary stop or host disappearance.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalReason {
+    /// Ordinary stop intent; it does not assert worker completion.
     Stop,
+    /// The native query is unavailable or no longer grants live admission.
     HostClosed,
+    /// A genuine native or module fault, including a caught panic.
     Fault,
+    /// The factory or setup returned an error; native fault is also reported.
     SetupFailed,
 }
 /// Actual controller cleanup outcome, independent of native admission.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TerminalCompletion {
+    /// The controller has fenced admission and joined its actual workers.
+    /// This assertion alone proves neither SDK teardown nor backing last-Drop.
     PhysicallyStopped,
+    /// Actual controller cleanup could not be proved. The SDK retains the
+    /// uncertain owner; a deadline cannot convert this into successful cleanup.
     Uncertain,
 }
 /// Controller callbacks supplied by the terminal factory.
+///
+/// The factory owns partial-failure cleanup until it returns these hooks. It
+/// must launch independent workers only during setup, after hook registration.
+/// The same controller remains responsible through every reinitialization.
 pub struct RuntimeHooks {
     request: Arc<dyn Fn(TerminalReason) + Send + Sync>,
     finish: Box<dyn FnOnce() -> TerminalCompletion + Send>,
@@ -34,6 +46,9 @@ impl RuntimeHooks {
     /// independently fences and joins the controller after SDK setup cancellation
     /// has settled; it must not depend on cancelled futures or host shutdown.
     /// Returning `PhysicallyStopped` asserts actual fence/join, not a timeout.
+    /// The SDK additionally requires its own resource teardown without sticky
+    /// uncertainty before accepting physical completion. Trusted callbacks must
+    /// uphold these obligations; the SDK cannot force arbitrary Rust to finish.
     pub fn new<R, F>(request: R, finish: F) -> Self
     where
         R: Fn(TerminalReason) + Send + Sync + 'static,
@@ -47,6 +62,9 @@ impl RuntimeHooks {
 }
 /// A retained view of one actual admitted native instance. Its lifetime retains
 /// the instance's admission permit even after successful physical cleanup.
+/// Each SDK image admits at most 256 retained instances; views keep their slot
+/// occupied until actual last-Drop. This does not bound controller resource bytes
+/// or the host's existing context and mapped-library retention.
 #[derive(Clone)]
 pub struct NativeInstanceLiveness {
     pub(super) inner: Arc<TerminalState>,
@@ -54,6 +72,10 @@ pub struct NativeInstanceLiveness {
 impl NativeInstanceLiveness {
     /// Only a supported, exactly-live native query allows new admission.
     /// Observed terminal state never reopens. This is not a publication lease.
+    /// A controller must check its immutable instance/receiver binding and local
+    /// terminal flags, then this view, then local flags again under its physical
+    /// phase gate. A cached `true` cannot authorize a later phase; a later stop
+    /// cannot undo an operation whose admission already linearized.
     pub fn is_live(&self) -> bool {
         self.inner.is_live()
     }
@@ -104,6 +126,8 @@ impl NativeInstanceLiveness {
         self.inner.transport_drop_thread.lock().unwrap().as_deref() == Some("tinybus-terminal")
     }
     /// Persist genuine fault and close independent native admission first.
+    /// Signals the bounded request hook without joining. Call this after
+    /// unwinding out of the controller's physical phase gate.
     pub fn request_fault(&self) {
         self.inner.signal(TerminalReason::Fault);
     }

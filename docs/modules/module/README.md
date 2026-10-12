@@ -51,12 +51,19 @@ factory, config = Config, ...)`; the static export macro accepts the same
 arguments. The factory receives one `NativeInstanceLiveness` and returns its
 setup callback plus `RuntimeHooks`. An unsupported or non-live native query
 rejects initialization before the factory runs. Linked modules require the
-same explicit host query and retain the embedding process's panic hook.
+same explicit host query and retain the embedding process's panic hook. The
+factory owns cleanup of partial construction until it returns its hooks. It
+must defer independent worker launch until setup, after hook registration;
+reinitialization reuses the same controller and never replaces the hooks.
 
 A retained liveness view refers to that exact instance. Only a fresh, exactly
 Live native query admits work; any observed terminal intent permanently closes
 the view. `request_fault()` first reports genuine native fault. The view grants
 no publication lease and does not turn local cancellation into native success.
+Under its physical phase gate, the trusted controller must check immutable
+instance/receiver binding and local terminal flags, sample the view, then
+recheck local flags. A cached Live result cannot authorize a later phase;
+subsequent intent cannot undo an operation already admitted.
 
 The request hook runs at most once and must only close controller admission and
 perform bounded cancel/wake. It must not join, do I/O, wait for a gate, or reenter
@@ -93,8 +100,13 @@ allocation. Callback lookup acquires the exact State before releasing registry
 exclusion. Successful teardown retires its registry anchor; only actual State
 last-Drop releases the slot, so old views and surviving SDK resources count
 against the limit. Generations never wrap: exhaustion permanently denies that
-slot. Stale or unknown tokens return Closed and cannot select a replacement.
+slot. Null, stale or unknown context tokens return `TB_CLOSED` for otherwise
+valid terminal callbacks and cannot select a replacement. Legacy shutdown's
+null-context behavior remains unchanged.
 Tokens are private bookkeeping, not native authentication.
+
+The SDK's `__native-fixture-support` feature is private and disabled by default.
+It exposes only compiled-fixture instrumentation, not production authority.
 
 This metadata bound does not bound existing host-context or mapped-library
 retention. Libraries remain mapped until process exit, including a rejected

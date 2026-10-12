@@ -66,7 +66,9 @@ clones the exact matching State under registry exclusion, then releases that
 lock before instance operations. Successful resource teardown may retire the
 anchor, but slot reuse waits for actual State last-Drop, including retained
 liveness views and SDK resources. Generation exhaustion permanently denies the
-slot instead of wrapping. Unknown or retired tokens return Closed; an old
+slot instead of wrapping. Null, unknown or retired tokens return `TB_CLOSED`
+when the callback's other arguments are valid; legacy shutdown retains its
+existing null-context behavior. An old
 instance token cannot act on a replacement. These tokens are not serialized or
 logged and do not authenticate a native host.
 

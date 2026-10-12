@@ -1002,7 +1002,15 @@ where
 /// state is reused for that instance's reinitializations, allowing admission to
 /// remain bound without process-global state. Separate instances receive fresh
 /// state. A factory panic returns `TB_PANICKED` without unwinding into the host.
-/// Existing `setup = function` callbacks retain their behavior.
+/// Configured modules may instead use `terminal_setup_factory = factory`. Its
+/// factory receives [`NativeInstanceLiveness`] and returns `Result<(F,
+/// RuntimeHooks)>`, with the same setup callback bounds. A supported, exactly
+/// live native query and an available instance slot are required before factory
+/// evaluation; otherwise initialization returns `TB_CLOSED`. The factory owns
+/// partial-failure cleanup until it returns and must launch independent workers
+/// only from setup after hook registration. See [`RuntimeHooks`] for controller
+/// obligations. Hooks are registered once and never replaced by reinitialization.
+/// Existing `setup = function` and `setup_factory` callbacks retain their behavior.
 #[macro_export]
 macro_rules! module_export {
     (@linked) => {
@@ -1189,7 +1197,9 @@ macro_rules! module_export {
 
 /// Generate Rust-addressable entry points for linking several modules into a
 /// single executable. The entry points have no shared C linker symbol names.
-/// Both configured `setup` and per-instance `setup_factory` forms are supported.
+/// Configured `setup`, per-instance `setup_factory`, and opted-in
+/// `terminal_setup_factory` forms are supported; see [`module_export`].
+/// Terminal factories require the supplied host's native query even when linked.
 #[macro_export]
 macro_rules! module_export_static {
     (terminal_setup_factory = $factory:path, config = $config:ty, $($rest:tt)*) => {
@@ -1263,6 +1273,12 @@ mod setup_factory_test;
 mod lifecycle_test;
 
 /// Initialize an opted-in instance with native admission and physical hooks.
+///
+/// The factory returns one shared setup callback and one controller hook pair.
+/// It owns partial-failure disposal until return and must defer worker launch
+/// until setup, after hook registration. Reinitialization reuses this controller.
+/// Admission exhaustion or an unsupported/non-live query returns `TB_CLOSED`
+/// before factory evaluation. [`RuntimeHooks`] defines physical finish obligations.
 ///
 /// # Safety
 /// Uphold [`start_module`]'s ABI and output contracts. The compatible native
