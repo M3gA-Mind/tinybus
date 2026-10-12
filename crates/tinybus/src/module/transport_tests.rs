@@ -988,3 +988,95 @@ async fn lifecycle_waiters_do_not_reenter_a_transport_disposed_by_the_prior_shut
     assert!(transport.stop_task_spawned(), "S79");
     assert!(!transport.is_faulted(), "S80");
 }
+
+#[tokio::test]
+async fn fresh_signal_and_call_cannot_enter_an_actual_running_shutdown() {
+    let _lock = VTABLE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let _release = ShutdownRelease;
+    SHUTDOWN_BLOCKED.store(true, Ordering::Release);
+    SHUTDOWN_ENTERED.store(false, Ordering::Release);
+    SHUTDOWN_CALLS.store(0, Ordering::Release);
+    DELIVERIES.store(0, Ordering::Release);
+    let (transport, host) = ModuleTransport::new("admission".into(), vec![]);
+    transport.defer_initialize(initialize_ok, host);
+    transport.ensure_initialized().await.expect("A01");
+    unsafe { (host.ready)(host.host_ctx); }
+    let stopping = tokio::spawn(transport.clone().stop(Duration::from_secs(2)));
+    shutdown_entry().await;
+    let mut signal = call();
+    signal.header.kind = MessageKind::Signal;
+    let signal_result = transport.send(signal).await;
+    let call_result = transport.send(call()).await;
+    assert!(matches!(signal_result, Err(Error::ConnectionClosed)), "A02");
+    assert!(matches!(call_result, Err(Error::ConnectionClosed)), "A03");
+    assert_eq!(DELIVERIES.load(Ordering::Acquire), 0, "A04");
+    assert!(!transport.is_faulted(), "A05");
+    assert!(!transport.init_failed(), "A06");
+    assert!(!transport.is_stopped(), "A07");
+    assert!(transport.is_ready(), "A08");
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    assert_eq!(stopping.await.expect("A09").expect("A10"), TB_OK, "A11");
+}
+
+#[tokio::test]
+async fn queued_readiness_and_backpressure_retire_before_actual_shutdown_returns() {
+    let _lock = VTABLE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let _release = ShutdownRelease;
+    SHUTDOWN_BLOCKED.store(true, Ordering::Release);
+    SHUTDOWN_ENTERED.store(false, Ordering::Release);
+    DELIVERIES.store(0, Ordering::Release);
+    let (transport, host) = ModuleTransport::new("queued-admission".into(), vec![]);
+    transport.defer_initialize(initialize_ok, host);
+    transport.send(call()).await.expect("A12");
+    let stopping = tokio::spawn(transport.clone().stop(Duration::from_secs(2)));
+    shutdown_entry().await;
+    tokio::time::timeout(Duration::from_millis(100), transport.wait_ready()).await.expect("A13");
+    unsafe { (host.ready)(host.host_ctx); (host.wake)(host.host_ctx); }
+    tokio::time::timeout(Duration::from_millis(100), async {
+        while transport.drain_started.load(Ordering::Acquire) { tokio::task::yield_now().await; }
+    }).await.expect("A14");
+    let empty = transport.pending.lock().expect("A15").is_empty();
+    assert!(empty, "A16");
+    assert_eq!(DELIVERIES.load(Ordering::Acquire), 0, "A17");
+    assert!(!transport.is_ready(), "A18");
+    assert!(!transport.is_faulted(), "A19");
+    assert!(!transport.is_stopped(), "A20");
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    stopping.await.expect("A21").expect("A22");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_signal_callback_is_drained_despite_stop_timeout_and_cancellation() {
+    let _lock = VTABLE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let _release = ShutdownRelease;
+    SHUTDOWN_BLOCKED.store(true, Ordering::Release);
+    SHUTDOWN_ENTERED.store(false, Ordering::Release);
+    SHUTDOWN_CALLS.store(0, Ordering::Release);
+    DELIVERY_BLOCKED.store(true, Ordering::Release);
+    DELIVERIES.store(0, Ordering::Release);
+    let (transport, host) = ModuleTransport::new("callback-drain".into(), vec![]);
+    transport.defer_initialize(initialize_ok, host);
+    transport.ensure_initialized().await.expect("A23");
+    let mut signal = call(); signal.header.kind = MessageKind::Signal;
+    let sending_transport = transport.clone();
+    let sending = tokio::spawn(async move { sending_transport.send(signal).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while DELIVERIES.load(Ordering::Acquire) == 0 { tokio::task::yield_now().await; }
+    }).await.expect("A24");
+    assert_eq!(transport.inflight(), 0, "A25");
+    let stopping = tokio::spawn(transport.clone().stop(Duration::from_millis(50)));
+    assert!(matches!(stopping.await.expect("A26"), Err(StopError::Started(_))), "A27");
+    assert!(!SHUTDOWN_ENTERED.load(Ordering::Acquire), "A28");
+    assert!(!transport.is_stopped(), "A29");
+    assert!(transport.stop_task_spawned(), "A30");
+    assert!(matches!(transport.clone().stop(Duration::from_millis(10)).await, Err(StopError::NotStarted(_))), "A31");
+    assert!(matches!(transport.send(call()).await, Err(Error::ConnectionClosed)), "A32");
+    DELIVERY_BLOCKED.store(false, Ordering::Release);
+    sending.await.expect("A33").expect("A34");
+    shutdown_entry().await;
+    assert_eq!(SHUTDOWN_CALLS.load(Ordering::Acquire), 1, "A35");
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    let _completed = tokio::time::timeout(Duration::from_secs(2), transport.lifecycle.lock()).await.expect("A36");
+    assert!(transport.is_stopped(), "A37");
+    assert!(!transport.is_faulted(), "A38");
+}
