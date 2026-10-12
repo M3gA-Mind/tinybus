@@ -1513,7 +1513,9 @@ impl ModuleControl for ModuleHostInner {
         match stopped {
             Ok(_) => {}
             Err(StopError::NotStarted(error)) => {
-                module.transition_from = None;
+                if !module.transport.stop_task_spawned() {
+                    module.transition_from = None;
+                }
                 return Err(error);
             }
             Err(StopError::Started(error)) => return Err(error),

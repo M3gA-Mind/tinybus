@@ -662,6 +662,23 @@ async fn ordinary_shutdown_deadline_preserves_state_until_callback_returns() {
         "S11"
     );
     assert!(!transport.init_failed(), "S12");
+    assert!(
+        matches!(
+            transport.clone().stop(Duration::from_secs(1)).await,
+            Err(StopError::NotStarted(Error::ConnectionClosed))
+        ),
+        "S68"
+    );
+    assert_eq!(SHUTDOWN_CALLS.load(Ordering::Acquire), 1, "S69");
+    assert!(
+        matches!(
+            transport
+                .reinitialize(crate::Secret::new(b"{}".to_vec()))
+                .await,
+            Err(Error::ConnectionClosed)
+        ),
+        "S70"
+    );
 }
 
 #[tokio::test]

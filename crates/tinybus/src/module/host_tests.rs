@@ -2979,6 +2979,19 @@ async fn ordinary_stop_never_fabricates_faulted_before_or_after_callback_complet
             std::thread::yield_now();
         }
         assert!(!loaded[0].transport.is_faulted(), "H12");
+        // A disposed transport refuses a retry immediately, before any new
+        // physical task or marker change, even while detach is held back.
+        let mut retry = std::pin::pin!(loaded[0].transport.clone().stop(Duration::from_secs(1)));
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            matches!(
+                std::future::Future::poll(retry.as_mut(), &mut context),
+                std::task::Poll::Ready(Err(StopError::NotStarted(Error::ConnectionClosed)))
+            ),
+            "H15"
+        );
+        assert!(loaded[0].transport.stop_task_spawned(), "H16");
+        assert_eq!(BLOCKING_STOP_CALLS.load(Ordering::Acquire), 1, "H17");
         assert!(
             !matches!(
                 loaded[0].snapshot().state,

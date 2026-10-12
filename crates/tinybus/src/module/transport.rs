@@ -359,6 +359,9 @@ impl ModuleTransport {
     }
 
     pub(crate) async fn reinitialize(self: &Arc<Self>, bytes: crate::Secret) -> Result<()> {
+        if self.is_stopped() {
+            return Err(Error::ConnectionClosed);
+        }
         let started = std::time::Instant::now();
         let lifecycle =
             tokio::time::timeout(MODULE_INIT_DEADLINE, self.lifecycle.clone().lock_owned())
@@ -368,6 +371,9 @@ impl ModuleTransport {
                         .expect("static member name is valid"),
                     timeout_ms: MODULE_INIT_DEADLINE.as_millis() as u64,
                 })?;
+        if self.is_stopped() {
+            return Err(Error::ConnectionClosed);
+        }
         let module = self
             .module
             .lock()
@@ -587,6 +593,9 @@ impl ModuleTransport {
     }
 
     pub(crate) fn stop_sync(&self, deadline: Duration) -> i32 {
+        if self.is_stopped() {
+            return TB_CLOSED;
+        }
         {
             let _gate = self
                 .initialization_gate
@@ -616,6 +625,9 @@ impl ModuleTransport {
         self: Arc<Self>,
         deadline: Duration,
     ) -> std::result::Result<i32, StopError> {
+        if self.is_stopped() {
+            return Err(StopError::NotStarted(Error::ConnectionClosed));
+        }
         let started = std::time::Instant::now();
         let lifecycle = tokio::time::timeout(deadline, self.lifecycle.clone().lock_owned())
             .await
@@ -624,6 +636,9 @@ impl ModuleTransport {
                     "module lifecycle operation exceeded its deadline",
                 ))
             })?;
+        if self.is_stopped() {
+            return Err(StopError::NotStarted(Error::ConnectionClosed));
+        }
         let remaining = deadline.saturating_sub(started.elapsed());
         // A retry that cannot acquire the physical lock must not erase the
         // original running stop's host transition. Only its new lock owner may
