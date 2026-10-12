@@ -558,9 +558,16 @@ impl TerminalState {
         self.changed.notify_all();
         let mut control = self.lock();
         while control.prior_pending && control.finish_state != FinishState::SpawnFailed {
-            control = self.changed.wait(control).unwrap_or_else(std::sync::PoisonError::into_inner);
+            control = self
+                .changed
+                .wait(control)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
-        if control.finish_state == FinishState::SpawnFailed { TB_CLOSED } else { control.construction_code }
+        if control.finish_state == FinishState::SpawnFailed {
+            TB_CLOSED
+        } else {
+            control.construction_code
+        }
     }
     fn schedule(self: &Arc<Self>) {
         let job = {

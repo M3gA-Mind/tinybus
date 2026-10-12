@@ -120,14 +120,24 @@ mod controlled {
         #[serde(skip, default = "config_fixture")]
         fixture: std::sync::Weak<Fixture>,
     }
-    static CONFIG_FIXTURE: StdMutex<std::sync::Weak<Fixture>> = StdMutex::new(std::sync::Weak::new());
-    fn config_fixture() -> std::sync::Weak<Fixture> { CONFIG_FIXTURE.lock().unwrap().clone() }
+    static CONFIG_FIXTURE: StdMutex<std::sync::Weak<Fixture>> =
+        StdMutex::new(std::sync::Weak::new());
+    fn config_fixture() -> std::sync::Weak<Fixture> {
+        CONFIG_FIXTURE.lock().unwrap().clone()
+    }
     impl Drop for Config {
         fn drop(&mut self) {
             if self.record_drop {
-                let Some(fixture) = self.fixture.upgrade() else { return; };
+                let Some(fixture) = self.fixture.upgrade() else {
+                    return;
+                };
                 fixture.config_drops.fetch_add(1, Ordering::SeqCst);
-                let _ = fixture.events.send(Event::ConfigDrop(std::thread::current().name().unwrap_or("unnamed").to_owned()));
+                let _ = fixture.events.send(Event::ConfigDrop(
+                    std::thread::current()
+                        .name()
+                        .unwrap_or("unnamed")
+                        .to_owned(),
+                ));
             }
         }
     }
@@ -1066,7 +1076,10 @@ async fn controlled_prior_reinit_drop(panic: bool) {
     let caller_host = host.clone();
     let caller = tokio::spawn(async move {
         caller_host
-            .reinitialize("tinybus-module", serde_json::json!({"mode":0,"record_drop":true}))
+            .reinitialize(
+                "tinybus-module",
+                serde_json::json!({"mode":0,"record_drop":true}),
+            )
             .await
     });
     let entered = events.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -1088,7 +1101,11 @@ async fn controlled_prior_reinit_drop(panic: bool) {
     }
     host.shutdown(Duration::from_secs(8)).await;
     let completion = view.inner.wait(Duration::from_secs(5));
-    assert_eq!(fixture.config_drops.load(Ordering::SeqCst), 0, "rejected reinit must not receive a config before prior retirement and LIVE admission");
+    assert_eq!(
+        fixture.config_drops.load(Ordering::SeqCst),
+        0,
+        "rejected reinit must not receive a config before prior retirement and LIVE admission"
+    );
     assert!(matches!(entered, controlled::Event::FutureDrop(name) if name == "tinybus-terminal"));
     assert!(not_finished_while_blocked && no_next_setup);
     assert!(result.is_err());
@@ -1123,14 +1140,33 @@ async fn accepted_reinit_config_is_destroyed_on_physical_worker_including_constr
     for mode in [0, 4] {
         let (fixture, events) = controlled::fixture();
         let broker = tinybus::broker::Broker::new();
-        broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+        broker
+            .clone()
+            .spawn(tinybus::transport::memory::MemoryBus::new());
         let host = Arc::new(tinybus::module::ModuleHost::new(broker));
-        host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":0})).unwrap();
+        host.attach_linked_with_config(
+            controlled::linked_module().unwrap(),
+            serde_json::json!({"mode":0}),
+        )
+        .unwrap();
         events.recv_timeout(Duration::from_secs(3)).unwrap();
         tokio::time::timeout(Duration::from_secs(3), async {
-            while !host.list().iter().any(|info| matches!(info.state, tinybus::module::ModuleState::Ready)) { tokio::task::yield_now().await; }
-        }).await.unwrap();
-        let result = host.reinitialize("tinybus-module", serde_json::json!({"mode":mode,"record_drop":true})).await;
+            while !host
+                .list()
+                .iter()
+                .any(|info| matches!(info.state, tinybus::module::ModuleState::Ready))
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let result = host
+            .reinitialize(
+                "tinybus-module",
+                serde_json::json!({"mode":mode,"record_drop":true}),
+            )
+            .await;
         host.shutdown(Duration::from_secs(8)).await;
         let mut names = Vec::new();
         loop {
@@ -1144,7 +1180,11 @@ async fn accepted_reinit_config_is_destroyed_on_physical_worker_including_constr
         let _completion = view.inner.wait(Duration::from_secs(5));
         assert_eq!(result.is_ok(), mode == 0);
         assert_eq!(fixture.config_drops.load(Ordering::SeqCst), 1);
-        assert_eq!(names, ["tinybus-terminal"], "accepted generic config Drop must run on the one physical worker");
+        assert_eq!(
+            names,
+            ["tinybus-terminal"],
+            "accepted generic config Drop must run on the one physical worker"
+        );
         assert_eq!(fixture.joins.load(Ordering::SeqCst), 1);
     }
 }
