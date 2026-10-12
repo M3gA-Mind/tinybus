@@ -639,7 +639,9 @@ impl Drop for LoadRollback<'_> {
         if self.committed {
             return;
         }
-        if let Some(transport) = &self.transport { transport.commit_terminal(true); }
+        if let Some(transport) = &self.transport {
+            transport.commit_terminal(true);
+        }
         self.binding.revoke();
         self.binding.transport.close_outbound();
         self.binding
@@ -685,13 +687,22 @@ impl Drop for LoadRollback<'_> {
 impl Drop for ModuleHostInner {
     fn drop(&mut self) {
         let modules = self.loaded.get_mut().expect("module list lock");
-        let transports: Vec<_> = modules.iter().map(|module| module.transport.clone()).collect();
-        for transport in &transports { transport.commit_terminal(false); }
+        let transports: Vec<_> = modules
+            .iter()
+            .map(|module| module.transport.clone())
+            .collect();
+        for transport in &transports {
+            transport.commit_terminal(false);
+        }
         {
             let mut router = self.broker.router.lock().expect("router lock");
-            for module in modules.iter() { router.revoke_callbacks_for_peer(&module.unique_name); }
+            for module in modules.iter() {
+                router.revoke_callbacks_for_peer(&module.unique_name);
+            }
         }
-        for transport in transports { transport.request_terminal(false); }
+        for transport in transports {
+            transport.request_terminal(false);
+        }
     }
 }
 

@@ -1021,7 +1021,11 @@ impl ModuleHost {
         } else {
             admitted.state = ModuleState::Initializing;
             if let Err(failure) = transport.eager_initialize(artifact.init, host_vtable) {
-                let reason = if failure.to_string().contains("vtable") { "module returned an invalid vtable" } else { "module initialization failed" };
+                let reason = if failure.to_string().contains("vtable") {
+                    "module returned an invalid vtable"
+                } else {
+                    "module initialization failed"
+                };
                 let error = Error::module_refused(path, reason);
                 self.record_manifest_rejection(&error, manifest, RefusalClass::Failed);
                 return Err(error);
@@ -1515,9 +1519,18 @@ impl ModuleControl for ModuleHostInner {
             Err(StopError::Started(error)) => return Err(error),
         }
         module.info.state = if module.transport.is_faulted() {
-            if module.transport.init_failed() { ModuleState::Failed { reason: "module initialization failed".into() } }
-            else { ModuleState::Faulted { reason: "module reported an unrecoverable fault".into() } }
-        } else { ModuleState::Stopped };
+            if module.transport.init_failed() {
+                ModuleState::Failed {
+                    reason: "module initialization failed".into(),
+                }
+            } else {
+                ModuleState::Faulted {
+                    reason: "module reported an unrecoverable fault".into(),
+                }
+            }
+        } else {
+            ModuleState::Stopped
+        };
         Ok(module.info.clone())
     }
 
@@ -1660,7 +1673,9 @@ impl ModuleControl for ModuleHostInner {
         let module = loaded
             .iter_mut()
             .find(|module| &module.unique_name == unique_name)?;
-        if !module.transport.is_faulted() && let Some(old) = module.transition_from.take() {
+        if !module.transport.is_faulted()
+            && let Some(old) = module.transition_from.take()
+        {
             module.info.state = ModuleState::Stopped;
             return Some((module.info.name.clone(), old, ModuleState::Stopped));
         }

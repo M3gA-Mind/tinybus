@@ -1311,7 +1311,10 @@ async fn unanswered_method_calls_are_not_physical_callback_leases() {
 
 #[tokio::test]
 async fn abandoning_initiating_waiter_faults_and_retains_late_initializer_cleanup() {
-    let _lock = VTABLE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let _lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     SHUTDOWN_BLOCKED.store(false, Ordering::Release);
     SHUTDOWN_CODE.store(TB_OK, Ordering::Release);
     SHUTDOWN_CALLS.store(0, Ordering::Release);
@@ -1321,7 +1324,10 @@ async fn abandoning_initiating_waiter_faults_and_retains_late_initializer_cleanu
     transport.defer_initializer(host, move |host| {
         entered_tx.send(()).unwrap();
         release_rx.recv().unwrap();
-        assert_eq!(unsafe { std::slice::from_raw_parts(host.config.ptr, host.config.len) }, b"secret");
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(host.config.ptr, host.config.len) },
+            b"secret"
+        );
         let mut module = TbModuleVtable::default();
         assert_eq!(unsafe { initialize_ok(&host, &mut module) }, TB_OK);
         Ok(module)
@@ -1336,13 +1342,20 @@ async fn abandoning_initiating_waiter_faults_and_retains_late_initializer_cleanu
     // Always release foreign work even on the unfixed implementation.
     let faulted = transport.is_faulted();
     release_tx.send(()).unwrap();
-    assert!(faulted, "initiating waiter abandonment must publish fault immediately");
+    assert!(
+        faulted,
+        "initiating waiter abandonment must publish fault immediately"
+    );
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
-            if transport.is_stopped() { break; }
+            if transport.is_stopped() {
+                break;
+            }
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert_eq!(SHUTDOWN_CALLS.load(Ordering::Acquire), 1);
     assert!(transport.ensure_initialized().await.is_err());
 }
@@ -1353,19 +1366,32 @@ async fn scheduled_initializer_fault_cancels_before_actual_entry() {
     let entries = Arc::new(AtomicUsize::new(0));
     transport.defer_initializer(host, {
         let entries = entries.clone();
-        move |_| { entries.fetch_add(1, Ordering::AcqRel); Err("unexpected C entry".into()) }
+        move |_| {
+            entries.fetch_add(1, Ordering::AcqRel);
+            Err("unexpected C entry".into())
+        }
     });
     let guard = transport.lifecycle.clone().lock_owned().await;
     assert!(transport.schedule_initializer().unwrap());
     transport.request_terminal(true);
     assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 6);
-    assert_eq!(transport.context.physical.lock().unwrap().init, InitState::Scheduled);
+    assert_eq!(
+        transport.context.physical.lock().unwrap().init,
+        InitState::Scheduled
+    );
     drop(guard);
     tokio::time::timeout(Duration::from_secs(2), async {
-        while !transport.is_stopped() { tokio::task::yield_now().await; }
-    }).await.unwrap();
+        while !transport.is_stopped() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
     assert_eq!(entries.load(Ordering::Acquire), 0);
-    assert_eq!(transport.context.physical.lock().unwrap().cleanup, CleanupState::NoCallbackRequired);
+    assert_eq!(
+        transport.context.physical.lock().unwrap().cleanup,
+        CleanupState::NoCallbackRequired
+    );
     assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 6);
 }
 
@@ -1375,7 +1401,10 @@ async fn scheduled_initializer_is_adopted_by_original_ordinary_stop() {
     let entries = Arc::new(AtomicUsize::new(0));
     transport.defer_initializer(host, {
         let entries = entries.clone();
-        move |_| { entries.fetch_add(1, Ordering::AcqRel); Err("unexpected C entry".into()) }
+        move |_| {
+            entries.fetch_add(1, Ordering::AcqRel);
+            Err("unexpected C entry".into())
+        }
     });
     let (worker_started, worker_started_rx) = tokio::sync::oneshot::channel();
     let (worker_release, worker_release_rx) = std::sync::mpsc::channel();
@@ -1384,15 +1413,20 @@ async fn scheduled_initializer_is_adopted_by_original_ordinary_stop() {
         worker_release_rx.recv().unwrap();
     }));
     let waiter = tokio::spawn({
-        let transport = transport.clone(); async move { transport.ensure_initialized().await }
+        let transport = transport.clone();
+        async move { transport.ensure_initialized().await }
     });
     worker_started_rx.await.unwrap();
     let mut stopping = Box::pin(transport.clone().stop(Duration::from_secs(2)));
     tokio::select! { result = &mut stopping => panic!("stop completed before owner: {result:?}"),
-        _ = async { while !transport.stop_task_spawned() { tokio::task::yield_now().await; } } => {} }
+    _ = async { while !transport.stop_task_spawned() { tokio::task::yield_now().await; } } => {} }
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
-    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 2, "ordinary cancellation cannot invent Fault");
+    assert_eq!(
+        unsafe { host_native_terminal_state(host.host_ctx) },
+        2,
+        "ordinary cancellation cannot invent Fault"
+    );
     worker_release.send(()).unwrap();
     assert_eq!(stopping.await.unwrap(), TB_CLOSED);
     assert_eq!(entries.load(Ordering::Acquire), 0);
@@ -1402,21 +1436,39 @@ async fn scheduled_initializer_is_adopted_by_original_ordinary_stop() {
 #[tokio::test]
 async fn rejected_spawn_retains_actual_initializer_owner_and_never_resubmits() {
     struct Probe(Arc<AtomicBool>);
-    impl Drop for Probe { fn drop(&mut self) { self.0.store(true, Ordering::Release); } }
+    impl Drop for Probe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
     let dropped = Arc::new(AtomicBool::new(false));
     let (transport, host) = ModuleTransport::new("spawn-rejection".into(), vec![]);
     transport.reject_worker_spawn.store(true, Ordering::Release);
     let probe = Probe(dropped.clone());
-    transport.defer_initializer(host, move |_| { drop(probe); Err("must never execute".into()) });
+    transport.defer_initializer(host, move |_| {
+        drop(probe);
+        Err("must never execute".into())
+    });
     assert!(transport.ensure_initialized().await.is_err());
     assert!(transport.is_faulted());
     let weak = Arc::downgrade(&transport);
-    assert_eq!(transport.context.physical.lock().unwrap().cleanup, CleanupState::Uncertain);
-    transport.reject_worker_spawn.store(false, Ordering::Release);
+    assert_eq!(
+        transport.context.physical.lock().unwrap().cleanup,
+        CleanupState::Uncertain
+    );
+    transport
+        .reject_worker_spawn
+        .store(false, Ordering::Release);
     assert!(transport.ensure_initialized().await.is_err());
     drop(transport);
-    assert!(weak.upgrade().is_some(), "context anchor retains actual job through host teardown");
-    assert!(!dropped.load(Ordering::Acquire), "closure rejection must not drop controller");
+    assert!(
+        weak.upgrade().is_some(),
+        "context anchor retains actual job through host teardown"
+    );
+    assert!(
+        !dropped.load(Ordering::Acquire),
+        "closure rejection must not drop controller"
+    );
     assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 6);
 }
 
@@ -1441,7 +1493,9 @@ unsafe extern "C" fn native_entered(ctx: *mut c_void, host: *const TbHostVtable)
     let mut state = barrier.state.lock().unwrap();
     state.0 = Some(unsafe { *host });
     barrier.entered.notify_one();
-    while !state.1 { state = barrier.changed.wait(state).unwrap(); }
+    while !state.1 {
+        state = barrier.changed.wait(state).unwrap();
+    }
 }
 unsafe extern "C" fn native_joined(ctx: *mut c_void) {
     let barrier = unsafe { &*ctx.cast::<NativeBarrier>() };
@@ -1451,17 +1505,38 @@ unsafe extern "C" fn native_joined(ctx: *mut c_void) {
     barrier.joined.notify_one();
     drop(state);
     let gate = barrier.finish_gate.lock().unwrap().take();
-    if let Some(gate) = gate { gate.recv().unwrap(); }
+    if let Some(gate) = gate {
+        gate.recv().unwrap();
+    }
 }
-pub(crate) fn native_fixture() -> (Arc<ModuleTransport>, TbHostVtable, crate::module::abi::TbModuleInit, Arc<NativeBarrier>) {
-    let path = std::env::var_os("TINYBUS_TEST_CONTROLLED_INIT_MODULE").expect("controlled native fixture path");
+pub(crate) fn native_fixture() -> (
+    Arc<ModuleTransport>,
+    TbHostVtable,
+    crate::module::abi::TbModuleInit,
+    Arc<NativeBarrier>,
+) {
+    let path = std::env::var_os("TINYBUS_TEST_CONTROLLED_INIT_MODULE")
+        .expect("controlled native fixture path");
     let artifact = crate::module::loader::load(std::path::Path::new(&path), false).unwrap();
     let barrier = Arc::new(NativeBarrier {
-        state: StdMutex::new((None, false, false)), changed: Condvar::new(),
-        entered: Notify::new(), joined: Notify::new(), finish_gate: StdMutex::new(None),
+        state: StdMutex::new((None, false, false)),
+        changed: Condvar::new(),
+        entered: Notify::new(),
+        joined: Notify::new(),
+        finish_gate: StdMutex::new(None),
     });
-    let controls = NativeControls { ctx: Arc::as_ptr(&barrier).cast_mut().cast(), entered: native_entered, joined: native_joined };
-    let config = unsafe { std::slice::from_raw_parts(std::ptr::from_ref(&controls).cast::<u8>(), size_of::<NativeControls>()) }.to_vec();
+    let controls = NativeControls {
+        ctx: Arc::as_ptr(&barrier).cast_mut().cast(),
+        entered: native_entered,
+        joined: native_joined,
+    };
+    let config = unsafe {
+        std::slice::from_raw_parts(
+            std::ptr::from_ref(&controls).cast::<u8>(),
+            size_of::<NativeControls>(),
+        )
+    }
+    .to_vec();
     let (transport, host) = ModuleTransport::new("actual-native".into(), config);
     (transport, host, artifact.init, barrier)
 }
@@ -1472,30 +1547,47 @@ async fn actual_native_late_init_is_joined_after_initiator_abandonment() {
     let (transport, host, init, barrier) = native_fixture();
     transport.defer_initialize(init, host);
     let waiter = tokio::spawn({
-        let transport = transport.clone(); async move { transport.ensure_initialized().await }
+        let transport = transport.clone();
+        async move { transport.ensure_initialized().await }
     });
     barrier.entered.notified().await;
     let mut observation = Box::pin(transport.ensure_initialized());
     std::future::poll_fn(|cx| {
         assert!(std::future::Future::poll(observation.as_mut(), cx).is_pending());
         std::task::Poll::Ready(())
-    }).await;
+    })
+    .await;
     drop(observation);
-    assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 1, "observer abandonment cannot cancel initiating owner");
+    assert_eq!(
+        unsafe { host_native_terminal_state(host.host_ctx) },
+        1,
+        "observer abandonment cannot cancel initiating owner"
+    );
     waiter.abort();
     assert!(waiter.await.unwrap_err().is_cancelled());
     let view = barrier.state.lock().unwrap().0.unwrap();
-    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 6);
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        6
+    );
     assert!(!barrier.state.lock().unwrap().2);
     {
         let mut state = barrier.state.lock().unwrap();
         state.1 = true;
         barrier.changed.notify_all();
     }
-    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified())
+        .await
+        .unwrap();
     let _physical_exit = transport.lifecycle.lock().await;
-    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 14);
-    assert_eq!(transport.context.physical.lock().unwrap().cleanup, CleanupState::Complete);
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        14
+    );
+    assert_eq!(
+        transport.context.physical.lock().unwrap().cleanup,
+        CleanupState::Complete
+    );
     assert!(transport.ensure_initialized().await.is_err());
 }
 
@@ -1503,16 +1595,30 @@ async fn actual_native_late_init_is_joined_after_initiator_abandonment() {
 #[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
 async fn actual_native_eager_fault_denies_while_config_remains_borrowed_then_joins() {
     let (transport, host, init, barrier) = native_fixture();
-    let host = DeferredInitializer { initialize: Box::new(|_| unreachable!()), host };
+    let host = DeferredInitializer {
+        initialize: Box::new(|_| unreachable!()),
+        host,
+    };
     let eager = std::thread::spawn({
         let transport = transport.clone();
-        move || { let owner = host; transport.eager_initialize(init, owner.host) }
+        move || {
+            let owner = host;
+            transport.eager_initialize(init, owner.host)
+        }
     });
     barrier.entered.notified().await;
     let view = barrier.state.lock().unwrap().0.unwrap();
-    unsafe { (view.fault)(view.host_ctx, std::ptr::null(), 0); }
-    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 6);
-    assert_eq!(transport.context.config.lock().unwrap().len(), size_of::<NativeControls>());
+    unsafe {
+        (view.fault)(view.host_ctx, std::ptr::null(), 0);
+    }
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        6
+    );
+    assert_eq!(
+        transport.context.config.lock().unwrap().len(),
+        size_of::<NativeControls>()
+    );
     assert!(!barrier.state.lock().unwrap().2);
     {
         let mut state = barrier.state.lock().unwrap();
@@ -1520,23 +1626,33 @@ async fn actual_native_eager_fault_denies_while_config_remains_borrowed_then_joi
         barrier.changed.notify_all();
     }
     assert!(eager.join().unwrap().is_err());
-    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified())
+        .await
+        .unwrap();
     let _physical_exit = transport.lifecycle.lock().await;
-    assert_eq!(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }, 14);
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        14
+    );
     assert!(transport.context.config.lock().unwrap().is_empty());
 }
-
 
 async fn wait_physical_cleanup(transport: &ModuleTransport) {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let changed = transport.context.physical_notify.notified();
-            let terminal = matches!(transport.context.physical.lock().unwrap().cleanup,
-                CleanupState::Complete | CleanupState::Uncertain | CleanupState::NoCallbackRequired);
-            if terminal { return; }
+            let terminal = matches!(
+                transport.context.physical.lock().unwrap().cleanup,
+                CleanupState::Complete | CleanupState::Uncertain | CleanupState::NoCallbackRequired
+            );
+            if terminal {
+                return;
+            }
             changed.await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -1546,13 +1662,22 @@ async fn observing_fault_owned_job_does_not_create_ordinary_stop_marker() {
     transport.defer_initialize(initialize_ok, host);
     assert!(transport.ensure_initialized().await.is_err());
     assert!(!transport.stop_task_spawned());
-    assert!(matches!(transport.clone().stop(Duration::from_secs(1)).await, Err(StopError::NotStarted(_))));
-    assert!(!transport.stop_task_spawned(), "fault-owned uncertainty cannot become an ordinary handoff");
+    assert!(matches!(
+        transport.clone().stop(Duration::from_secs(1)).await,
+        Err(StopError::NotStarted(_))
+    ));
+    assert!(
+        !transport.stop_task_spawned(),
+        "fault-owned uncertainty cannot become an ordinary handoff"
+    );
 }
 
 #[tokio::test]
 async fn ordinary_shutdown_retains_non_ok_return_without_physical_success() {
-    let _lock = VTABLE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let _lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     let (transport, host) = ModuleTransport::new("shutdown-status".into(), vec![]);
     transport.defer_initialize(initialize_ok, host);
     transport.ensure_initialized().await.unwrap();
@@ -1560,17 +1685,30 @@ async fn ordinary_shutdown_retains_non_ok_return_without_physical_success() {
     SHUTDOWN_BLOCKED.store(false, Ordering::Release);
     let result = transport.clone().stop(Duration::from_secs(1)).await;
     SHUTDOWN_CODE.store(TB_OK, Ordering::Release);
-    assert_eq!(result.unwrap(), TB_TIMEOUT, "ordinary public return remains compatible");
+    assert_eq!(
+        result.unwrap(),
+        TB_TIMEOUT,
+        "ordinary public return remains compatible"
+    );
     assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 2);
-    assert_eq!(transport.context.physical.lock().unwrap().cleanup, CleanupState::Uncertain);
+    assert_eq!(
+        transport.context.physical.lock().unwrap().cleanup,
+        CleanupState::Uncertain
+    );
     assert!(transport.stop_task_spawned());
-    assert!(transport.is_stopped(), "legacy stopped is separate from physical-success proof");
+    assert!(
+        transport.is_stopped(),
+        "legacy stopped is separate from physical-success proof"
+    );
     assert!(!transport.is_faulted());
 }
 
 #[tokio::test]
 async fn rejected_module_outputs_never_invoke_untrusted_callbacks() {
-    let _lock = VTABLE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let _lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     SHUTDOWN_CALLS.store(0, Ordering::Release);
     for rejection in 0..4 {
         let (transport, host) = ModuleTransport::new(format!("rejected-{rejection}"), vec![]);
@@ -1599,15 +1737,29 @@ async fn rejected_ordinary_worker_submission_retains_original_lifecycle_guard() 
     transport.defer_initialize(initialize_ok, host);
     transport.ensure_initialized().await.unwrap();
     transport.reject_worker_spawn.store(true, Ordering::Release);
-    assert!(matches!(transport.clone().stop(Duration::from_secs(1)).await, Err(StopError::Started(_))));
+    assert!(matches!(
+        transport.clone().stop(Duration::from_secs(1)).await,
+        Err(StopError::Started(_))
+    ));
     assert!(transport.stop_task_spawned());
-    assert!(transport.lifecycle.try_lock().is_err(), "rejected closure cannot drop actual acquired guard");
+    assert!(
+        transport.lifecycle.try_lock().is_err(),
+        "rejected closure cannot drop actual acquired guard"
+    );
     let weak = Arc::downgrade(&transport);
     drop(transport);
-    let retained = weak.upgrade().expect("actual owner retained beyond host handle");
-    assert_eq!(retained.context.physical.lock().unwrap().cleanup, CleanupState::Uncertain);
+    let retained = weak
+        .upgrade()
+        .expect("actual owner retained beyond host handle");
+    assert_eq!(
+        retained.context.physical.lock().unwrap().cleanup,
+        CleanupState::Uncertain
+    );
     assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 2);
-    assert!(!retained.is_faulted(), "ordinary spawner failure is uncertainty, not module fault");
+    assert!(
+        !retained.is_faulted(),
+        "ordinary spawner failure is uncertainty, not module fault"
+    );
 }
 
 #[tokio::test]
@@ -1616,7 +1768,8 @@ async fn actual_native_deadline_fault_retains_late_cleanup_without_wall_clock_sl
     let (transport, host, init, barrier) = native_fixture();
     transport.defer_initialize(init, host);
     let waiter = tokio::spawn({
-        let transport = transport.clone(); async move { transport.ensure_initialized().await }
+        let transport = transport.clone();
+        async move { transport.ensure_initialized().await }
     });
     barrier.entered.notified().await;
     tokio::time::pause();
@@ -1631,7 +1784,9 @@ async fn actual_native_deadline_fault_retains_late_cleanup_without_wall_clock_sl
     }
     // Resume the real timer only for the outer stuck-test safety deadline.
     tokio::time::resume();
-    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified())
+        .await
+        .unwrap();
     wait_physical_cleanup(&transport).await;
     assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 14);
 }
@@ -1648,25 +1803,42 @@ async fn actual_native_fault_between_return_and_publication_uses_same_owner() {
     }));
     transport.defer_initialize(init, host);
     let waiter = tokio::spawn({
-        let transport = transport.clone(); async move { transport.ensure_initialized().await }
+        let transport = transport.clone();
+        async move { transport.ensure_initialized().await }
     });
     barrier.entered.notified().await;
     {
-        let mut state = barrier.state.lock().unwrap(); state.1 = true; barrier.changed.notify_all();
+        let mut state = barrier.state.lock().unwrap();
+        state.1 = true;
+        barrier.changed.notify_all();
     }
     publication_rx.await.unwrap();
-    let job = transport.context.physical.lock().unwrap().job.clone().unwrap();
-    unsafe { (host.fault)(host.host_ctx, std::ptr::null(), 0); }
+    let job = transport
+        .context
+        .physical
+        .lock()
+        .unwrap()
+        .job
+        .clone()
+        .unwrap();
+    unsafe {
+        (host.fault)(host.host_ctx, std::ptr::null(), 0);
+    }
     {
         let state = transport.context.physical.lock().unwrap();
         assert!(Arc::ptr_eq(&job, state.job.as_ref().unwrap()));
         assert_eq!(state.cleanup, CleanupState::Requested);
-        assert!(state.result.is_none(), "cleanup must not claim an empty publication");
+        assert!(
+            state.result.is_none(),
+            "cleanup must not claim an empty publication"
+        );
     }
     assert!(!barrier.state.lock().unwrap().2);
     release_tx.send(()).unwrap();
     assert!(waiter.await.unwrap().is_err());
-    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified())
+        .await
+        .unwrap();
     wait_physical_cleanup(&transport).await;
     assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 14);
 }
@@ -1676,31 +1848,47 @@ async fn actual_native_fault_between_return_and_publication_uses_same_owner() {
 async fn actual_native_reinitializer_fault_denies_before_c_returns_and_joins_once() {
     let (transport, host, init, barrier) = native_fixture();
     {
-        let mut state = barrier.state.lock().unwrap(); state.1 = true;
+        let mut state = barrier.state.lock().unwrap();
+        state.1 = true;
     }
     transport.defer_initialize(init, host);
     transport.ensure_initialized().await.unwrap();
     barrier.entered.notified().await;
     {
-        let mut state = barrier.state.lock().unwrap(); state.1 = false;
+        let mut state = barrier.state.lock().unwrap();
+        state.1 = false;
     }
     let reinit = tokio::spawn({
         let transport = transport.clone();
         async move { transport.reinitialize(crate::Secret::new(vec![])).await }
     });
     barrier.entered.notified().await;
-    unsafe { (host.fault)(host.host_ctx, std::ptr::null(), 0); }
+    unsafe {
+        (host.fault)(host.host_ctx, std::ptr::null(), 0);
+    }
     assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 6);
     assert!(!barrier.state.lock().unwrap().2);
-    assert!(transport.lifecycle.try_lock().is_err(), "actual C reinit owns physical exclusion");
+    assert!(
+        transport.lifecycle.try_lock().is_err(),
+        "actual C reinit owns physical exclusion"
+    );
     {
-        let mut state = barrier.state.lock().unwrap(); state.1 = true; barrier.changed.notify_all();
+        let mut state = barrier.state.lock().unwrap();
+        state.1 = true;
+        barrier.changed.notify_all();
     }
     reinit.await.unwrap().unwrap();
-    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified())
+        .await
+        .unwrap();
     wait_physical_cleanup(&transport).await;
     assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 14);
-    assert!(transport.reinitialize(crate::Secret::new(vec![])).await.is_err());
+    assert!(
+        transport
+            .reinitialize(crate::Secret::new(vec![]))
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -1708,20 +1896,42 @@ async fn actual_native_reinitializer_fault_denies_before_c_returns_and_joins_onc
 async fn actual_native_late_eager_publication_cannot_refund_failed_cleanup_spawn() {
     let (transport, host, init, barrier) = native_fixture();
     transport.reject_worker_spawn.store(true, Ordering::Release);
-    let host_owner = DeferredInitializer { initialize: Box::new(|_| unreachable!()), host };
+    let host_owner = DeferredInitializer {
+        initialize: Box::new(|_| unreachable!()),
+        host,
+    };
     let eager = std::thread::spawn({
         let transport = transport.clone();
-        move || { let owner = host_owner; transport.eager_initialize(init, owner.host) }
+        move || {
+            let owner = host_owner;
+            transport.eager_initialize(init, owner.host)
+        }
     });
     barrier.entered.notified().await;
-    unsafe { (host.fault)(host.host_ctx, std::ptr::null(), 0); }
-    let job = transport.context.physical.lock().unwrap().job.clone().unwrap();
-    assert_eq!(transport.context.physical.lock().unwrap().cleanup, CleanupState::Uncertain);
+    unsafe {
+        (host.fault)(host.host_ctx, std::ptr::null(), 0);
+    }
+    let job = transport
+        .context
+        .physical
+        .lock()
+        .unwrap()
+        .job
+        .clone()
+        .unwrap();
+    assert_eq!(
+        transport.context.physical.lock().unwrap().cleanup,
+        CleanupState::Uncertain
+    );
     {
-        let mut state = barrier.state.lock().unwrap(); state.1 = true; barrier.changed.notify_all();
+        let mut state = barrier.state.lock().unwrap();
+        state.1 = true;
+        barrier.changed.notify_all();
     }
     assert!(eager.join().unwrap().is_err());
-    transport.reject_worker_spawn.store(false, Ordering::Release);
+    transport
+        .reject_worker_spawn
+        .store(false, Ordering::Release);
     transport.request_terminal(true);
     {
         let state = transport.context.physical.lock().unwrap();
@@ -1729,9 +1939,15 @@ async fn actual_native_late_eager_publication_cannot_refund_failed_cleanup_spawn
         assert_eq!(state.cleanup, CleanupState::Uncertain);
         assert!(Arc::ptr_eq(&job, state.job.as_ref().unwrap()));
     }
-    assert!(transport.module.lock().unwrap().is_some(), "valid late output is cleanup access only");
+    assert!(
+        transport.module.lock().unwrap().is_some(),
+        "valid late output is cleanup access only"
+    );
     assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 6);
-    assert!(!barrier.state.lock().unwrap().2, "rejected submission must never be silently retried");
+    assert!(
+        !barrier.state.lock().unwrap().2,
+        "rejected submission must never be silently retried"
+    );
     let weak = Arc::downgrade(&transport);
     drop(transport);
     drop(job);
@@ -1742,31 +1958,59 @@ async fn actual_native_late_eager_publication_cannot_refund_failed_cleanup_spawn
     std::mem::forget(barrier);
 }
 
-
-unsafe extern "C" fn initialize_short_output(host: *const TbHostVtable, out: *mut TbModuleVtable) -> i32 {
-    unsafe { initialize_ok(host, out); (*out).size = TB_MODULE_VTABLE_BASE_SIZE - 1; }
+unsafe extern "C" fn initialize_short_output(
+    host: *const TbHostVtable,
+    out: *mut TbModuleVtable,
+) -> i32 {
+    unsafe {
+        initialize_ok(host, out);
+        (*out).size = TB_MODULE_VTABLE_BASE_SIZE - 1;
+    }
     TB_OK
 }
-unsafe extern "C" fn initialize_null_context_output(host: *const TbHostVtable, out: *mut TbModuleVtable) -> i32 {
-    unsafe { initialize_ok(host, out); (*out).module_ctx = std::ptr::null_mut(); }
+unsafe extern "C" fn initialize_null_context_output(
+    host: *const TbHostVtable,
+    out: *mut TbModuleVtable,
+) -> i32 {
+    unsafe {
+        initialize_ok(host, out);
+        (*out).module_ctx = std::ptr::null_mut();
+    }
     TB_OK
 }
-unsafe extern "C" fn initialize_missing_declared_reinit(host: *const TbHostVtable, out: *mut TbModuleVtable) -> i32 {
-    unsafe { initialize_ok(host, out); (*out).reinitialize = None; }
+unsafe extern "C" fn initialize_missing_declared_reinit(
+    host: *const TbHostVtable,
+    out: *mut TbModuleVtable,
+) -> i32 {
+    unsafe {
+        initialize_ok(host, out);
+        (*out).reinitialize = None;
+    }
     TB_OK
 }
-unsafe extern "C" fn initialize_non_ok_misleading_output(host: *const TbHostVtable, out: *mut TbModuleVtable) -> i32 {
-    unsafe { initialize_ok(host, out); }
+unsafe extern "C" fn initialize_non_ok_misleading_output(
+    host: *const TbHostVtable,
+    out: *mut TbModuleVtable,
+) -> i32 {
+    unsafe {
+        initialize_ok(host, out);
+    }
     TB_PANICKED
 }
 
 #[tokio::test]
 async fn eager_rejected_outputs_keep_uncertainty_and_never_call_returned_callbacks() {
-    let _lock = VTABLE_TEST_LOCK.get_or_init(|| tokio::sync::Mutex::new(())).lock().await;
+    let _lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
     SHUTDOWN_CALLS.store(0, Ordering::Release);
-    for init in [initialize_short_output as crate::module::abi::TbModuleInit,
-        initialize_null_context_output, initialize_missing_declared_reinit,
-        initialize_non_ok_misleading_output] {
+    for init in [
+        initialize_short_output as crate::module::abi::TbModuleInit,
+        initialize_null_context_output,
+        initialize_missing_declared_reinit,
+        initialize_non_ok_misleading_output,
+    ] {
         let (transport, host) = ModuleTransport::new("eager-invalid".into(), b"borrowed".to_vec());
         assert!(transport.eager_initialize(init, host).is_err());
         let state = transport.context.physical.lock().unwrap();
@@ -1789,25 +2033,38 @@ fn actual_native_initializer_owner_outlives_runtime_and_host_handle_drop() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async {
         let transport = transport.clone();
-        tokio::spawn(async move { let _ = transport.ensure_initialized().await; });
+        tokio::spawn(async move {
+            let _ = transport.ensure_initialized().await;
+        });
         barrier.entered.notified().await;
     });
     let weak = Arc::downgrade(&transport);
     drop(runtime);
     assert_eq!(unsafe { host_native_terminal_state(host.host_ctx) }, 6);
     drop(transport);
-    let retained = weak.upgrade().expect("real initializer owner survives runtime and host drop");
+    let retained = weak
+        .upgrade()
+        .expect("real initializer owner survives runtime and host drop");
     assert!(!barrier.state.lock().unwrap().2);
     {
-        let mut state = barrier.state.lock().unwrap(); state.1 = true; barrier.changed.notify_all();
+        let mut state = barrier.state.lock().unwrap();
+        state.1 = true;
+        barrier.changed.notify_all();
     }
     // The runtime is gone. Wait on the retained physical predicate/Condvar,
     // never on a Tokio task, deadline or notification as completion proof.
     let mut state = retained.context.physical.lock().unwrap();
     while state.cleanup != CleanupState::Complete {
-        let (next, timeout) = retained.context.physical_changed.wait_timeout(state, Duration::from_secs(2)).unwrap();
+        let (next, timeout) = retained
+            .context
+            .physical_changed
+            .wait_timeout(state, Duration::from_secs(2))
+            .unwrap();
         state = next;
-        assert!(!timeout.timed_out(), "actual retained native cleanup must finish");
+        assert!(
+            !timeout.timed_out(),
+            "actual retained native cleanup must finish"
+        );
     }
     drop(state);
     assert!(barrier.state.lock().unwrap().2);

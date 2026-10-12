@@ -68,7 +68,7 @@ pub(crate) struct ModuleTransport {
     initialization_gate: StdMutex<Option<bool>>,
     initialization_gate_changed: Notify,
     #[cfg(test)]
-    reject_worker_spawn: AtomicBool,
+    pub(crate) reject_worker_spawn: AtomicBool,
     #[cfg(test)]
     before_worker_lock: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
@@ -135,9 +135,24 @@ struct DeferredInitializer {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InitState { Deferred, Scheduled, Entered, PublishedValid, PublishedRejected, CanceledBeforeEntry, ExternalValid }
+enum InitState {
+    Deferred,
+    Scheduled,
+    Entered,
+    PublishedValid,
+    PublishedRejected,
+    CanceledBeforeEntry,
+    ExternalValid,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CleanupState { Idle, Requested, Executing, Complete, Uncertain, NoCallbackRequired }
+enum CleanupState {
+    Idle,
+    Requested,
+    Executing,
+    Complete,
+    Uncertain,
+    NoCallbackRequired,
+}
 
 struct PhysicalState {
     init: InitState,
@@ -153,9 +168,14 @@ struct PhysicalJob {
     guard: StdMutex<Option<tokio::sync::OwnedMutexGuard<()>>>,
     deadline: Duration,
     fault_on_spawn_failure: bool,
+    submitted: AtomicBool,
+    started: AtomicBool,
 }
 
-struct InitiatingWaiter<'a> { transport: &'a ModuleTransport, armed: bool }
+struct InitiatingWaiter<'a> {
+    transport: &'a ModuleTransport,
+    armed: bool,
+}
 impl Drop for InitiatingWaiter<'_> {
     fn drop(&mut self) {
         if self.armed {
@@ -207,8 +227,11 @@ impl ModuleTransport {
             owner: StdMutex::new(Weak::new()),
             native_terminal_state: AtomicU32::new(crate::module::abi::TB_NATIVE_TERMINAL_LIVE),
             physical: StdMutex::new(PhysicalState {
-                init: InitState::Deferred, cleanup: CleanupState::Idle,
-                job: None, result: None, code: None,
+                init: InitState::Deferred,
+                cleanup: CleanupState::Idle,
+                job: None,
+                result: None,
+                code: None,
             }),
             physical_changed: Condvar::new(),
             physical_notify: Notify::new(),
@@ -363,7 +386,11 @@ impl ModuleTransport {
     /// Publish physical completion only after the opaque shutdown returns.
     fn finish_stop(&self) {
         self.context.stopped.store(true, Ordering::Release);
-        self.context.inbound.lock().expect("host inbound lock").take();
+        self.context
+            .inbound
+            .lock()
+            .expect("host inbound lock")
+            .take();
         self.context.init_notify.notify_waiters();
         self.context.ready_notify.notify_waiters();
         self.context.wake.notify_waiters();
@@ -400,21 +427,39 @@ impl ModuleTransport {
         }
 
         let initiating = self.schedule_initializer()?;
-        let mut abandonment = InitiatingWaiter { transport: self, armed: initiating };
+        let mut abandonment = InitiatingWaiter {
+            transport: self,
+            armed: initiating,
+        };
         let wait = async {
             loop {
                 let changed = self.context.physical_notify.notified();
-                let result = self.context.physical.lock().expect("physical state lock").result.clone();
-                if let Some(result) = result { return result; }
+                let result = self
+                    .context
+                    .physical
+                    .lock()
+                    .expect("physical state lock")
+                    .result
+                    .clone();
+                if let Some(result) = result {
+                    return result;
+                }
                 changed.await;
             }
         };
         let result = match tokio::time::timeout(MODULE_INIT_DEADLINE, wait).await {
-            Ok(result) => { abandonment.armed = false; result }
-            Err(_) => {
-                if initiating { self.abandon_initialization(); }
+            Ok(result) => {
                 abandonment.armed = false;
-                return Err(Error::transport("module initialization exceeded its deadline"));
+                result
+            }
+            Err(_) => {
+                if initiating {
+                    self.abandon_initialization();
+                }
+                abandonment.armed = false;
+                return Err(Error::transport(
+                    "module initialization exceeded its deadline",
+                ));
             }
         };
         match result {
@@ -433,21 +478,34 @@ impl ModuleTransport {
 
     // Scheduling is synchronous: the externally anchored owner precedes submission.
     fn schedule_initializer(&self) -> Result<bool> {
-        let gate = self.initialization_gate.lock().expect("initialization gate lock");
+        let gate = self
+            .initialization_gate
+            .lock()
+            .expect("initialization gate lock");
         if *gate != Some(true) || self.is_faulted() || self.admission_closed() {
             return Err(Error::ConnectionClosed);
         }
         let mut state = self.context.physical.lock().expect("physical state lock");
-        if state.result.is_some() || state.init != InitState::Deferred { return Ok(false); }
-        let Some(initializer) = self.initializer.lock().expect("module initializer lock").take() else {
+        if state.result.is_some() || state.init != InitState::Deferred {
+            return Ok(false);
+        }
+        let Some(initializer) = self
+            .initializer
+            .lock()
+            .expect("module initializer lock")
+            .take()
+        else {
             state.result = Some(Err(InitFailure::Failed("module has no initializer".into())));
             return Ok(false);
         };
         let job = Arc::new(PhysicalJob {
             transport: self.self_ref.upgrade().ok_or(Error::ConnectionClosed)?,
-            initializer: StdMutex::new(Some(initializer)), guard: StdMutex::new(None),
+            initializer: StdMutex::new(Some(initializer)),
+            guard: StdMutex::new(None),
             deadline: MODULE_INIT_DEADLINE,
             fault_on_spawn_failure: true,
+            submitted: AtomicBool::new(false),
+            started: AtomicBool::new(false),
         });
         state.init = InitState::Scheduled;
         state.job = Some(job.clone());
@@ -460,6 +518,11 @@ impl ModuleTransport {
     }
 
     fn submit_job(job: Arc<PhysicalJob>) {
+        // Submission is spent even if the builder drops its closure. The
+        // external anchor remains; no caller can silently resubmit this job.
+        if job.submitted.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let submitted = job.clone();
         #[cfg(test)]
         let rejected = job.transport.reject_worker_spawn.load(Ordering::Acquire);
@@ -472,14 +535,22 @@ impl ModuleTransport {
             drop(worker);
             Err(std::io::Error::other("controlled worker rejection"))
         } else {
-            std::thread::Builder::new().name("tinybus-physical".into()).spawn(worker)
+            std::thread::Builder::new()
+                .name("tinybus-physical".into())
+                .spawn(worker)
         };
         if spawn.is_err() {
             let transport = &job.transport;
             transport.commit_terminal(job.fault_on_spawn_failure);
-            let mut state = transport.context.physical.lock().expect("physical state lock");
+            let mut state = transport
+                .context
+                .physical
+                .lock()
+                .expect("physical state lock");
             state.cleanup = CleanupState::Uncertain;
-            state.result.get_or_insert(Err(InitFailure::Failed("module physical worker could not start".into())));
+            state.result.get_or_insert(Err(InitFailure::Failed(
+                "module physical worker could not start".into(),
+            )));
             drop(state);
             transport.notify_physical();
         }
@@ -487,14 +558,18 @@ impl ModuleTransport {
 
     fn publish_terminal_flags(&self, fault: bool) {
         use crate::module::abi::{TB_NATIVE_TERMINAL_FAULT, TB_NATIVE_TERMINAL_STOP_INTENT};
-        if fault { self.context.faulted.store(true, Ordering::Release); }
+        if fault {
+            self.context.faulted.store(true, Ordering::Release);
+        }
         let flags = &self.context.native_terminal_state;
         let mut old = flags.load(Ordering::Acquire);
         loop {
-            let new = (old & !crate::module::abi::TB_NATIVE_TERMINAL_LIVE) |
-                TB_NATIVE_TERMINAL_STOP_INTENT | if fault { TB_NATIVE_TERMINAL_FAULT } else { 0 };
+            let new = (old & !crate::module::abi::TB_NATIVE_TERMINAL_LIVE)
+                | TB_NATIVE_TERMINAL_STOP_INTENT
+                | if fault { TB_NATIVE_TERMINAL_FAULT } else { 0 };
             match flags.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Acquire) {
-                Ok(_) => break, Err(current) => old = current,
+                Ok(_) => break,
+                Err(current) => old = current,
             }
         }
     }
@@ -504,10 +579,16 @@ impl ModuleTransport {
             let mut state = self.context.physical.lock().expect("physical state lock");
             // Linearize publication versus the initiating waiter's abandonment.
             // Atomic-only cause publication does not invert the host lock order.
-            if state.result.is_some() || self.context.native_terminal_state.load(Ordering::Acquire)
-                != crate::module::abi::TB_NATIVE_TERMINAL_LIVE { return; }
+            if state.result.is_some()
+                || self.context.native_terminal_state.load(Ordering::Acquire)
+                    != crate::module::abi::TB_NATIVE_TERMINAL_LIVE
+            {
+                return;
+            }
             self.publish_terminal_flags(true);
-            if state.cleanup == CleanupState::Idle { state.cleanup = CleanupState::Requested; }
+            if state.cleanup == CleanupState::Idle {
+                state.cleanup = CleanupState::Requested;
+            }
         }
         self.request_terminal(true);
     }
@@ -520,57 +601,111 @@ impl ModuleTransport {
     pub(crate) fn request_terminal(&self, fault: bool) {
         self.commit_terminal(fault);
         let mut state = self.context.physical.lock().expect("physical state lock");
-        if state.cleanup == CleanupState::Idle { state.cleanup = CleanupState::Requested; }
-        if state.job.is_some() || state.cleanup != CleanupState::Requested { return; }
+        if state.cleanup == CleanupState::Idle {
+            state.cleanup = CleanupState::Requested;
+        }
+        if state.job.is_some() || state.cleanup != CleanupState::Requested {
+            return;
+        }
         if state.init == InitState::Deferred {
             state.init = InitState::CanceledBeforeEntry;
             state.cleanup = CleanupState::NoCallbackRequired;
             state.result = Some(Err(InitFailure::Closed));
             drop(state);
-            self.initializer.lock().expect("module initializer lock").take();
+            self.initializer
+                .lock()
+                .expect("module initializer lock")
+                .take();
             self.clear_config();
             self.finish_stop();
             self.notify_physical();
             return;
         }
-        let Some(transport) = self.self_ref.upgrade() else { return; };
-        let job = Arc::new(PhysicalJob { transport, initializer: StdMutex::new(None),
-            guard: StdMutex::new(None), deadline: MODULE_INIT_DEADLINE, fault_on_spawn_failure: fault });
+        let Some(transport) = self.self_ref.upgrade() else {
+            return;
+        };
+        let job = Arc::new(PhysicalJob {
+            transport,
+            initializer: StdMutex::new(None),
+            guard: StdMutex::new(None),
+            deadline: MODULE_INIT_DEADLINE,
+            fault_on_spawn_failure: fault,
+            submitted: AtomicBool::new(false),
+            started: AtomicBool::new(false),
+        });
         state.job = Some(job.clone());
         drop(state);
         Self::submit_job(job);
     }
 
-    pub(crate) fn eager_initialize(&self, init: crate::module::abi::TbModuleInit, host: TbHostVtable) -> Result<()> {
+    pub(crate) fn eager_initialize(
+        &self,
+        init: crate::module::abi::TbModuleInit,
+        host: TbHostVtable,
+    ) -> Result<()> {
         let guard = self.lifecycle.clone().try_lock_owned().map_err(|_| {
             self.commit_terminal(true);
-            self.context.physical.lock().expect("physical state lock").cleanup = CleanupState::Uncertain;
+            self.context
+                .physical
+                .lock()
+                .expect("physical state lock")
+                .cleanup = CleanupState::Uncertain;
             Error::transport("module initialization lifecycle unavailable")
         })?;
-        self.context.physical.lock().expect("physical state lock").init = InitState::Entered;
+        self.context
+            .physical
+            .lock()
+            .expect("physical state lock")
+            .init = InitState::Entered;
         self.context.init_started.store(true, Ordering::Release);
         let mut module = TbModuleVtable::default();
         let code = unsafe { init(&host, &mut module) };
-        let result = if code == TB_OK { self.initialize(module) } else { Err(Error::transport("module initialization failed")) };
+        let result = if code == TB_OK {
+            self.initialize(module)
+        } else {
+            Err(Error::transport("module initialization failed"))
+        };
         self.clear_config();
         {
             let mut state = self.context.physical.lock().expect("physical state lock");
-            state.init = if result.is_ok() { InitState::ExternalValid } else { InitState::PublishedRejected };
-            state.result = Some(if result.is_ok() { Ok(()) } else { Err(InitFailure::Failed("module returned an invalid vtable".into())) });
+            state.init = if result.is_ok() {
+                InitState::ExternalValid
+            } else {
+                InitState::PublishedRejected
+            };
+            state.result.get_or_insert(if result.is_ok() {
+                Ok(())
+            } else {
+                Err(InitFailure::Failed(
+                    "module returned an invalid vtable".into(),
+                ))
+            });
             if result.is_err() {
                 state.cleanup = CleanupState::Uncertain;
                 if state.job.is_none() {
-                    state.job = self.self_ref.upgrade().map(|transport| Arc::new(PhysicalJob {
-                        transport, initializer: StdMutex::new(None), guard: StdMutex::new(None),
-                        deadline: MODULE_INIT_DEADLINE, fault_on_spawn_failure: true,
-                    }));
+                    state.job = self.self_ref.upgrade().map(|transport| {
+                        Arc::new(PhysicalJob {
+                            transport,
+                            initializer: StdMutex::new(None),
+                            guard: StdMutex::new(None),
+                            deadline: MODULE_INIT_DEADLINE,
+                            fault_on_spawn_failure: true,
+                            submitted: AtomicBool::new(false),
+                            started: AtomicBool::new(false),
+                        })
+                    });
                 }
             }
         }
         self.notify_physical();
         drop(guard);
-        if result.is_err() { self.request_terminal(true); return result; }
-        if self.is_faulted() || self.admission_closed() { return Err(Error::ConnectionClosed); }
+        if result.is_err() {
+            self.request_terminal(true);
+            return result;
+        }
+        if self.is_faulted() || self.admission_closed() {
+            return Err(Error::ConnectionClosed);
+        }
         result
     }
 
@@ -851,7 +986,10 @@ impl ModuleTransport {
         self.callbacks.wait_drained();
         let code = self.shutdown_sync(deadline.saturating_sub(started.elapsed()));
         if code == TB_OK {
-            self.context.native_terminal_state.fetch_or(crate::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, Ordering::AcqRel);
+            self.context.native_terminal_state.fetch_or(
+                crate::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED,
+                Ordering::AcqRel,
+            );
         }
         self.finish_stop();
         self.context
@@ -887,62 +1025,103 @@ impl ModuleTransport {
         let remaining = deadline.saturating_sub(started.elapsed());
         self.commit_terminal(false);
         let (_existing, job, mut acquired, ordinary_handoff) = {
-        let mut state = self.context.physical.lock().expect("physical state lock");
-        if state.cleanup == CleanupState::Idle { state.cleanup = CleanupState::Requested; }
-        let existing = state.job.is_some();
-        let mut acquired = Some(lifecycle);
-        let job = if existing || state.cleanup != CleanupState::Requested { None } else {
-            let job = Arc::new(PhysicalJob { transport: self.clone(),
-                initializer: StdMutex::new(None), guard: StdMutex::new(acquired.take()),
-                deadline: remaining, fault_on_spawn_failure: false });
-            state.job = Some(job.clone());
-            Some(job)
-        };
-        let ordinary_handoff = !self.is_faulted() && state.cleanup == CleanupState::Requested
-            && (job.is_some() || (existing && state.init == InitState::Scheduled));
-        if ordinary_handoff { self.stop_task_spawned.store(true, Ordering::Release); }
-        (existing, job, acquired, ordinary_handoff)
+            let mut state = self.context.physical.lock().expect("physical state lock");
+            if state.cleanup == CleanupState::Idle {
+                state.cleanup = CleanupState::Requested;
+            }
+            let existing = state.job.is_some();
+            let mut acquired = Some(lifecycle);
+            let job = if existing || state.cleanup != CleanupState::Requested {
+                None
+            } else {
+                let job = Arc::new(PhysicalJob {
+                    transport: self.clone(),
+                    initializer: StdMutex::new(None),
+                    guard: StdMutex::new(acquired.take()),
+                    deadline: remaining,
+                    fault_on_spawn_failure: false,
+                    submitted: AtomicBool::new(false),
+                    started: AtomicBool::new(false),
+                });
+                state.job = Some(job.clone());
+                Some(job)
+            };
+            let ordinary_handoff = !self.is_faulted()
+                && state.cleanup == CleanupState::Requested
+                && (job.is_some() || (existing && state.init == InitState::Scheduled));
+            if ordinary_handoff {
+                self.stop_task_spawned.store(true, Ordering::Release);
+            }
+            (existing, job, acquired, ordinary_handoff)
         };
         // A Scheduled initializer must acquire the guard itself to prove no C entry.
         drop(acquired.take());
-        if let Some(job) = job { Self::submit_job(job); }
-        let classify = |error| if ordinary_handoff { StopError::Started(error) } else { StopError::NotStarted(error) };
+        if let Some(job) = job {
+            Self::submit_job(job);
+        }
+        let classify = |error| {
+            if ordinary_handoff {
+                StopError::Started(error)
+            } else {
+                StopError::NotStarted(error)
+            }
+        };
         let wait = async {
             loop {
                 let changed = self.context.physical_notify.notified();
                 let outcome = {
-                let state = self.context.physical.lock().expect("physical state lock");
-                match state.cleanup {
-                    CleanupState::Complete | CleanupState::NoCallbackRequired => Some(Ok(state.code.unwrap_or(TB_CLOSED))),
-                    CleanupState::Uncertain => Some(match state.code {
-                        Some(code) => Ok(code),
-                        None => Err(classify(Error::transport("module cleanup is uncertain"))),
-                    }),
-                    _ => None,
-                }
+                    let state = self.context.physical.lock().expect("physical state lock");
+                    match state.cleanup {
+                        CleanupState::Complete | CleanupState::NoCallbackRequired => {
+                            Some(Ok(state.code.unwrap_or(TB_CLOSED)))
+                        }
+                        CleanupState::Uncertain => Some(match state.code {
+                            Some(code) => Ok(code),
+                            None => Err(classify(Error::transport("module cleanup is uncertain"))),
+                        }),
+                        _ => None,
+                    }
                 };
-                if let Some(outcome) = outcome { return outcome; }
+                if let Some(outcome) = outcome {
+                    return outcome;
+                }
                 changed.await;
             }
         };
-        tokio::time::timeout(remaining, wait).await.map_err(|_| classify(Error::failed("module shutdown exceeded its deadline")))?
-
+        tokio::time::timeout(remaining, wait)
+            .await
+            .map_err(|_| classify(Error::failed("module shutdown exceeded its deadline")))?
     }
 }
 
 impl PhysicalJob {
     fn run(self: Arc<Self>) {
+        self.started.store(true, Ordering::Release);
         let transport = &self.transport;
         #[cfg(test)]
         {
-            let hook = transport.before_worker_lock.lock().expect("worker test hook lock").take();
-            if let Some(hook) = hook { hook(); }
+            let hook = transport
+                .before_worker_lock
+                .lock()
+                .expect("worker test hook lock")
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
         }
-        let initializer = self.initializer.lock().expect("physical initializer lock").take();
+        let initializer = self
+            .initializer
+            .lock()
+            .expect("physical initializer lock")
+            .take();
         if let Some(initializer) = initializer {
             let guard = transport.lifecycle.clone().blocking_lock_owned();
             let entered = {
-                let mut state = transport.context.physical.lock().expect("physical state lock");
+                let mut state = transport
+                    .context
+                    .physical
+                    .lock()
+                    .expect("physical state lock");
                 if transport.admission_closed() || transport.is_faulted() {
                     state.init = InitState::CanceledBeforeEntry;
                     state.cleanup = CleanupState::NoCallbackRequired;
@@ -950,7 +1129,10 @@ impl PhysicalJob {
                     state.code = Some(TB_CLOSED);
                     state.job = None;
                     false
-                } else { state.init = InitState::Entered; true }
+                } else {
+                    state.init = InitState::Entered;
+                    true
+                }
             };
             if !entered {
                 drop(initializer);
@@ -959,43 +1141,88 @@ impl PhysicalJob {
                 transport.notify_physical();
                 return;
             }
-            let output = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| initializer.run()));
+            let output =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| initializer.run()));
             let result = match output {
-                Ok(Ok(module)) => transport.initialize(module.0).map_err(|_| InitFailure::Failed("module returned an invalid vtable".into())),
+                Ok(Ok(module)) => transport
+                    .initialize(module.0)
+                    .map_err(|_| InitFailure::Failed("module returned an invalid vtable".into())),
                 Ok(Err(reason)) => Err(InitFailure::Failed(reason)),
                 Err(_) => Err(InitFailure::Failed("module initialization panicked".into())),
             };
             transport.clear_config();
             #[cfg(test)]
             {
-                let hook = transport.before_init_publication.lock().expect("publication test hook lock").take();
-                if let Some(hook) = hook { hook(); }
+                let hook = transport
+                    .before_init_publication
+                    .lock()
+                    .expect("publication test hook lock")
+                    .take();
+                if let Some(hook) = hook {
+                    hook();
+                }
             }
-            if result.is_err() { transport.commit_terminal(true); }
+            if result.is_err() {
+                transport.commit_terminal(true);
+            }
             let cleanup = {
-                let mut state = transport.context.physical.lock().expect("physical state lock");
-                state.init = if result.is_ok() { InitState::PublishedValid } else { InitState::PublishedRejected };
-                state.result = Some(result.clone());
-                if result.is_err() { state.cleanup = CleanupState::Uncertain; }
-                if state.cleanup == CleanupState::Idle { state.job = None; }
+                let mut state = transport
+                    .context
+                    .physical
+                    .lock()
+                    .expect("physical state lock");
+                state.init = if result.is_ok() {
+                    InitState::PublishedValid
+                } else {
+                    InitState::PublishedRejected
+                };
+                state.result.get_or_insert(result.clone());
+                if result.is_err() {
+                    state.cleanup = CleanupState::Uncertain;
+                }
+                if state.cleanup == CleanupState::Idle {
+                    state.job = None;
+                }
                 state.cleanup == CleanupState::Requested
             };
             transport.notify_physical();
             drop(guard);
-            if !cleanup { return; }
+            if !cleanup {
+                return;
+            }
         } else {
             // Eager entry publishes before releasing its exclusion. Never hold
             // lifecycle while waiting for an initializer which needs that lock.
-            let mut state = transport.context.physical.lock().expect("physical state lock");
-            while matches!(state.init, InitState::Scheduled | InitState::Entered) && state.result.is_none() {
-                state = transport.context.physical_changed.wait(state).expect("physical state lock");
+            let mut state = transport
+                .context
+                .physical
+                .lock()
+                .expect("physical state lock");
+            while matches!(state.init, InitState::Scheduled | InitState::Entered)
+                && state.result.is_none()
+            {
+                state = transport
+                    .context
+                    .physical_changed
+                    .wait(state)
+                    .expect("physical state lock");
             }
         }
-        let guard = self.guard.lock().expect("physical guard lock").take()
+        let guard = self
+            .guard
+            .lock()
+            .expect("physical guard lock")
+            .take()
             .unwrap_or_else(|| transport.lifecycle.clone().blocking_lock_owned());
         {
-            let mut state = transport.context.physical.lock().expect("physical state lock");
-            if state.cleanup != CleanupState::Requested { return; }
+            let mut state = transport
+                .context
+                .physical
+                .lock()
+                .expect("physical state lock");
+            if state.cleanup != CleanupState::Requested {
+                return;
+            }
             if state.init == InitState::Deferred || state.init == InitState::CanceledBeforeEntry {
                 state.init = InitState::CanceledBeforeEntry;
                 state.cleanup = CleanupState::NoCallbackRequired;
@@ -1003,13 +1230,22 @@ impl PhysicalJob {
                 state.code = Some(TB_CLOSED);
                 state.job = None;
                 drop(state);
-                transport.initializer.lock().expect("module initializer lock").take();
+                transport
+                    .initializer
+                    .lock()
+                    .expect("module initializer lock")
+                    .take();
                 transport.clear_config();
                 transport.finish_stop();
                 transport.notify_physical();
                 return;
             }
-            if transport.module.lock().expect("module vtable lock").is_none() {
+            if transport
+                .module
+                .lock()
+                .expect("module vtable lock")
+                .is_none()
+            {
                 state.cleanup = CleanupState::Uncertain;
                 drop(state);
                 transport.notify_physical();
@@ -1017,11 +1253,23 @@ impl PhysicalJob {
             }
             state.cleanup = CleanupState::Executing;
         }
-        let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| transport.stop_sync(self.deadline)));
-        let mut state = transport.context.physical.lock().expect("physical state lock");
+        let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            transport.stop_sync(self.deadline)
+        }));
+        let mut state = transport
+            .context
+            .physical
+            .lock()
+            .expect("physical state lock");
         state.code = code.as_ref().ok().copied();
-        state.cleanup = if matches!(code, Ok(TB_OK)) { CleanupState::Complete } else { CleanupState::Uncertain };
-        if state.cleanup == CleanupState::Complete { state.job = None; }
+        state.cleanup = if matches!(code, Ok(TB_OK)) {
+            CleanupState::Complete
+        } else {
+            CleanupState::Uncertain
+        };
+        if state.cleanup == CleanupState::Complete {
+            state.job = None;
+        }
         drop(state);
         transport.notify_physical();
         drop(guard);
@@ -1030,8 +1278,10 @@ impl PhysicalJob {
 
 unsafe extern "C" fn host_native_terminal_state(ctx: *mut c_void) -> u32 {
     unsafe { ctx.cast::<HostContext>().as_ref() }.map_or(
-        crate::module::abi::TB_NATIVE_TERMINAL_STOP_INTENT | crate::module::abi::TB_NATIVE_TERMINAL_FAULT,
-        |context| context.native_terminal_state.load(Ordering::Acquire))
+        crate::module::abi::TB_NATIVE_TERMINAL_STOP_INTENT
+            | crate::module::abi::TB_NATIVE_TERMINAL_FAULT,
+        |context| context.native_terminal_state.load(Ordering::Acquire),
+    )
 }
 
 #[derive(Debug)]
@@ -1221,13 +1471,22 @@ unsafe extern "C" fn host_fault(ctx: *mut c_void, _: *const u8, _: usize) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Some(context) = unsafe { ctx.cast::<HostContext>().as_ref() } {
             context.faulted.store(true, Ordering::Release);
-            context.native_terminal_state.fetch_or(crate::module::abi::TB_NATIVE_TERMINAL_STOP_INTENT | crate::module::abi::TB_NATIVE_TERMINAL_FAULT, Ordering::AcqRel);
-            context.native_terminal_state.fetch_and(!crate::module::abi::TB_NATIVE_TERMINAL_LIVE, Ordering::AcqRel);
+            context.native_terminal_state.fetch_or(
+                crate::module::abi::TB_NATIVE_TERMINAL_STOP_INTENT
+                    | crate::module::abi::TB_NATIVE_TERMINAL_FAULT,
+                Ordering::AcqRel,
+            );
+            context.native_terminal_state.fetch_and(
+                !crate::module::abi::TB_NATIVE_TERMINAL_LIVE,
+                Ordering::AcqRel,
+            );
             context.init_notify.notify_waiters();
             context.ready_notify.notify_waiters();
             context.inbound.lock().expect("host inbound lock").take();
             let owner = context.owner.lock().expect("physical owner lock").upgrade();
-            if let Some(owner) = owner { owner.request_terminal(true); }
+            if let Some(owner) = owner {
+                owner.request_terminal(true);
+            }
         }
     }));
 }
