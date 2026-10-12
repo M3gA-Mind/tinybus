@@ -14,6 +14,7 @@ fn state(source: BusName, destination: BusName) -> Arc<CallbackState> {
     Arc::new(CallbackState {
         destination,
         endpoints: vec![endpoint()],
+        signals: vec![],
         module_transport: Mutex::new(None),
         lifetime: Mutex::new(Lifetime {
             active: true,

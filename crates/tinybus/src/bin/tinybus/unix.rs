@@ -527,6 +527,7 @@ fn render(message: &tinybus::Message) -> String {
     let h = &message.header;
     let kind = match h.kind {
         MessageKind::Signal => "signal",
+        MessageKind::DirectedSignal => "directed_signal",
         MessageKind::MethodCall => "call",
         MessageKind::MethodReturn => "return",
         MessageKind::Error => "error",

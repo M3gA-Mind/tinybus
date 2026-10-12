@@ -585,6 +585,21 @@ impl Router {
             .retain(|entry| !Arc::ptr_eq(entry, capability));
     }
 
+    #[cfg(feature = "modules")]
+    pub(crate) fn directed_signal_target(
+        &self,
+        source: &BusName,
+        destination: &BusName,
+        header: &crate::message::Header,
+    ) -> Result<mpsc::Sender<Message>> {
+        if !self.host_callbacks.iter().any(|capability| {
+            capability.matches_directed_signal(source, destination, header)
+        }) {
+            return Err(Error::failed("directed signal authority is unavailable"));
+        }
+        self.resolve(destination)
+    }
+
     /// The outbox of whoever owns `destination`.
     pub fn resolve(&self, destination: &BusName) -> Result<mpsc::Sender<Message>> {
         let id = self
