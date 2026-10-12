@@ -2742,3 +2742,7 @@ pub(crate) mod callbacks;
 #[cfg(test)]
 #[path = "host_required_tests.rs"]
 mod required_tests;
+
+#[cfg(test)]
+#[path = "host_reload_tests.rs"]
+mod reload_tests;
