@@ -27,6 +27,14 @@ struct Config {
     mode: u8,
     test_controls: Vec<u8>,
 }
+impl Drop for Config {
+    fn drop(&mut self) {
+        if self.test_controls.len() == size_of::<Controls>() {
+            let controls = unsafe { self.test_controls.as_ptr().cast::<Controls>().read_unaligned() };
+            controls.emit(19, u32::from(std::thread::current().name() == Some("tinybus-terminal")));
+        }
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Controls {
@@ -287,10 +295,10 @@ pub unsafe extern "C" fn tinybus_module_init_v1(
         // Product authority still comes exclusively from the untouched host query.
         if !host.config.ptr.is_null() {
             let bytes = unsafe { std::slice::from_raw_parts(host.config.ptr, host.config.len) };
-            if let Ok(config) = serde_json::from_slice::<Config>(bytes) {
-                if config.test_controls.len() == size_of::<Controls>() {
+            if let Ok(config) = serde_json::from_slice::<serde_json::Value>(bytes) {
+                if let Some(encoded) = config.get("test_controls").and_then(|value| serde_json::from_value::<Vec<u8>>(value.clone()).ok()).filter(|bytes| bytes.len() == size_of::<Controls>()) {
                     let controls = unsafe {
-                        config
+                        encoded
                             .test_controls
                             .as_ptr()
                             .cast::<Controls>()
