@@ -161,6 +161,12 @@ impl TerminalState {
     pub fn is_terminal(&self) -> bool { self.reason.load(Ordering::Acquire) != 0 }
     pub fn is_live(self: &Arc<Self>) -> bool {
         if self.is_terminal() { return false; }
+        self.observe_host();
+        !self.is_terminal()
+    }
+    // Cleanup must sample even when local Stop already closed admission: a real
+    // later native Fault is orthogonal to that local admission predicate.
+    pub fn observe_host(self: &Arc<Self>) {
         let flags = self.host.0.native_terminal_state.map(|query| unsafe { query(self.host.0.host_ctx) });
         if flags != Some(TB_NATIVE_TERMINAL_LIVE) {
             let reason = if flags.is_some_and(|flags| flags & TB_NATIVE_TERMINAL_FAULT != 0) {
@@ -169,9 +175,7 @@ impl TerminalState {
                 TerminalReason::Stop
             } else { TerminalReason::HostClosed };
             self.signal(reason);
-            return false;
         }
-        !self.is_terminal()
     }
     fn reason(&self) -> TerminalReason {
         match self.reason.load(Ordering::Acquire) { 1 => TerminalReason::Stop, 2 => TerminalReason::HostClosed,
@@ -330,11 +334,13 @@ impl TerminalState {
                 }
             }
         }
-        let future = future.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-        drop(future);
         let callback = reinitialize.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         if let Some(owner) = &self.owner { owner.stop(); }
+        let future = future.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        drop(future);
         drop(callback);
+        let request = self.lock().request.take();
+        drop(request);
         let future = reinit_future.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         drop(future);
         true

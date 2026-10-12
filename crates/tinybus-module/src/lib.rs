@@ -1316,11 +1316,11 @@ unsafe extern "C" fn terminal_shutdown(ctx: *mut c_void, deadline_ms: u64) -> i3
     let context = unsafe { &*ctx.cast::<TerminalRuntimeContext>() };
     let Some(state) = context.state() else { return TB_CLOSED; };
     let _scope = state.owner.as_ref().map(ExecutionOwner::enter);
-    state.is_live(); // sample actual host Fault before selecting ordinary Stop
+    state.observe_host(); // sample actual host Fault before selecting ordinary Stop
     state.signal(TerminalReason::Stop);
     let completion = state.wait(Duration::from_millis(deadline_ms));
     // Genuine source/native Fault cannot earn accepted-vtable physical success.
-    state.is_live();
+    state.observe_host();
     if completion != TerminalCompletion::PhysicallyStopped || state.has_fault() { return TB_PANICKED; }
     let retired = context.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
     drop(retired);
