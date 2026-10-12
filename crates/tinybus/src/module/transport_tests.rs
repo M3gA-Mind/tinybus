@@ -755,7 +755,15 @@ async fn stopping_initialized_module_before_ready_releases_observers_and_queued_
     assert!(!transport.init_failed(), "S29");
     let weak = Arc::downgrade(&transport);
     drop(transport);
-    assert!(weak.upgrade().is_none(), "S30");
+    // drain_started and init publication precede the actual task's Arc drop.
+    // Observe reclamation itself instead of treating either flag as task exit.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while weak.strong_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("S30");
 }
 
 #[tokio::test]
@@ -1572,10 +1580,13 @@ async fn actual_native_controller_is_owned_until_shutdown_callback_returns() {
     drop(barrier);
     let retained_through_transport = weak.upgrade().is_some();
     drop(transport);
-    assert!(
-        weak.upgrade().is_none(),
-        "successful fixture owner is reclaimed"
-    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while weak.strong_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("successful fixture owner is reclaimed after actual callback return");
     assert!(
         retained,
         "physical owner must retain the borrowed native controller"
