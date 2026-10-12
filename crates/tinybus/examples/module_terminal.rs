@@ -151,6 +151,7 @@ impl Future for SetupFuture {
 impl Drop for SetupFuture {
     fn drop(&mut self) {
         if self.mode == 48 || self.mode == 49 {
+            self.controller.observe(39);
             self.controller
                 .emit(38, u32::from(tokio::runtime::Handle::try_current().is_ok()));
         }
