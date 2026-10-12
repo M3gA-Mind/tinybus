@@ -26,6 +26,9 @@ use tinybus::module::abi::{
 use tinybus::{Connection, Error, Result, Transport};
 use tokio::sync::{Mutex, mpsc};
 
+mod execution_context;
+use execution_context::ExecutionOwner;
+
 const MODULE_QUEUE_CAPACITY: usize = 256;
 #[cfg(not(test))]
 const MODULE_REINITIALIZE_DEADLINE: Duration = Duration::from_secs(4);
@@ -323,6 +326,7 @@ fn module_connection(transport: Arc<ModuleTransport>) -> Connection {
 }
 
 struct RuntimeState {
+    owner: Option<ExecutionOwner>,
     inbound: StdMutex<Option<mpsc::Sender<IncomingFrame>>>,
     host: HostCalls,
     runtime: StdMutex<Option<tokio::runtime::Runtime>>,
@@ -378,6 +382,7 @@ unsafe extern "C" fn shutdown(ctx: *mut c_void, deadline_ms: u64) -> i32 {
             return TB_BAD_ARGUMENT;
         }
         let state = unsafe { &*(ctx.cast::<RuntimeState>()) };
+        let _caller = state.owner.as_ref().map(ExecutionOwner::enter);
         // An in-flight reinitializer finishes before disposal. Once the slot
         // is empty, late calls see a tombstone. Release the lock before joining
         // runtime tasks, whose failed-setup cleanup also uses this slot.
@@ -385,6 +390,9 @@ unsafe extern "C" fn shutdown(ctx: *mut c_void, deadline_ms: u64) -> i32 {
             .reinitialize
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(owner) = &state.owner {
+            owner.stop();
+        }
         callback.take();
         drop(callback);
         state.inbound.lock().expect("module inbound lock").take();
@@ -563,53 +571,21 @@ where
         };
         let host = HostCalls(host);
 
-        // A cdylib carries its own statically linked `tracing` and `std` state;
-        // this registration is global to the module's copy, not the embedding
-        // host's. Failure therefore means this module runtime was initialized
-        // more than once and cannot safely replace the existing subscriber.
-        if !linked
-            && tracing::subscriber::set_global_default(HostSubscriber {
-                host,
-                next_span: AtomicU64::new(1),
-                max_level: tracing::level_filters::LevelFilter::TRACE,
-            })
-            .is_err()
-        {
-            return TB_CLOSED;
+        let owner = (!linked).then(|| ExecutionOwner::new(host));
+        if owner.is_some() {
+            ExecutionOwner::install_panic_hook();
+        }
+        let _caller = owner.as_ref().map(ExecutionOwner::enter);
+        let panic_location = owner
+            .as_ref()
+            .map(|owner| owner.panic_location.clone())
+            .unwrap_or_else(|| Arc::new(StdMutex::new(None)));
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        if let Some(owner) = &owner {
+            owner.configure(&mut builder);
         }
 
-        let panic_host = host;
-        let panic_location = std::sync::Arc::new(StdMutex::new(None::<String>));
-        let hook_location = panic_location.clone();
-        if !linked {
-            std::panic::set_hook(Box::new(move |panic| {
-                let location = panic.location().map_or_else(
-                    || "module panicked at an unknown location".to_string(),
-                    |location| {
-                        let file = std::path::Path::new(location.file())
-                            .file_name()
-                            .and_then(|file| file.to_str())
-                            .unwrap_or("module");
-                        format!(
-                            "module panicked at {}:{}:{}",
-                            file,
-                            location.line(),
-                            location.column()
-                        )
-                    },
-                );
-                // The payload is intentionally neither formatted nor forwarded:
-                // it may contain arguments, credentials, or recovery material.
-                *hook_location.lock().expect("panic location lock") = Some(location.clone());
-                panic_host.log(1, location.as_bytes());
-            }));
-        }
-
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(worker_threads)
-            .enable_all()
-            .build()
-        {
+        let runtime = match builder.worker_threads(worker_threads).enable_all().build() {
             Ok(runtime) => runtime,
             Err(_) => return TB_CLOSED,
         };
@@ -623,8 +599,14 @@ where
         let connection_slot = Arc::new(StdMutex::new(None));
         let task_connection_slot = connection_slot.clone();
 
-        let reinitializer =
-            reinitialize_factory.map(|factory| factory(runtime.handle().clone(), connection_slot));
+        let reinitializer = reinitialize_factory.map(|factory| {
+            let callback = factory(runtime.handle().clone(), connection_slot);
+            let owner = owner.clone();
+            Box::new(move |ptr, len| {
+                let _caller = owner.as_ref().map(ExecutionOwner::enter);
+                callback(ptr, len)
+            }) as Reinitialize
+        });
         let supports_reinitialize = reinitializer.is_some();
         let reinitializer = Arc::new(StdMutex::new(reinitializer));
         let failed_setup_callback = reinitializer.clone();
@@ -682,6 +664,7 @@ where
         });
 
         let state = Box::new(RuntimeState {
+            owner,
             host,
             inbound: StdMutex::new(Some(inbound_tx)),
             runtime: StdMutex::new(Some(runtime)),
@@ -738,6 +721,11 @@ where
     F: FnOnce(Connection, C) -> Fut + Send + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
+    let caller_owner = (!linked).then(|| ExecutionOwner::new(HostCalls(unsafe { *host })));
+    if caller_owner.is_some() {
+        ExecutionOwner::install_panic_hook();
+    }
+    let _caller = caller_owner.as_ref().map(ExecutionOwner::enter);
     let parsed = catch_unwind(AssertUnwindSafe(|| unsafe { parse_config::<C>(host) }));
     let config = match parsed {
         Ok(Ok(config)) => config,
@@ -918,6 +906,11 @@ where
     if unsafe { validate_start_arguments(host, out, worker_threads) }.is_none() {
         return TB_BAD_ARGUMENT;
     }
+    let caller_owner = (!linked).then(|| ExecutionOwner::new(HostCalls(unsafe { *host })));
+    if caller_owner.is_some() {
+        ExecutionOwner::install_panic_hook();
+    }
+    let _caller = caller_owner.as_ref().map(ExecutionOwner::enter);
     let parsed = catch_unwind(AssertUnwindSafe(|| unsafe { parse_config::<C>(host) }));
     let config = match parsed {
         Ok(Ok(config)) => config,
