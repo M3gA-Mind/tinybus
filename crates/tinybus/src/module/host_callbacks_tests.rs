@@ -1,6 +1,6 @@
 use super::*;
 use crate::message::Message;
-use crate::router::Router;
+use crate::router::{MatchRule, Router};
 use std::sync::atomic::AtomicUsize;
 
 fn endpoint() -> HostCallbackEndpoint {
