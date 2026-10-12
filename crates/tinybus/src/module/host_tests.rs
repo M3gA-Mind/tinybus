@@ -3212,3 +3212,42 @@ async fn actual_native_fault_during_ordinary_stop_keeps_fault_state_and_single_j
     );
     assert!(barrier.state.lock().unwrap().2);
 }
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_rejected_stop_submission_retains_guard_through_host_drop() {
+    let (transport, view, barrier, artifact, path) = controlled_native_transport().await;
+    let host = ModuleHost::new(Broker::new());
+    attach_controlled_native(&host, transport.clone(), artifact, &path).unwrap();
+    transport.reject_worker_spawn.store(true, Ordering::Release);
+    assert!(matches!(
+        transport.clone().stop(Duration::from_secs(1)).await,
+        Err(StopError::Started(_))
+    ));
+    let weak = Arc::downgrade(&transport);
+    drop(host);
+    drop(transport);
+    let retained = weak
+        .upgrade()
+        .expect("external anchor retains physical owner through real Host Drop");
+    assert!(retained.lifecycle_is_owned_for_test());
+    assert!(retained.stop_task_spawned());
+    assert!(!retained.is_faulted());
+    assert_eq!(
+        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
+        2
+    );
+    assert!(
+        !barrier.state.lock().unwrap().2,
+        "rejected submission is not physical completion"
+    );
+    retained.reject_worker_spawn.store(false, Ordering::Release);
+    retained.request_terminal(false);
+    assert!(
+        !barrier.state.lock().unwrap().2,
+        "Host Drop cannot refund and resubmit an uncertain owner"
+    );
+    // One deliberately retained native uncertainty instance, with its controller
+    // lifetime retained explicitly; no process-wide leak or backing-Drop claim.
+    std::mem::forget(barrier);
+}

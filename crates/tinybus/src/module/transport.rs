@@ -856,6 +856,7 @@ impl ModuleTransport {
                         if self.admission_closed() {
                             return Err(Error::ConnectionClosed);
                         }
+                        self.publish_terminal_flags(true);
                         drop(_pending);
                         self.request_terminal(true);
                         self.context.ready_notify.notify_waiters();
@@ -929,7 +930,7 @@ impl ModuleTransport {
                 pending.clear();
                 return;
             }
-            self.context.faulted.store(true, Ordering::Release);
+            self.publish_terminal_flags(true);
             std::mem::take(&mut *pending)
         };
         // Each of these calls incremented `inflight` when it was queued. The
@@ -998,6 +999,11 @@ impl ModuleTransport {
             .expect("host inbound lock")
             .take();
         code
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lifecycle_is_owned_for_test(&self) -> bool {
+        self.lifecycle.try_lock().is_err()
     }
 
     pub(crate) fn stop_task_spawned(&self) -> bool {
@@ -1311,7 +1317,7 @@ impl Transport for ModuleTransport {
                     return Err(Error::ConnectionClosed);
                 }
                 self.context.init_failed.store(true, Ordering::Release);
-                self.context.faulted.store(true, Ordering::Release);
+                self.publish_terminal_flags(true);
             }
             self.context.ready_notify.notify_waiters();
             if message.header.kind == MessageKind::MethodCall {
