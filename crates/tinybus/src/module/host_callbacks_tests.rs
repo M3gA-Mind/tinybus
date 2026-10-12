@@ -814,11 +814,15 @@ async fn await_native_attach<T: std::fmt::Debug>(
     attached: &Notify,
     load: &mut tokio::task::JoinHandle<T>,
 ) {
+    // This watchdog bounds a broken fixture, not product readiness. Admission
+    // walks directories and hashes the library before attachment can happen.
     tokio::select! {
+        biased;
         _ = attached.notified() => {},
-        result = load => panic!("native callback load ended before attach: {result:?}"),
-        _ = tokio::time::sleep(Duration::from_secs(2)) => {
-            panic!("native callback load did not reach attach before the setup deadline");
+        result = &mut *load => panic!("native callback load ended before attach: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(60)) => {
+            load.abort();
+            panic!("native callback fixture never attached");
         }
     }
 }
@@ -842,7 +846,10 @@ async fn setup_attachment_wait_allows_preload_to_outlive_product_deadlines() {
     // admission, hashing, and native loading take to establish that precondition.
     tokio::time::advance(Duration::from_secs(3)).await;
     tokio::task::yield_now().await;
-    assert!(!wait.is_finished(), "valid preload was mistaken for setup failure");
+    assert!(
+        !wait.is_finished(),
+        "valid preload was mistaken for setup failure"
+    );
     release.send(()).unwrap();
     attached.notify_one();
     wait.await.unwrap();
@@ -855,7 +862,30 @@ async fn setup_attachment_wait_reports_an_early_load_failure() {
     let wait = tokio::spawn(async move {
         await_native_attach(&attached, &mut load).await;
     });
-    assert!(wait.await.unwrap_err().is_panic());
+    let panic = wait.await.unwrap_err().into_panic();
+    let message = panic.downcast_ref::<String>().unwrap();
+    assert!(message.contains("load ended before attach"), "{message}");
+    assert!(message.contains("ConnectionClosed"), "{message}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn setup_attachment_watchdog_cancels_a_stuck_preload() {
+    let attached = Notify::new();
+    let mut load = tokio::spawn(std::future::pending::<()>());
+    let cancellation = load.abort_handle();
+    let wait = tokio::spawn(async move {
+        await_native_attach(&attached, &mut load).await;
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(61)).await;
+    let panic = wait.await.unwrap_err().into_panic();
+    let message = panic.downcast_ref::<&str>().unwrap();
+    assert_eq!(*message, "native callback fixture never attached");
+    tokio::task::yield_now().await;
+    assert!(
+        cancellation.is_finished(),
+        "stuck preload must be cancelled"
+    );
 }
 
 async fn native_callback_setup_failure_race(panic_setup: bool) {

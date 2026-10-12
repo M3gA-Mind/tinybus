@@ -1903,11 +1903,7 @@ fn module_host_helpers_preserve_safe_names_states_and_allowlist_decisions() {
             .to_string()
             .contains("absent")
     );
-    std::fs::write(
-        directory.join("modules.toml"),
-        "clock = \"not-a-hash\"\n",
-    )
-    .unwrap();
+    std::fs::write(directory.join("modules.toml"), "clock = \"not-a-hash\"\n").unwrap();
     assert!(
         check_file(&module)
             .unwrap_err()

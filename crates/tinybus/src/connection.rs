@@ -1028,7 +1028,11 @@ impl Connection {
     /// This plumbing does not grant native authority or replace the panic policy.
     #[doc(hidden)]
     pub fn __set_catch_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
-        *self.inner.catch_observer.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+        *self
+            .inner
+            .catch_observer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
     }
 
     /// What this connection will accept from peers sending it bulk streams.
@@ -1453,14 +1457,22 @@ async fn handle_call(inner: Arc<Inner>, message: Message, brokered: bool) {
         .read()
         .expect("panic handler lock")
         .clone();
-    let catch_observer = inner.catch_observer.read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let catch_observer = inner
+        .catch_observer
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let result = if header.stream_reply && header.confidential {
         Err(Error::protocol(
             "a confidential call cannot request a streamed reply",
         ))
     } else if let Some(panic_handler) = panic_handler {
-        match CatchUnwind::new(dispatch(&inner, &header, message.body, brokered), catch_observer).await {
+        match CatchUnwind::new(
+            dispatch(&inner, &header, message.body, brokered),
+            catch_observer,
+        )
+        .await
+        {
             Ok(result) => result,
             Err(()) => Err(panic_handler()),
         }
