@@ -82,6 +82,8 @@ pub(crate) struct ModuleTransport {
     before_worker_lock: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(test)]
     before_init_publication: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    after_cleanup_publication: StdMutex<Option<Box<dyn FnOnce() + Send>>>,
     // Native fixtures pass a borrowed controller through C config. Retain its
     // actual owner with the physical transport, including uncertain jobs.
     #[cfg(test)]
@@ -296,6 +298,8 @@ impl ModuleTransport {
             before_worker_lock: StdMutex::new(None),
             #[cfg(test)]
             before_init_publication: StdMutex::new(None),
+            #[cfg(test)]
+            after_cleanup_publication: StdMutex::new(None),
             #[cfg(test)]
             fixture_controller: StdMutex::new(None),
         });
@@ -1330,6 +1334,17 @@ impl PhysicalJob {
         }
         drop(state);
         transport.notify_physical();
+        #[cfg(test)]
+        {
+            let hook = transport
+                .after_cleanup_publication
+                .lock()
+                .expect("cleanup publication test hook lock")
+                .take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         drop(pending);
         drop(guard);
     }

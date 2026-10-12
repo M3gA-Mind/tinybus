@@ -2145,3 +2145,33 @@ async fn rejected_observer_after_ordinary_stop_preserves_nonfault_cause() {
         2
     );
 }
+
+#[tokio::test]
+async fn completed_shutdown_has_already_released_its_native_lifecycle_marker() {
+    let _guard = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    SHUTDOWN_CODE.store(TB_OK, Ordering::Release);
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    let (transport, host) = ModuleTransport::new("completed-shutdown".into(), vec![]);
+    transport.eager_initialize(initialize_ok, host).unwrap();
+    let published = Arc::new(Notify::new());
+    let entered = published.clone();
+    let (release, worker) = std::sync::mpsc::channel();
+    *transport.after_cleanup_publication.lock().unwrap() = Some(Box::new(move || {
+        entered.notify_one();
+        worker.recv().unwrap();
+    }));
+    let stopping = tokio::spawn(transport.clone().stop(Duration::from_secs(2)));
+    published.notified().await;
+    let result = stopping.await.unwrap();
+    let still_pending = transport.native_lifecycle_pending();
+    // Always release the worker before asserting, even against the unfixed code.
+    release.send(()).unwrap();
+    assert_eq!(result.unwrap(), TB_OK);
+    assert!(
+        !still_pending,
+        "completed cleanup still reports native work"
+    );
+}
