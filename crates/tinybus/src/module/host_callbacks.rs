@@ -38,6 +38,11 @@ pub(crate) struct CallbackState {
 }
 
 impl CallbackState {
+    pub(crate) async fn drain(self: &Arc<Self>, deadline: Duration) -> Result<()> {
+        tokio::time::timeout(deadline, HostCallbackGuard(self.clone()).drained())
+            .await
+            .map_err(|_| Error::failed("module callback work exceeded lifecycle deadline"))
+    }
     fn module_live(&self) -> bool {
         self.module_transport
             .lock()
@@ -606,6 +611,7 @@ impl ModuleHost {
                 state.active = true;
             }
             module.callback_config = Some(fingerprint);
+            module.callback_state = Some(binding.state.clone());
             self.inner
                 .broker
                 .router

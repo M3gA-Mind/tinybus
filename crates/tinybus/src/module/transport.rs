@@ -71,6 +71,7 @@ pub(crate) struct ModuleTransport {
     // owned guard moves into the blocking task, so a host-side timeout cannot
     // let a second lifecycle callback overlap the still-running first one.
     lifecycle: Arc<Mutex<()>>,
+    native_lifecycle_pending: Arc<AtomicBool>,
     stop_task_spawned: Arc<AtomicBool>,
     callbacks: CallbackGate,
     initialization_gate: StdMutex<Option<bool>>,
@@ -204,6 +205,21 @@ enum InitFailure {
     Failed(String),
 }
 
+// Native callbacks outlive canceled public waiters. Clear this marker before
+// releasing the mutex so an older callback cannot clear its successor's flag.
+struct NativeLifecyclePending(Arc<AtomicBool>);
+impl NativeLifecyclePending {
+    fn begin(pending: &Arc<AtomicBool>) -> Self {
+        pending.store(true, Ordering::Release);
+        Self(pending.clone())
+    }
+}
+impl Drop for NativeLifecyclePending {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 // The opaque host context is process-lifetime state and every callback is
 // required by the ABI to be thread-safe.
 unsafe impl Send for DeferredInitializer {}
@@ -269,6 +285,7 @@ impl ModuleTransport {
             pending: StdMutex::new(VecDeque::new()),
             drain_started: AtomicBool::new(false),
             lifecycle: Arc::new(Mutex::new(())),
+            native_lifecycle_pending: Arc::new(AtomicBool::new(false)),
             stop_task_spawned: Arc::new(AtomicBool::new(false)),
             callbacks: CallbackGate::default(),
             initialization_gate: StdMutex::new(Some(true)),
@@ -750,6 +767,17 @@ impl ModuleTransport {
         }
     }
 
+    pub(crate) fn native_lifecycle_pending(&self) -> bool {
+        self.native_lifecycle_pending.load(Ordering::Acquire)
+            || self
+                .context
+                .physical
+                .lock()
+                .expect("physical state lock")
+                .job
+                .is_some()
+    }
+
     pub(crate) fn is_ready(&self) -> bool {
         self.context.ready.load(Ordering::Acquire) && !self.is_faulted() && !self.is_stopped()
     }
@@ -790,8 +818,10 @@ impl ModuleTransport {
             .ok_or_else(|| Error::failed("module does not support reinitialization"))?;
         let module = SendModuleVtable(module);
         let remaining = MODULE_INIT_DEADLINE.saturating_sub(started.elapsed());
+        let pending = NativeLifecyclePending::begin(&self.native_lifecycle_pending);
         let task = tokio::task::spawn_blocking(move || {
             let _lifecycle = lifecycle;
+            let _pending = pending;
             unsafe { module.reinitialize(callback, bytes.expose_secret()) }
         });
         let code = tokio::time::timeout(remaining, task)
