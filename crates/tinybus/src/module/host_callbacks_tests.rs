@@ -558,6 +558,48 @@ fn configuration_fingerprints_preserve_json_equality_without_normalizing_strings
     );
 }
 
+// Private fixture-only release ownership. Drop never joins or asserts.
+struct ControlledRelease {
+    barrier: Arc<super::super::super::transport::tests::NativeBarrier>,
+    finish: Option<std::sync::mpsc::Sender<()>>,
+    resume: Option<tokio::sync::oneshot::Sender<()>>,
+    transport: Option<Arc<ModuleTransport>>,
+}
+impl ControlledRelease {
+    fn new(barrier: Arc<super::super::super::transport::tests::NativeBarrier>) -> Self {
+        Self { barrier, finish: None, resume: None, transport: None }
+    }
+}
+impl Drop for ControlledRelease {
+    fn drop(&mut self) {}
+}
+
+#[test]
+fn controlled_release_wakes_entry_and_releases_channels_on_early_unwind() {
+    use super::super::super::transport::tests::NativeBarrier;
+    let barrier = Arc::new(NativeBarrier {
+        state: Mutex::new((None, false, false)),
+        changed: std::sync::Condvar::new(),
+        entered: Notify::new(), joined: Notify::new(),
+        finish_gate: Mutex::new(None),
+    });
+    let (finish, receive) = std::sync::mpsc::channel();
+    let (resume, decision) = tokio::sync::oneshot::channel();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut cleanup = ControlledRelease::new(barrier.clone());
+        cleanup.finish = Some(finish);
+        cleanup.resume = Some(resume);
+        panic!("fixture assertion before controlled release");
+    }));
+    let finish_result = receive.try_recv();
+    let mut decision = decision;
+    let decision_result = decision.try_recv();
+    assert!(result.is_err());
+    assert!(barrier.state.lock().unwrap().1, "early unwind must wake native entry");
+    assert!(finish_result.is_ok(), "finish must be released, not disconnected");
+    assert!(decision_result.is_ok(), "decision must be released, not disconnected");
+}
+
 // Manually polling the public future lets ordinary shutdown commit while the
 // loader is suspended; no scheduler race decides which cancellation is tested.
 async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: bool) {
