@@ -1498,11 +1498,17 @@ unsafe impl Send for NativeBarrier {}
 unsafe impl Sync for NativeBarrier {}
 unsafe extern "C" fn native_entered(ctx: *mut c_void, host: *const TbHostVtable) {
     let barrier = unsafe { &*ctx.cast::<NativeBarrier>() };
-    let mut state = barrier.state.lock().unwrap();
+    let mut state = barrier
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     state.0 = Some(unsafe { *host });
     barrier.entered.notify_one();
     while !state.1 {
-        state = barrier.changed.wait(state).unwrap();
+        state = barrier
+            .changed
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 }
 unsafe extern "C" fn native_joined(ctx: *mut c_void) {
@@ -1512,9 +1518,15 @@ unsafe extern "C" fn native_joined(ctx: *mut c_void) {
     state.2 = true;
     barrier.joined.notify_one();
     drop(state);
-    let gate = barrier.finish_gate.lock().unwrap().take();
+    let gate = barrier
+        .finish_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    // This artificial gate runs after the fixture's actual worker join. A failed
+    // Rust assertion may disconnect it; never unwind through the C callback.
     if let Some(gate) = gate {
-        gate.recv().unwrap();
+        let _ = gate.recv();
     }
 }
 pub(crate) fn native_fixture() -> (

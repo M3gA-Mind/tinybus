@@ -1024,6 +1024,7 @@ impl Connection {
     }
 
     /// Install SDK-local catch-time notification before a method panic payload drops.
+    /// Requires `__set_panic_handler`: without a handler no catch fence is constructed.
     /// The observer must be bounded, must not unwind, and must never join workers.
     /// This plumbing does not grant native authority or replace the panic policy.
     #[doc(hidden)]
