@@ -501,6 +501,7 @@ async fn rollback_after_attach_releases_the_actual_initialization_observer() {
         host: &host,
         transport: Some(transport.clone()),
         committed: false,
+        cause: AdmissionTermination::Canceled,
     });
     assert!(!transport.init_started());
     assert!(host.list().is_empty());

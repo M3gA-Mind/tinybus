@@ -50,6 +50,14 @@ struct HostContext {
 }
 
 /// The broker-facing side of one loaded module.
+/// Admission errors remain faults; cancellation preserves an already committed
+/// ordinary stop. Neither classification can clear a real, sticky Fault.
+#[derive(Clone, Copy)]
+pub(crate) enum AdmissionTermination {
+    Failed,
+    Canceled,
+}
+
 pub(crate) struct ModuleTransport {
     self_ref: Weak<ModuleTransport>,
     module: StdMutex<Option<TbModuleVtable>>,
@@ -351,10 +359,11 @@ impl ModuleTransport {
         }
     }
 
-    // Admission rejection is a genuine fault, unlike ordinary shutdown. Never
-    // fabricate READY or init_started to release a rejected observer.
+    // Releasing rejected observers is cancellation, which may follow an actual
+    // ordinary stop. Never fabricate READY or init_started to release them.
     fn terminate_waiters(&self) {
-        self.request_terminal(true);
+        let fault = self.commit_admission_termination(AdmissionTermination::Canceled);
+        self.request_terminal(fault);
         self.context.init_notify.notify_waiters();
         self.context.ready_notify.notify_waiters();
         self.initialization_gate_changed.notify_waiters();
@@ -591,6 +600,19 @@ impl ModuleTransport {
             }
         }
         self.request_terminal(true);
+    }
+
+    pub(crate) fn commit_admission_termination(&self, cause: AdmissionTermination) -> bool {
+        let fault = match cause {
+            AdmissionTermination::Failed => true,
+            AdmissionTermination::Canceled => {
+                let flags = self.context.native_terminal_state.load(Ordering::Acquire);
+                flags & crate::module::abi::TB_NATIVE_TERMINAL_STOP_INTENT == 0
+                    || flags & crate::module::abi::TB_NATIVE_TERMINAL_FAULT != 0
+            }
+        };
+        self.commit_terminal(fault);
+        fault
     }
 
     pub(crate) fn commit_terminal(&self, fault: bool) {

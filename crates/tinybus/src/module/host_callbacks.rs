@@ -1,6 +1,7 @@
 //! Local, exact-instance confidential callbacks; never artifact attestation.
 
 use super::*;
+use crate::module::transport::AdmissionTermination;
 use crate::message::Header;
 use crate::transport::memory::MemoryTransport;
 use crate::{CallContext, Connection, Interface, InterfaceName, MemberName, ObjectPath};
@@ -490,6 +491,7 @@ impl ModuleHost {
             host: self,
             transport: None,
             committed: false,
+            cause: AdmissionTermination::Failed,
         };
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
@@ -576,19 +578,26 @@ impl ModuleHost {
             transport.release_initialization(true);
             transport
         };
+        // All setup operations above are genuine failures. From this point a
+        // dropped waiter is cancellation; actual init error/deadline is explicit.
+        rollback.cause = AdmissionTermination::Canceled;
         let initialized = transport.ensure_initialized().await;
-        let ready = if initialized.is_ok() {
-            tokio::time::timeout(Duration::from_secs(5), transport.wait_ready())
-                .await
-                .is_ok()
-                && transport.is_ready()
-        } else {
-            false
+        let failure = match initialized {
+            Err(Error::ConnectionClosed) => Some(AdmissionTermination::Canceled),
+            Err(_) => Some(AdmissionTermination::Failed),
+            Ok(()) => match tokio::time::timeout(
+                Duration::from_secs(5), transport.wait_ready()
+            ).await {
+                Err(_) => Some(AdmissionTermination::Failed),
+                Ok(()) if !transport.is_ready() => Some(AdmissionTermination::Canceled),
+                Ok(()) => None,
+            },
         };
-        if !ready {
-            transport.commit_terminal(true);
+        if let Some(cause) = failure {
+            rollback.cause = cause;
+            let fault = transport.commit_admission_termination(cause);
             binding.revoke();
-            transport.request_terminal(true);
+            transport.request_terminal(fault);
             let _ = transport.close().await;
             self.inner
                 .loaded
@@ -633,15 +642,16 @@ struct LoadRollback<'a> {
     host: &'a ModuleHost,
     transport: Option<Arc<ModuleTransport>>,
     committed: bool,
+    cause: AdmissionTermination,
 }
 impl Drop for LoadRollback<'_> {
     fn drop(&mut self) {
         if self.committed {
             return;
         }
-        if let Some(transport) = &self.transport {
-            transport.commit_terminal(true);
-        }
+        let fault = self.transport.as_ref().map(|transport| {
+            transport.commit_admission_termination(self.cause)
+        });
         self.binding.revoke();
         self.binding.transport.close_outbound();
         self.binding
@@ -673,7 +683,7 @@ impl Drop for LoadRollback<'_> {
             }
             // A timed-out initializer may still run. Stop is best effort;
             // revocation/detach removes authority without claiming cessation.
-            transport.request_terminal(true);
+            transport.request_terminal(fault.expect("rollback transport cause"));
             self.host
                 .inner
                 .loaded
