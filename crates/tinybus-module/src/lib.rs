@@ -1336,7 +1336,7 @@ impl Transport for TerminalTransport {
 // The existing opaque module_ctx field is a bounded slot/generation token,
 // never a dereferenced pointer. Retirement denies old callbacks permanently.
 unsafe extern "C" fn terminal_deliver(ctx: *mut c_void, ptr: *const u8, len: usize) -> i32 {
-    if ctx.is_null() || ptr.is_null() || len > MAX_FRAME_LEN {
+    if ptr.is_null() || len > MAX_FRAME_LEN {
         return TB_BAD_ARGUMENT;
     }
     let Some(state) = terminal::TerminalState::lookup(ctx) else {
@@ -1361,9 +1361,6 @@ unsafe extern "C" fn terminal_deliver(ctx: *mut c_void, ptr: *const u8, len: usi
     }
 }
 unsafe extern "C" fn terminal_shutdown(ctx: *mut c_void, deadline_ms: u64) -> i32 {
-    if ctx.is_null() {
-        return TB_BAD_ARGUMENT;
-    }
     let Some(state) = terminal::TerminalState::lookup(ctx) else {
         return TB_CLOSED;
     };
@@ -1380,7 +1377,7 @@ unsafe extern "C" fn terminal_shutdown(ctx: *mut c_void, deadline_ms: u64) -> i3
     TB_OK
 }
 unsafe extern "C" fn terminal_reinitialize(ctx: *mut c_void, ptr: *const u8, len: usize) -> i32 {
-    if ctx.is_null() || len > 1024 * 1024 || (ptr.is_null() && len != 0) {
+    if len > 1024 * 1024 || (ptr.is_null() && len != 0) {
         return TB_BAD_ARGUMENT;
     }
     let Some(state) = terminal::TerminalState::lookup(ctx) else {
