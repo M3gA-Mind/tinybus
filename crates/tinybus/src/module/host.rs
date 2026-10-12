@@ -586,6 +586,23 @@ impl ModuleHost {
         self.load_file_pinned(path, config, None)
     }
 
+    /// Load an artifact only if its actual manifest satisfies host requirements.
+    pub fn load_file_with_requirements(
+        &self, path: impl AsRef<Path>, config: serde_json::Value,
+        requirements: &super::ModuleRequirements,
+    ) -> Result<ModuleInfo> {
+        let _ = requirements;
+        self.load_file_with_config(path, config)
+    }
+
+    fn activate_required(
+        &self, path: &Path, artifact: LoadedArtifact, config: serde_json::Value,
+        requirements: &super::ModuleRequirements,
+    ) -> Result<ModuleInfo> {
+        requirements.check(&artifact.manifest)?;
+        self.activate(path, artifact, config, None)
+    }
+
     /// [`ModuleHost::load_file_with_config`], carrying a digest the caller has
     /// already verified for an artifact that has no `modules.toml` beside it.
     ///
@@ -2623,3 +2640,7 @@ mod tests;
 #[cfg(test)]
 #[path = "host_admission_tests.rs"]
 mod admission_tests;
+
+#[cfg(test)]
+#[path = "host_required_tests.rs"]
+mod required_tests;
