@@ -513,3 +513,46 @@ async fn rollback_after_attach_releases_the_actual_initialization_observer() {
     .await
     .unwrap();
 }
+
+#[test]
+fn configuration_fingerprints_preserve_json_equality_without_normalizing_strings() {
+    fn fingerprint(value: &serde_json::Value) -> [u8; 32] {
+        let bytes = crate::Secret::new(serde_json::to_vec(value).unwrap());
+        callback_config_fingerprint(bytes.expose_secret())
+    }
+    let negative = serde_json::json!({
+        "z": [-0.0, {"number": -0.0, "text": "\"-0.0\"\\-0.0"}],
+        "credential": "private-test-secret",
+    });
+    // Construct the same map in reverse insertion order.
+    let mut positive = serde_json::Map::new();
+    positive.insert(
+        "credential".into(),
+        serde_json::json!("private-test-secret"),
+    );
+    positive.insert(
+        "z".into(),
+        serde_json::json!([
+            0.0, {"number": 0.0, "text": "\"-0.0\"\\-0.0"}
+        ]),
+    );
+    let positive = serde_json::Value::Object(positive);
+    assert_eq!(negative, positive);
+    assert_eq!(fingerprint(&negative), fingerprint(&positive));
+    for differing in [
+        serde_json::json!({"z": [0, {"number": 0.0, "text": "\"-0.0\"\\-0.0"}], "credential": "private-test-secret"}),
+        serde_json::json!({"z": [0.0, {"number": 0.0, "text": "\"0.0\"\\-0.0"}], "credential": "private-test-secret"}),
+        serde_json::json!({"z": [0.0, {"number": 0.0, "text": "\"-0.0\"\\-0.0"}], "credential": "different-private-test-secret"}),
+    ] {
+        assert_ne!(negative, differing);
+        assert_ne!(fingerprint(&negative), fingerprint(&differing));
+    }
+    assert_eq!(
+        fingerprint(&serde_json::json!(-0.0)),
+        fingerprint(&serde_json::json!(0.0))
+    );
+    assert_ne!(
+        fingerprint(&serde_json::json!(-0.01)),
+        fingerprint(&serde_json::json!(0.01))
+    );
+}
