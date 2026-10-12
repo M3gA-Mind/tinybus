@@ -166,6 +166,8 @@ pub struct TbHostVtable {
     /// The SDK trusts this callback under the unsafe module-init host contract;
     /// it is not authentication of arbitrary user-provided C vtables.
     pub broker_routing: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
+    /// Optional native per-instance terminal state query.
+    pub native_terminal_state: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
 }
 
 /// Size required from an older host before reading its frozen prefix.
@@ -206,6 +208,7 @@ impl TbHostVtable {
             config: base.config,
             ready: base.ready,
             broker_routing,
+            native_terminal_state: None,
         })
     }
 }

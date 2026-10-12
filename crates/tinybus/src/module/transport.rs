@@ -209,6 +209,7 @@ impl ModuleTransport {
             config: config_slice,
             ready: host_ready,
             broker_routing: Some(host_broker_routing),
+            native_terminal_state: None,
         };
         (transport, vtable)
     }
