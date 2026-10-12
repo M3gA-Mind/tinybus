@@ -66,6 +66,18 @@ impl Broker {
         }
     }
 
+    /// Create a broker whose module control belongs to one host-selected peer.
+    #[cfg(feature = "modules")]
+    pub fn new_restricted_module_control() -> Self {
+        Self::new()
+    }
+
+    /// Attach the concrete transport selected by the host as module controller.
+    #[cfg(feature = "modules")]
+    pub fn attach_module_controller(&self, transport: Arc<dyn Transport>) -> Result<BusName> {
+        Ok(self.attach(transport))
+    }
+
     /// This broker's id, as reported by the bus's `GetId`.
     pub fn id(&self) -> &str {
         &self.id
@@ -767,3 +779,7 @@ async fn reader_task(broker: Broker, transport: Arc<dyn Transport>, id: u64, nam
 #[cfg(test)]
 #[path = "broker_tests.rs"]
 mod tests;
+
+#[cfg(all(test, feature = "modules"))]
+#[path = "broker_module_control_tests.rs"]
+mod module_control_tests;

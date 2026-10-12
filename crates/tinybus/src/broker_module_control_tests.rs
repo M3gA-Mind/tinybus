@@ -1,0 +1,239 @@
+use super::*;
+use crate::Connection;
+use crate::module::host::{ModuleControl, ModuleInfo, ModuleState, ModuleTransition};
+use crate::transport::memory::MemoryTransport;
+use std::path::PathBuf;
+use std::time::Duration;
+
+const DENIED: &str = "ai.tinyhumans.tinybus.Error.ModuleControlDenied";
+
+#[derive(Default)]
+struct RecordingControl(Mutex<Vec<&'static str>>);
+
+impl RecordingControl {
+    fn changed(&self, operation: &'static str) -> ModuleInfo {
+        self.0.lock().unwrap().push(operation);
+        ModuleInfo {
+            name: "fixture".into(),
+            version: "1.0.0".into(),
+            file: "fixture.so".into(),
+            state: ModuleState::Ready,
+            manifest: serde_json::from_value(serde_json::json!({
+                "schema": 1,
+                "module": {"name": "fixture", "version": "1.0.0"},
+                "bus_name": "ai.tinyhumans.Fixture",
+                "object_path": "/ai/tinyhumans/Fixture"
+            }))
+            .unwrap(),
+            rustc_version: String::new(),
+            rustc_mismatch: false,
+            enabled: true,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl ModuleControl for RecordingControl {
+    fn list(&self) -> Vec<ModuleInfo> {
+        Vec::new()
+    }
+    fn load(
+        self: Arc<Self>,
+        _: PathBuf,
+        _: Value,
+    ) -> Result<(ModuleInfo, Option<ModuleTransition>)> {
+        Ok((self.changed("LoadModule"), None))
+    }
+    fn load_github(
+        self: Arc<Self>,
+        _: String,
+        _: String,
+        _: String,
+        _: Value,
+    ) -> Result<(ModuleInfo, Option<ModuleTransition>)> {
+        Ok((self.changed("LoadGithubModule"), None))
+    }
+    async fn stop(&self, _: &str, _: Duration) -> Result<ModuleInfo> {
+        Ok(self.changed("StopModule"))
+    }
+    async fn stop_after_lifecycle(&self, name: &str, deadline: Duration) -> Result<ModuleInfo> {
+        self.stop(name, deadline).await
+    }
+    async fn stop_inner(&self, name: &str, deadline: Duration) -> Result<ModuleInfo> {
+        self.stop(name, deadline).await
+    }
+    async fn reinitialize(&self, _: &str, _: Value) -> Result<ModuleInfo> {
+        Ok(self.changed("ReinitializeModule"))
+    }
+    fn enable(&self, _: &str, _: bool) -> Result<(ModuleInfo, Option<ModuleTransition>)> {
+        Ok((self.changed("EnableModule"), None))
+    }
+    fn rescan(
+        self: Arc<Self>,
+        _: Vec<PathBuf>,
+        _: bool,
+    ) -> Result<(Vec<ModuleInfo>, Vec<ModuleTransition>)> {
+        self.changed("RescanModules");
+        Ok((Vec::new(), Vec::new()))
+    }
+    fn peer_detached(&self, _: &BusName) -> Option<ModuleTransition> {
+        None
+    }
+    fn unavailable_for(&self, _: &BusName) -> Option<Error> {
+        None
+    }
+}
+
+async fn peer(broker: &Broker, controller: bool) -> Connection {
+    let (server, client) = MemoryTransport::pair();
+    if controller {
+        broker.attach_module_controller(Arc::new(server)).unwrap();
+    } else {
+        broker.attach(Arc::new(server));
+    }
+    Connection::connect(client).await.unwrap()
+}
+
+fn operations() -> Vec<(&'static str, Value)> {
+    vec![
+        (
+            "LoadModule",
+            serde_json::json!(["fixture.so", {"secret": "private"}]),
+        ),
+        (
+            "LoadGithubModule",
+            serde_json::json!(["url", "asset", "digest", {}]),
+        ),
+        (
+            "ReinitializeModule",
+            serde_json::json!(["fixture", {"secret": "private"}]),
+        ),
+        ("StopModule", serde_json::json!(["fixture", 1000])),
+        ("EnableModule", serde_json::json!(["fixture", false])),
+        ("RescanModules", serde_json::json!([[], false])),
+    ]
+}
+
+async fn invoke(
+    client: &Connection,
+    member: &str,
+    args: Value,
+    forged: Option<BusName>,
+) -> Result<Message> {
+    let mut message = Message::method_call(
+        BusName::new(crate::BUS_NAME).unwrap(),
+        ObjectPath::new(crate::BUS_PATH).unwrap(),
+        InterfaceName::new(crate::BUS_INTERFACE).unwrap(),
+        MemberName::new(member).unwrap(),
+        args,
+    );
+    message.header.sender = forged;
+    client.call_raw(message, Duration::from_secs(2)).await
+}
+
+fn install_control(broker: &Broker) -> Arc<RecordingControl> {
+    let control = Arc::new(RecordingControl::default());
+    let erased: Arc<dyn ModuleControl> = control.clone();
+    broker.set_module_control(Arc::downgrade(&erased));
+    control
+}
+
+#[tokio::test]
+async fn restricted_module_mutations_refuse_noncontroller_before_callbacks() {
+    let broker = Broker::new_restricted_module_control();
+    let control = install_control(&broker);
+    let owner = peer(&broker, true).await;
+    let stranger = peer(&broker, false).await;
+    for (member, args) in operations() {
+        let result = invoke(&stranger, member, args, Some(owner.unique_name().unwrap())).await;
+        assert!(
+            result.is_err(),
+            "unauthorized {member} reached control: {result:?}"
+        );
+        assert_eq!(result.unwrap_err().wire_name(), DENIED);
+        assert!(control.0.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn selected_controller_can_mutate_and_other_peers_can_inspect() {
+    let broker = Broker::new_restricted_module_control();
+    let control = install_control(&broker);
+    let owner = peer(&broker, true).await;
+    for (member, args) in operations() {
+        invoke(&owner, member, args, None).await.unwrap();
+    }
+    assert_eq!(
+        *control.0.lock().unwrap(),
+        operations()
+            .iter()
+            .map(|(member, _)| *member)
+            .collect::<Vec<_>>()
+    );
+    let stranger = peer(&broker, false).await;
+    let listed = invoke(&stranger, "ListModules", serde_json::json!([]), None)
+        .await
+        .unwrap();
+    assert_eq!(listed.body, serde_json::json!([]));
+}
+
+#[tokio::test]
+async fn restriction_starts_closed_and_denies_before_argument_parsing() {
+    let broker = Broker::new_restricted_module_control();
+    let control = install_control(&broker);
+    let stranger = peer(&broker, false).await;
+    for (member, _) in operations() {
+        let error = invoke(
+            &stranger,
+            member,
+            serde_json::json!({"secret": "private"}),
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.wire_name(), DENIED);
+        assert!(!error.to_string().contains("private"));
+    }
+    assert!(control.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn controller_cannot_be_rebound_through_a_clone_or_after_disconnect() {
+    let broker = Broker::new_restricted_module_control();
+    let control = install_control(&broker);
+    let owner = peer(&broker, true).await;
+    let (server, _client) = MemoryTransport::pair();
+    assert!(
+        broker
+            .clone()
+            .attach_module_controller(Arc::new(server))
+            .is_err()
+    );
+    owner.close().await.unwrap();
+    let stranger = peer(&broker, false).await;
+    let (server, _client) = MemoryTransport::pair();
+    assert!(broker.attach_module_controller(Arc::new(server)).is_err());
+    let error = invoke(
+        &stranger,
+        "StopModule",
+        serde_json::json!(["fixture", 1]),
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.wire_name(), DENIED);
+    assert!(control.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn permissive_broker_retains_legacy_control_calls_and_cannot_claim_restricted_binding() {
+    let broker = Broker::new();
+    let control = install_control(&broker);
+    let client = peer(&broker, false).await;
+    for (member, args) in operations() {
+        invoke(&client, member, args, None).await.unwrap();
+    }
+    assert_eq!(control.0.lock().unwrap().len(), 6);
+    let (server, _client) = MemoryTransport::pair();
+    assert!(broker.attach_module_controller(Arc::new(server)).is_err());
+}
