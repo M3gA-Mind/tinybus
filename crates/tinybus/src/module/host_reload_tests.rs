@@ -163,28 +163,29 @@ async fn native_replacement_logs_and_sanitized_panics_use_only_its_original_host
             .starts_with("second:")
     );
     assert!(proxy.call::<serde_json::Value>("Panic", ()).await.is_err());
-    let logs = LOGS.get().unwrap().lock().unwrap();
-    assert_eq!(
-        logs[&first_key].len(),
-        first_count,
-        "B must not call A's original logging callback"
-    );
-    assert!(
-        logs[&second_key]
-            .iter()
-            .any(|line| line.contains("clock fixture served"))
-    );
-    assert!(
-        logs[&second_key]
-            .iter()
-            .any(|line| line.contains("module panicked at"))
-    );
-    assert!(
-        logs[&second_key]
-            .iter()
-            .all(|line| !line.contains("secret-token"))
-    );
-    drop(logs);
+    {
+        let logs = LOGS.get().unwrap().lock().unwrap();
+        assert_eq!(
+            logs[&first_key].len(),
+            first_count,
+            "B must not call A's original logging callback"
+        );
+        assert!(
+            logs[&second_key]
+                .iter()
+                .any(|line| line.contains("clock fixture served"))
+        );
+        assert!(
+            logs[&second_key]
+                .iter()
+                .any(|line| line.contains("module panicked at"))
+        );
+        assert!(
+            logs[&second_key]
+                .iter()
+                .all(|line| !line.contains("secret-token"))
+        );
+    }
     second.shutdown(Duration::from_secs(3)).await;
     broker_task.abort();
 }
