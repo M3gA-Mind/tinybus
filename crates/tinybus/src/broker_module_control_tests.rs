@@ -138,13 +138,12 @@ fn install_control(broker: &Broker) -> Arc<RecordingControl> {
     control
 }
 
-#[tokio::test]
-async fn restricted_module_mutations_refuse_noncontroller_before_callbacks() {
+async fn refuse_noncontroller(index: usize) {
     let broker = Broker::new_restricted_module_control();
     let control = install_control(&broker);
     let owner = peer(&broker, true).await;
     let stranger = peer(&broker, false).await;
-    for (member, args) in operations() {
+    for (member, args) in operations().into_iter().skip(index).take(1) {
         let result = invoke(&stranger, member, args, Some(owner.unique_name().unwrap())).await;
         assert!(
             result.is_err(),
@@ -153,6 +152,36 @@ async fn restricted_module_mutations_refuse_noncontroller_before_callbacks() {
         assert_eq!(result.unwrap_err().wire_name(), DENIED);
         assert!(control.0.lock().unwrap().is_empty());
     }
+}
+
+#[tokio::test]
+async fn restricted_load_refuses_noncontroller_before_callback() {
+    refuse_noncontroller(0).await;
+}
+
+#[tokio::test]
+async fn restricted_github_load_refuses_noncontroller_before_callback() {
+    refuse_noncontroller(1).await;
+}
+
+#[tokio::test]
+async fn restricted_reinitialize_refuses_noncontroller_before_callback() {
+    refuse_noncontroller(2).await;
+}
+
+#[tokio::test]
+async fn restricted_stop_refuses_noncontroller_before_callback() {
+    refuse_noncontroller(3).await;
+}
+
+#[tokio::test]
+async fn restricted_enable_refuses_noncontroller_before_callback() {
+    refuse_noncontroller(4).await;
+}
+
+#[tokio::test]
+async fn restricted_rescan_refuses_noncontroller_before_callback() {
+    refuse_noncontroller(5).await;
 }
 
 #[tokio::test]
