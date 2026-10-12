@@ -1060,6 +1060,11 @@ async fn queued_readiness_and_backpressure_retire_before_actual_shutdown_returns
     transport.send(call()).await.expect("A12");
     let stopping = tokio::spawn(transport.clone().stop(Duration::from_secs(2)));
     shutdown_entry().await;
+    assert_eq!(
+        transport.context.physical.lock().unwrap().cleanup,
+        CleanupState::Executing,
+        "shutdown_entry must observe this transport, not a preceding fixture"
+    );
     tokio::time::timeout(Duration::from_millis(100), transport.wait_ready())
         .await
         .expect("A13");
