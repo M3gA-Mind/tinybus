@@ -115,12 +115,24 @@ mod controlled {
     #[derive(serde::Deserialize)]
     pub struct Config {
         pub mode: u8,
+        #[serde(default)]
+        record_drop: bool,
+    }
+    impl Drop for Config {
+        fn drop(&mut self) {
+            if self.record_drop {
+                let fixture = NEXT.lock().unwrap().as_ref().unwrap().clone();
+                fixture.config_drops.fetch_add(1, Ordering::SeqCst);
+                let _ = fixture.events.send(Event::ConfigDrop(std::thread::current().name().unwrap_or("unnamed").to_owned()));
+            }
+        }
     }
     #[derive(Debug)]
     pub enum Event {
         Poll(u8),
         Request,
         FutureDrop(String),
+        ConfigDrop(String),
         Finish,
         FactoryDrop(String),
     }
@@ -131,6 +143,7 @@ mod controlled {
         worker: StdMutex<Option<std::thread::JoinHandle<bool>>>,
         pub requests: AtomicUsize,
         pub joins: AtomicUsize,
+        pub config_drops: AtomicUsize,
         pub drop_off_lock: AtomicBool,
         pub request_off_lock: AtomicBool,
         pub future_drop_control: StdMutex<Option<(Arc<std::sync::Barrier>, bool)>>,
@@ -146,6 +159,7 @@ mod controlled {
             worker: StdMutex::new(None),
             requests: AtomicUsize::new(0),
             joins: AtomicUsize::new(0),
+            config_drops: AtomicUsize::new(0),
             drop_off_lock: AtomicBool::new(true),
             request_off_lock: AtomicBool::new(true),
             future_drop_control: StdMutex::new(None),
@@ -1047,7 +1061,7 @@ async fn controlled_prior_reinit_drop(panic: bool) {
     let caller_host = host.clone();
     let caller = tokio::spawn(async move {
         caller_host
-            .reinitialize("tinybus-module", serde_json::json!({"mode":0}))
+            .reinitialize("tinybus-module", serde_json::json!({"mode":0,"record_drop":true}))
             .await
     });
     let entered = events.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -1069,6 +1083,7 @@ async fn controlled_prior_reinit_drop(panic: bool) {
     }
     host.shutdown(Duration::from_secs(8)).await;
     let completion = view.inner.wait(Duration::from_secs(5));
+    assert_eq!(fixture.config_drops.load(Ordering::SeqCst), 0, "rejected reinit must not receive a config before prior retirement and LIVE admission");
     assert!(matches!(entered, controlled::Event::FutureDrop(name) if name == "tinybus-terminal"));
     assert!(not_finished_while_blocked && no_next_setup);
     assert!(result.is_err());
@@ -1095,4 +1110,36 @@ async fn actual_prior_reinit_drop_blocks_next_setup_then_stop_settles_same_job()
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_prior_reinit_drop_panic_retains_resources_but_attempts_finish_once() {
     controlled_prior_reinit_drop(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_reinit_config_is_destroyed_on_physical_worker_including_constructor_panic() {
+    let _serial = controlled::TEST_LOCK.lock().await;
+    for mode in [0, 4] {
+        let (fixture, events) = controlled::fixture();
+        let broker = tinybus::broker::Broker::new();
+        broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+        let host = Arc::new(tinybus::module::ModuleHost::new(broker));
+        host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":0})).unwrap();
+        events.recv_timeout(Duration::from_secs(3)).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !host.list().iter().any(|info| matches!(info.state, tinybus::module::ModuleState::Ready)) { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        let result = host.reinitialize("tinybus-module", serde_json::json!({"mode":mode,"record_drop":true})).await;
+        host.shutdown(Duration::from_secs(8)).await;
+        let mut names = Vec::new();
+        loop {
+            match events.recv_timeout(Duration::from_secs(5)).unwrap() {
+                controlled::Event::ConfigDrop(name) => names.push(name),
+                controlled::Event::Finish => break,
+                _ => {}
+            }
+        }
+        let view = fixture.view.lock().unwrap().as_ref().unwrap().clone();
+        let _completion = view.inner.wait(Duration::from_secs(5));
+        assert_eq!(result.is_ok(), mode == 0);
+        assert_eq!(fixture.config_drops.load(Ordering::SeqCst), 1);
+        assert_eq!(names, ["tinybus-terminal"], "accepted generic config Drop must run on the one physical worker");
+        assert_eq!(fixture.joins.load(Ordering::SeqCst), 1);
+    }
 }
