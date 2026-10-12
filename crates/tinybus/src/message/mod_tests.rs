@@ -59,6 +59,31 @@ fn a_signal_needs_no_destination() {
 }
 
 #[test]
+fn a_directed_signal_requires_one_unique_recipient_and_cannot_be_private() {
+    let mut signal = Message::directed_signal(
+        ":1.9".parse().unwrap(),
+        "/storage/Documents".parse().unwrap(),
+        "ai.tinyhumans.tinystorage.Storage".parse().unwrap(),
+        "WatchChanged".parse().unwrap(),
+        serde_json::json!([{"watch_id":"opaque","notice":{"kind":"invalidated"}}]),
+    );
+    signal.validate().unwrap();
+    assert_eq!(signal.header.kind, MessageKind::DirectedSignal);
+
+    signal.header.destination = Some("org.example.Module".parse().unwrap());
+    assert!(signal.validate().is_err());
+    signal.header.destination = Some(":1.9".parse().unwrap());
+    signal.header.confidential = true;
+    assert!(
+        signal
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("signal")
+    );
+}
+
+#[test]
 fn the_header_omits_absent_fields_rather_than_writing_nulls() {
     // Signals outnumber every other message on a busy bus; not writing
     // seven `null`s per signal is most of the framing cost.
@@ -74,7 +99,7 @@ fn the_header_omits_absent_fields_rather_than_writing_nulls() {
 }
 
 #[test]
-fn a_signal_cannot_be_confidential_because_it_is_a_broadcast() {
+fn a_signal_cannot_be_confidential() {
     let mut sig = Message::signal(
         ObjectPath::root(),
         InterfaceName::new("ai.tinyhumans.Test").unwrap(),
@@ -83,7 +108,7 @@ fn a_signal_cannot_be_confidential_because_it_is_a_broadcast() {
     );
     sig.header.confidential = true;
     let err = sig.validate().unwrap_err();
-    assert!(err.to_string().contains("broadcast"), "{err}");
+    assert!(err.to_string().contains("private body"), "{err}");
 }
 
 #[test]

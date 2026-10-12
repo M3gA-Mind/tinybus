@@ -1328,6 +1328,7 @@ fn rule_to_wire(rule: &MatchRule) -> String {
     if let Some(kind) = rule.kind {
         let name = match kind {
             MessageKind::Signal => "signal",
+            MessageKind::DirectedSignal => "directed_signal",
             MessageKind::MethodCall => "method_call",
             MessageKind::MethodReturn => "method_return",
             MessageKind::Error => "error",
@@ -1414,7 +1415,7 @@ async fn dispatch_loop(inner: Arc<Inner>) {
                     }
                 }
             }
-            MessageKind::Signal => {
+            MessageKind::Signal | MessageKind::DirectedSignal => {
                 // `send` fails only when nobody is subscribed, which is the
                 // common case for a service that emits but never listens.
                 let _ = inner

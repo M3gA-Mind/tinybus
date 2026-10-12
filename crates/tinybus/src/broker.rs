@@ -245,6 +245,29 @@ impl Broker {
                 }
                 Ok(())
             }
+            MessageKind::DirectedSignal => {
+                #[cfg(feature = "modules")]
+                {
+                    let destination = message
+                        .header
+                        .destination
+                        .as_ref()
+                        .ok_or_else(|| Error::protocol("directed signal has no destination"))?;
+                    let target = self
+                        .router
+                        .lock()
+                        .expect("router lock")
+                        .directed_signal_target(from_name, destination, &message.header)?;
+                    // This route is one recipient, not a match-rule broadcast.
+                    let _ = target.try_send(message);
+                    Ok(())
+                }
+                #[cfg(not(feature = "modules"))]
+                {
+                    let _ = (from, from_name, message);
+                    Err(Error::failed("directed signals require module support"))
+                }
+            }
             _ => {
                 let destination = message
                     .header
