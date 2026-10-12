@@ -131,6 +131,8 @@ mod controlled {
         worker: StdMutex<Option<std::thread::JoinHandle<bool>>>,
         pub requests: AtomicUsize,
         pub joins: AtomicUsize,
+        pub drop_off_lock: AtomicBool,
+        pub request_off_lock: AtomicBool,
     }
     static NEXT: StdMutex<Option<Arc<Fixture>>> = StdMutex::new(None);
     pub static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -143,6 +145,8 @@ mod controlled {
             worker: StdMutex::new(None),
             requests: AtomicUsize::new(0),
             joins: AtomicUsize::new(0),
+            drop_off_lock: AtomicBool::new(true),
+            request_off_lock: AtomicBool::new(true),
         });
         *NEXT.lock().unwrap() = Some(fixture.clone());
         (fixture, receiver)
@@ -180,6 +184,12 @@ mod controlled {
     }
     impl Drop for SetupFuture {
         fn drop(&mut self) {
+            if let Some(view) = self.fixture.view.lock().unwrap().as_ref() {
+                let slot = view.inner.resources.lock().unwrap().reinitialize.clone();
+                if slot.try_lock().is_err() {
+                    self.fixture.drop_off_lock.store(false, Ordering::Release);
+                }
+            }
             let _ = self.fixture.events.send(Event::FutureDrop(
                 std::thread::current()
                     .name()
@@ -230,6 +240,12 @@ mod controlled {
         };
         let hooks = RuntimeHooks::new(
             move |_| {
+                if let Some(view) = request.view.lock().unwrap().as_ref() {
+                    let slot = view.inner.resources.lock().unwrap().reinitialize.clone();
+                    if slot.try_lock().is_err() {
+                        request.request_off_lock.store(false, Ordering::Release);
+                    }
+                }
                 request.requests.fetch_add(1, Ordering::SeqCst);
                 *request.wake.0.lock().unwrap() = true;
                 request.wake.1.notify_all();
@@ -795,4 +811,54 @@ async fn actual_connection_object_drop_panic_fences_fault_after_owner_suppressio
     assert_eq!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED, 0);
     assert!(still_anchored, "panicking Connection teardown cannot refund admission");
     assert_ne!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn successful_repeated_reinit_disposes_prior_future_on_same_physical_worker_off_lock() {
+    let _serial = controlled::TEST_LOCK.lock().await;
+    let (fixture, events) = controlled::fixture();
+    let broker = tinybus::broker::Broker::new();
+    broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+    let host = Arc::new(tinybus::module::ModuleHost::new(broker));
+    host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":0})).unwrap();
+    events.recv_timeout(Duration::from_secs(3)).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !host.list().iter().any(|info| matches!(info.state, tinybus::module::ModuleState::Ready)) {
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    let first = host.reinitialize("tinybus-module", serde_json::json!({"mode":0})).await;
+    let second = host.reinitialize("tinybus-module", serde_json::json!({"mode":0})).await;
+    host.shutdown(Duration::from_secs(8)).await;
+    let drops: Vec<_> = events.try_iter().filter_map(|event| {
+        if let controlled::Event::FutureDrop(name) = event { Some(name) } else { None }
+    }).collect();
+    assert!(first.is_ok() && second.is_ok());
+    assert_eq!(drops.len(), 3);
+    assert!(drops.iter().all(|name| name == "tinybus-terminal"), "all completed futures must be destroyed by the sole physical worker: {drops:?}");
+    assert!(fixture.drop_off_lock.load(Ordering::Acquire));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_reinit_source_error_and_panic_request_outside_callback_exclusion() {
+    let _serial = controlled::TEST_LOCK.lock().await;
+    for mode in [3, 2, 4] {
+        let (fixture, events) = controlled::fixture();
+        let broker = tinybus::broker::Broker::new();
+        broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+        let host = Arc::new(tinybus::module::ModuleHost::new(broker));
+        host.attach_linked_with_config(controlled::linked_module().unwrap(), serde_json::json!({"mode":0})).unwrap();
+        events.recv_timeout(Duration::from_secs(3)).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !host.list().iter().any(|info| matches!(info.state, tinybus::module::ModuleState::Ready)) {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let result = host.reinitialize("tinybus-module", serde_json::json!({"mode":mode})).await;
+        host.shutdown(Duration::from_secs(8)).await;
+        assert!(result.is_err());
+        assert_eq!(fixture.requests.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.joins.load(Ordering::SeqCst), 1);
+        assert!(fixture.request_off_lock.load(Ordering::Acquire), "source fault request held reinitializer mutex in mode {mode}");
+    }
 }
