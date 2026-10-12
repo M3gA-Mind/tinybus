@@ -207,16 +207,16 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
         Some(tokio::spawn(async move {
             // Always release the observer, including a failed watchdog.
             let _release = CallbackRelease(probe_release);
-            let entered = tokio::time::timeout(
-                Duration::from_secs(5),
-                probe_entered.acquire(),
-            ).await;
-            let completed = tokio::time::timeout(
-                Duration::from_secs(1),
-                native_cleanup_finished(&transport),
-            ).await;
-            eprintln!("denial observer: entered={} actual_cleanup_while_held={}",
-                entered.is_ok(), completed.is_ok());
+            let entered =
+                tokio::time::timeout(Duration::from_secs(5), probe_entered.acquire()).await;
+            let completed =
+                tokio::time::timeout(Duration::from_secs(1), native_cleanup_finished(&transport))
+                    .await;
+            eprintln!(
+                "denial observer: entered={} actual_cleanup_while_held={}",
+                entered.is_ok(),
+                completed.is_ok()
+            );
             (entered.is_ok(), completed.is_ok())
         }))
     } else {
@@ -281,16 +281,16 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
         host.inner.stop(&loaded.name, Duration::from_secs(2)).await
     };
     let stop_elapsed = stop_started.elapsed();
-    let stop_code = stopped.as_ref().err().map(|error| error.wire_name().to_owned());
-    let drained = tokio::time::timeout(Duration::from_secs(2), binding.guard().drained())
-        .await;
+    let stop_code = stopped
+        .as_ref()
+        .err()
+        .map(|error| error.wire_name().to_owned());
+    let drained = tokio::time::timeout(Duration::from_secs(2), binding.guard().drained()).await;
     // An error is not evidence of reclamation. Complete the retained ordinary
     // terminal job and independently observe native shutdown and lock release.
     transport.request_terminal(false);
-    let cleanup = tokio::time::timeout(
-        Duration::from_secs(2),
-        native_cleanup_finished(&transport),
-    ).await;
+    let cleanup =
+        tokio::time::timeout(Duration::from_secs(2), native_cleanup_finished(&transport)).await;
     let request_outcome = request.await;
     // Observe the unrelated RPC only after the original stop and real cleanup.
     // Its denial is measured at the task's actual execution phase.
@@ -300,19 +300,31 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
         Some(observer) => Some(observer.await),
         None => None,
     };
-    eprintln!("stop fixture: code={stop_code:?} elapsed={stop_elapsed:?} cleanup={}",
-        cleanup.is_ok());
+    eprintln!(
+        "stop fixture: code={stop_code:?} elapsed={stop_elapsed:?} cleanup={}",
+        cleanup.is_ok()
+    );
     assert!(cleanup.is_ok(), "actual native cleanup did not finish");
     assert!(request_outcome.is_ok());
     assert!(drained.is_ok());
     if let Some(outcome) = observer_outcome {
-        assert!(outcome.is_ok_and(|(entered, completed)| entered && completed),
-            "actual native cleanup waited for the unrelated denial observer");
+        assert!(
+            outcome.is_ok_and(|(entered, completed)| entered && completed),
+            "actual native cleanup waited for the unrelated denial observer"
+        );
     }
-    assert!(stopped.is_ok(), "stop code={stop_code:?}, elapsed={stop_elapsed:?}");
+    assert!(
+        stopped.is_ok(),
+        "stop code={stop_code:?}, elapsed={stop_elapsed:?}"
+    );
     assert_eq!(committed.load(Ordering::Acquire), 1);
     assert_eq!(still_running, 1);
-    assert!(authority_denied && owner_retained && enable_denied && new_call_denied.is_ok_and(|denied| denied));
+    assert!(
+        authority_denied
+            && owner_retained
+            && enable_denied
+            && new_call_denied.is_ok_and(|denied| denied)
+    );
     assert!(!shutdown_started_early && !physically_stopped_early);
     assert_eq!(
         terminal_while_held,
