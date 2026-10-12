@@ -69,7 +69,12 @@ unsafe extern "C" fn observe_log(ctx: *mut std::ffi::c_void, _: u32, ptr: *const
     record_log(LOGS.get(), ctx as usize, line);
 }
 fn record_log(storage: Option<&Mutex<HashMap<usize, Vec<String>>>>, key: usize, line: String) {
-    storage.unwrap().lock().unwrap().entry(key).or_default().push(line);
+    if let Some(storage) = storage {
+        storage.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(key).or_default().push(line);
+    }
+}
+fn recorded_lines(key: usize) -> Vec<String> {
+    LOGS.get().and_then(|logs| logs.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&key).cloned()).unwrap_or_default()
 }
 fn observed_native(host: &ModuleHost, path: &Path, prefix: &str) -> usize {
     let artifact = loader::load(path, false).unwrap();
@@ -82,7 +87,7 @@ fn observed_native(host: &ModuleHost, path: &Path, prefix: &str) -> usize {
     let key = vtable.host_ctx as usize;
     LOGS.get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
-        .unwrap()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(key, Vec::new());
     vtable.log = observe_log;
     transport.defer_initialize(artifact.init, vtable);
@@ -128,11 +133,8 @@ async fn native_replacement_logs_and_sanitized_panics_use_only_its_original_host
             .unwrap()
             .starts_with("first:")
     );
-    assert!(
-        LOGS.get().unwrap().lock().unwrap()[&first_key]
-            .iter()
-            .any(|line| line.contains("clock fixture served"))
-    );
+    let first_lines = recorded_lines(first_key);
+    assert!(first_lines.iter().any(|line| line.contains("clock fixture served")));
     first.shutdown(Duration::from_secs(3)).await;
     tokio::time::timeout(Duration::from_secs(3), async {
         while caller
@@ -148,7 +150,7 @@ async fn native_replacement_logs_and_sanitized_panics_use_only_its_original_host
     .await
     .unwrap();
     drop(first);
-    let first_count = LOGS.get().unwrap().lock().unwrap()[&first_key].len();
+    let first_count = recorded_lines(first_key).len();
     let second = ModuleHost::new(broker);
     let second_key = observed_native(&second, &artifact, "second:");
     assert_ne!(first_key, second_key);
@@ -160,33 +162,15 @@ async fn native_replacement_logs_and_sanitized_panics_use_only_its_original_host
             .starts_with("second:")
     );
     assert!(proxy.call::<serde_json::Value>("Panic", ()).await.is_err());
-    {
-        let logs = LOGS.get().unwrap().lock().unwrap();
-        assert_eq!(
-            logs[&first_key].len(),
-            first_count,
-            "B must not call A's original logging callback"
-        );
-        assert!(
-            logs[&second_key]
-                .iter()
-                .any(|line| line.contains("clock fixture served"))
-        );
-        assert!(
-            logs[&second_key]
-                .iter()
-                .any(|line| line.contains("module panicked at"))
-        );
-        assert!(
-            logs[&second_key]
-                .iter()
-                .all(|line| !line.contains("secret-token"))
-        );
-    }
+    let first_lines = recorded_lines(first_key);
+    let second_lines = recorded_lines(second_key);
     second.shutdown(Duration::from_secs(3)).await;
     broker_task.abort();
+    assert_eq!(first_lines.len(), first_count, "B must not call A's original logging callback");
+    assert!(second_lines.iter().any(|line| line.contains("clock fixture served")));
+    assert!(second_lines.iter().any(|line| line.contains("module panicked at")));
+    assert!(second_lines.iter().all(|line| !line.contains("secret-token")));
 }
-
 
 #[test]
 fn native_log_fixture_recovers_poison_without_unwinding_across_abi() {

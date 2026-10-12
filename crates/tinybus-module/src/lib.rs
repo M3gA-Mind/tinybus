@@ -490,6 +490,12 @@ where
     F: FnOnce(Connection) -> Fut + Send + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
+    let Some((_, compatible_host)) =
+        (unsafe { validate_start_arguments(host, out, worker_threads) })
+    else {
+        return TB_BAD_ARGUMENT;
+    };
+    let owner = Some(ExecutionOwner::new(HostCalls(compatible_host)));
     unsafe {
         start_module_runtime(
             host,
@@ -498,7 +504,7 @@ where
             detach_on_panic,
             setup,
             None,
-            false,
+            owner,
         )
     }
 }
@@ -528,7 +534,7 @@ where
             detach_on_panic,
             setup,
             None,
-            true,
+            None,
         )
     }
 }
@@ -558,7 +564,7 @@ unsafe fn start_module_runtime<F, Fut>(
     detach_on_panic: bool,
     setup: F,
     reinitialize_factory: Option<ReinitializeFactory>,
-    linked: bool,
+    owner: Option<ExecutionOwner>,
 ) -> i32
 where
     F: FnOnce(Connection) -> Fut + Send + 'static,
@@ -572,7 +578,6 @@ where
         };
         let host = HostCalls(host);
 
-        let owner = (!linked).then(|| ExecutionOwner::new(host));
         if owner.is_some() {
             ExecutionOwner::install_panic_hook();
         }
@@ -739,12 +744,14 @@ where
         Err(_) => return TB_PANICKED,
     };
     unsafe {
-        start_module(
+        start_module_runtime(
             host,
             out,
             worker_threads,
             detach_on_panic,
             move |connection| setup(connection, config),
+            None,
+            caller_owner,
         )
     }
 }
@@ -970,7 +977,7 @@ where
             detach_on_panic,
             move |connection| initial_setup(connection, config),
             Some(reinitialize_factory),
-            linked,
+            caller_owner,
         )
     }
 }

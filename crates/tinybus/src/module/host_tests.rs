@@ -746,6 +746,7 @@ fn a_sidecar_without_lazy_init_refuses_the_artifact_instead_of_loading_it_eagerl
 
 #[tokio::test]
 async fn a_module_whose_init_fails_is_terminal_and_is_never_initialized_again() {
+    let _test_guard = FAKE_MODULE_TEST_LOCK.lock().await;
     FAILED_INIT_COUNT.store(0, Ordering::Release);
     let bus = MemoryBus::new();
     let broker = Broker::new();
