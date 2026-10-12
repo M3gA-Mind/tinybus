@@ -434,6 +434,104 @@ mod controlled {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_linked_hook_panics_and_uncertain_finish_preserve_once_join_and_anchor() {
+    let _serial = controlled::TEST_LOCK.lock().await;
+    for mode in [1, 2, 3] {
+        let (fixture, events) = controlled::fixture();
+        fixture.hook_failure.store(mode, Ordering::Release);
+        let broker = tinybus::broker::Broker::new();
+        broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+        let host = Arc::new(tinybus::module::ModuleHost::new(broker));
+        host.attach_linked_with_config(
+            controlled::linked_module().unwrap(), serde_json::json!({"mode":1}),
+        ).unwrap();
+        let entered = events.recv_timeout(Duration::from_secs(3)).unwrap();
+        let view = fixture.view.lock().unwrap().take().unwrap();
+        let context = view.inner.context();
+        // Real setup has launched the independent controller worker. Actual
+        // request closes/wakes it, and original finish really joins it even
+        // when request panic has already made uncertainty sticky.
+        view.inner.signal(TerminalReason::Stop);
+        host.shutdown(Duration::from_secs(5)).await;
+        let completed = view.inner.wait(Duration::from_secs(5));
+        let observations: Vec<_> = events.try_iter().collect();
+        let native = view.inner.host.0;
+        let flags = unsafe { native.native_terminal_state.unwrap()(native.host_ctx) };
+        // Controlled work and actual original finish/join have settled before
+        // assertions. Uncertain primary payload/resource ownership stays anchored.
+        assert!(matches!(entered, controlled::Event::Poll(1)));
+        assert_eq!(completed, TerminalCompletion::Uncertain, "hook mode {mode}");
+        assert!(view.inner.request_done_for_test());
+        assert_eq!(fixture.requests.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.finishes.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.joins.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.payload_drops.load(Ordering::Acquire), 0);
+        assert!(!view.is_live());
+        assert!(terminal::TerminalState::lookup(context).is_some());
+        if mode != 3 {
+            assert_ne!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
+        }
+        let future_drop = observations.iter().position(|event| matches!(event,
+            controlled::Event::FutureDrop(name) if name == "tinybus-terminal")).unwrap();
+        let finish = observations.iter().position(|event| matches!(event, controlled::Event::Finish)).unwrap();
+        assert!(future_drop < finish);
+        // Neither a later cause upgrade nor shutdown retry spends hooks again.
+        view.request_fault();
+        host.shutdown(Duration::from_millis(20)).await;
+        assert_eq!(fixture.requests.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.finishes.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.payload_drops.load(Ordering::Acquire), 0);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn actual_linked_rejected_physical_spawn_retains_received_resources_without_retry() {
+    let _serial = controlled::TEST_LOCK.lock().await;
+    let (fixture, events) = controlled::fixture();
+    let broker = tinybus::broker::Broker::new();
+    broker.clone().spawn(tinybus::transport::memory::MemoryBus::new());
+    let host = Arc::new(tinybus::module::ModuleHost::new(broker));
+    host.attach_linked_with_config(
+        controlled::linked_module().unwrap(), serde_json::json!({"mode":1}),
+    ).unwrap();
+    let entered = events.recv_timeout(Duration::from_secs(3)).unwrap();
+    let view = fixture.view.lock().unwrap().take().unwrap();
+    let context = view.inner.context();
+    view.inner.reject_worker_spawn_for_test();
+    view.request_fault();
+    host.shutdown(Duration::from_secs(3)).await;
+    // Submission failure cannot execute original finish. The fixture alone
+    // releases/joins its independent worker; this is not SDK finish evidence.
+    fixture.settle_rejected_worker();
+    let completed = view.inner.wait(Duration::from_secs(1));
+    let observations: Vec<_> = events.try_iter().collect();
+    let native = view.inner.host.0;
+    let flags = unsafe { native.native_terminal_state.unwrap()(native.host_ctx) };
+    assert!(matches!(entered, controlled::Event::Poll(1)));
+    assert_eq!(completed, TerminalCompletion::Uncertain);
+    assert!(view.inner.request_done_for_test());
+    assert_ne!(flags & tinybus::module::abi::TB_NATIVE_TERMINAL_FAULT, 0);
+    assert_eq!(fixture.requests.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.finishes.load(Ordering::Acquire), 0);
+    assert_eq!(fixture.joins.load(Ordering::Acquire), 1);
+    assert!(!observations.iter().any(|event| matches!(event,
+        controlled::Event::FactoryDrop(_) | controlled::Event::FutureDrop(_) | controlled::Event::Finish)));
+    assert!(!view.is_live());
+    drop(host);
+    view.request_fault();
+    assert_eq!(view.inner.wait(Duration::from_millis(20)), TerminalCompletion::Uncertain);
+    assert_eq!(fixture.requests.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.finishes.load(Ordering::Acquire), 0);
+    let anchored = terminal::TerminalState::lookup(context).unwrap();
+    let resources = anchored.resources.lock().unwrap();
+    assert!(resources.retained_factory.is_some());
+    assert!(resources.runtime.is_some());
+    assert!(resources.initial.is_some());
+    assert!(resources.initial_future.lock().unwrap().is_some());
+    // One deliberately retained, bounded original State/job/Runtime remains.
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn actual_linked_initial_cancellation_drops_future_and_joins_worker_on_physical_thread() {
     let _serial = controlled::TEST_LOCK.lock().await;
     let (fixture, events) = controlled::fixture();
