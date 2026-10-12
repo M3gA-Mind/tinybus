@@ -3,6 +3,11 @@ use std::{ffi::c_void, future::Future, pin::Pin, sync::{Arc, Condvar, Mutex}, ta
 use tinybus::{Connection, Result};
 use std::sync::atomic::{AtomicUsize, Ordering};
 static DROPPED: AtomicUsize = AtomicUsize::new(0);
+static EARLY: Mutex<Option<Controls>> = Mutex::new(None);
+#[derive(Clone, Copy)]
+struct NativeQuery { ctx: *mut c_void, query: unsafe extern "C" fn(*mut c_void) -> u32 }
+unsafe impl Send for NativeQuery {}
+static NATIVE_QUERY: Mutex<Option<NativeQuery>> = Mutex::new(None);
 use tinybus::module::abi::*;
 use tinybus_module::{NativeInstanceLiveness, RuntimeHooks, TerminalCompletion};
 #[derive(serde::Deserialize)]
@@ -44,8 +49,11 @@ impl Drop for SetupFuture {
     fn drop(&mut self) { self.controller.emit(4, u32::from(std::thread::current().name() == Some("tinybus-terminal"))); }
 }
 fn factory(view: NativeInstanceLiveness) -> Result<(impl Fn(Connection, Config) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync, RuntimeHooks)> {
-    let controller = Arc::new(Controller { controls: Mutex::new(None), view,
+    let early = EARLY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+    let held_finish = early.is_some();
+    let controller = Arc::new(Controller { controls: Mutex::new(early), view,
         wake: (Mutex::new(false), Condvar::new()), worker: Mutex::new(None) });
+    if held_finish { controller.view.request_fault(); }
     let (request, finish) = (controller.clone(), controller.clone());
     let setup = move |_: Connection, config: Config| {
         if config.test_controls.len() != size_of::<Controls>() { return Box::pin(async { Err(tinybus::Error::failed("bad test controls")) }) as Pin<Box<dyn Future<Output = Result<()>> + Send>>; }
@@ -70,9 +78,10 @@ fn factory(view: NativeInstanceLiveness) -> Result<(impl Fn(Connection, Config) 
         *request.wake.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = true;
         request.wake.1.notify_all(); request.emit(3, 1);
     }, move || {
+        if held_finish { finish.emit(8, 0); }
         let worker = finish.worker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         let outcome = worker.map(|worker| worker.join());
-        let joined = matches!(outcome, Some(Ok(true)));
+        let joined = outcome.is_none() || matches!(outcome, Some(Ok(true)));
         finish.emit(5, u32::from(joined));
         if joined { TerminalCompletion::PhysicallyStopped } else { TerminalCompletion::Uncertain }
     });
@@ -93,6 +102,11 @@ static LATEST: Mutex<Option<Table>> = Mutex::new(None);
 /// Standard trusted module init contract plus live test controls in config.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn tinybus_module_init_v1(host: *const TbHostVtable, out: *mut TbModuleVtable) -> i32 {
+    if let Some(host) = unsafe { TbHostVtable::read_compatible(host) } {
+        if let Some(query) = host.native_terminal_state {
+            *NATIVE_QUERY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(NativeQuery { ctx: host.host_ctx, query });
+        }
+    }
     let code = unsafe { tinybus_module::start_terminal_reconfigurable_module_with_factory::<Config, _, _>(host, out, 1, true, factory) };
     if code == TB_OK { *LATEST.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Table(unsafe { *out })); }
     code
@@ -112,3 +126,16 @@ pub extern "C" fn terminal_test_old_context(token: usize) -> i32 {
 /// Test-only acquire fence after the final controller event callback returned.
 #[unsafe(no_mangle)]
 pub extern "C" fn terminal_test_drops() -> usize { DROPPED.load(Ordering::Acquire) }
+
+/// # Safety
+/// The test context and callback must remain live until actual controller Drop.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn terminal_test_early(ctx: *mut c_void, event: unsafe extern "C" fn(*mut c_void, u32, u32)) {
+    *EARLY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Controls { ctx, event });
+}
+/// Sample only the actual copied host query; no local or fabricated success bit.
+#[unsafe(no_mangle)]
+pub extern "C" fn terminal_test_native_flags() -> u32 {
+    let query = *NATIVE_QUERY.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    query.map_or(0, |query| unsafe { (query.query)(query.ctx) })
+}
