@@ -63,16 +63,30 @@ struct FrozenRoutingHost {
     routing: Option<unsafe extern "C" fn(*mut c_void) -> u32>,
 }
 
-unsafe extern "C" fn send(_: *mut c_void, _: *const u8, _: usize) -> i32 { TB_OK }
+unsafe extern "C" fn send(_: *mut c_void, _: *const u8, _: usize) -> i32 {
+    TB_OK
+}
 unsafe extern "C" fn wake(_: *mut c_void) {}
 unsafe extern "C" fn log(_: *mut c_void, _: u32, _: *const u8, _: usize) {}
 unsafe extern "C" fn fault(_: *mut c_void, _: *const u8, _: usize) {}
-unsafe extern "C" fn query(ctx: *mut c_void) -> u32 { unsafe { ctx.cast::<u32>().read() } }
+unsafe extern "C" fn query(ctx: *mut c_void) -> u32 {
+    unsafe { ctx.cast::<u32>().read() }
+}
 
 fn frozen_prefix(size: usize) -> FrozenHostPrefix {
     FrozenHostPrefix {
-        size: size as u32, reserved: 0, ctx: std::ptr::null_mut(), send, wake, log, fault,
-        config: TbSlice { ptr: std::ptr::null(), len: 0 }, ready: wake,
+        size: size as u32,
+        reserved: 0,
+        ctx: std::ptr::null_mut(),
+        send,
+        wake,
+        log,
+        fault,
+        config: TbSlice {
+            ptr: std::ptr::null(),
+            len: 0,
+        },
+        ready: wake,
     }
 }
 
@@ -80,11 +94,15 @@ fn frozen_prefix(size: usize) -> FrozenHostPrefix {
 fn routing_tail_survives_newer_optional_tail() {
     let value = 1u32;
     let mut old = FrozenRoutingHost {
-        prefix: frozen_prefix(size_of::<FrozenRoutingHost>()), routing: Some(query),
+        prefix: frozen_prefix(size_of::<FrozenRoutingHost>()),
+        routing: Some(query),
     };
     old.prefix.ctx = std::ptr::from_ref(&value).cast_mut().cast();
-    let normalized = unsafe { TbHostVtable::read_compatible(std::ptr::from_ref(&old).cast()) }.unwrap();
-    let routing = normalized.broker_routing.expect("complete original routing tail is retained");
+    let normalized =
+        unsafe { TbHostVtable::read_compatible(std::ptr::from_ref(&old).cast()) }.unwrap();
+    let routing = normalized
+        .broker_routing
+        .expect("complete original routing tail is retained");
     assert_eq!(unsafe { routing(normalized.host_ctx) }, 1);
     assert!(normalized.native_terminal_state.is_none());
 }
@@ -92,14 +110,21 @@ fn routing_tail_survives_newer_optional_tail() {
 #[test]
 fn prefix_hosts_normalize_both_tails() {
     assert_eq!(ABI_REVISION, 1);
-    assert_eq!(size_of::<FrozenHostPrefix>(), TB_HOST_VTABLE_BASE_SIZE as usize);
-    assert_eq!(size_of::<FrozenHostPrefix>(), std::mem::offset_of!(TbHostVtable, broker_routing));
+    assert_eq!(
+        size_of::<FrozenHostPrefix>(),
+        TB_HOST_VTABLE_BASE_SIZE as usize
+    );
+    assert_eq!(
+        size_of::<FrozenHostPrefix>(),
+        std::mem::offset_of!(TbHostVtable, broker_routing)
+    );
     assert!(unsafe { TbHostVtable::read_compatible(std::ptr::null()) }.is_none());
     // Only a u32 allocation is present for the rejected short header.
     let short = TB_HOST_VTABLE_BASE_SIZE - 1;
     assert!(unsafe { TbHostVtable::read_compatible(std::ptr::from_ref(&short).cast()) }.is_none());
     let prefix = frozen_prefix(size_of::<FrozenHostPrefix>());
-    let normalized = unsafe { TbHostVtable::read_compatible(std::ptr::from_ref(&prefix).cast()) }.unwrap();
+    let normalized =
+        unsafe { TbHostVtable::read_compatible(std::ptr::from_ref(&prefix).cast()) }.unwrap();
     assert!(normalized.broker_routing.is_none());
     assert!(normalized.native_terminal_state.is_none());
 }
@@ -112,25 +137,56 @@ fn terminal_tail_requires_its_complete_field() {
         + size_of::<Option<unsafe extern "C" fn(*mut c_void) -> u32>>();
     let terminal_end = std::mem::offset_of!(TbHostVtable, native_terminal_state)
         + size_of::<Option<unsafe extern "C" fn(*mut c_void) -> u32>>();
-    for size in [routing_end - 1, routing_end, terminal_end - 1, terminal_end, terminal_end + 16] {
+    let state = TB_NATIVE_TERMINAL_LIVE;
+    for size in [
+        routing_end - 1,
+        routing_end,
+        terminal_end - 1,
+        terminal_end,
+        terminal_end + 16,
+    ] {
         for terminal_present in [false, true] {
-            let layout = std::alloc::Layout::from_size_align(size, align_of::<TbHostVtable>()).unwrap();
+            let layout =
+                std::alloc::Layout::from_size_align(size, align_of::<TbHostVtable>()).unwrap();
             let storage = unsafe { std::alloc::alloc_zeroed(layout) };
             assert!(!storage.is_null());
-            unsafe { storage.cast::<FrozenHostPrefix>().write(frozen_prefix(size)) };
+            let mut prefix = frozen_prefix(size);
+            prefix.ctx = std::ptr::from_ref(&state).cast_mut().cast();
+            unsafe { storage.cast::<FrozenHostPrefix>().write(prefix) };
             if size >= routing_end {
-                unsafe { storage.add(std::mem::offset_of!(TbHostVtable, broker_routing))
-                    .cast::<Option<unsafe extern "C" fn(*mut c_void) -> u32>>().write(Some(query)) };
+                unsafe {
+                    storage
+                        .add(std::mem::offset_of!(TbHostVtable, broker_routing))
+                        .cast::<Option<unsafe extern "C" fn(*mut c_void) -> u32>>()
+                        .write(Some(query))
+                };
             }
             if size >= terminal_end {
-                unsafe { storage.add(std::mem::offset_of!(TbHostVtable, native_terminal_state))
-                    .cast::<Option<unsafe extern "C" fn(*mut c_void) -> u32>>()
-                    .write(terminal_present.then_some(query)) };
+                unsafe {
+                    storage
+                        .add(std::mem::offset_of!(TbHostVtable, native_terminal_state))
+                        .cast::<Option<unsafe extern "C" fn(*mut c_void) -> u32>>()
+                        .write(terminal_present.then_some(query))
+                };
             }
             let normalized = unsafe { TbHostVtable::read_compatible(storage.cast()) }.unwrap();
             unsafe { std::alloc::dealloc(storage, layout) };
-            assert_eq!(normalized.broker_routing.is_some(), size >= routing_end, "routing size {size}");
-            assert_eq!(normalized.native_terminal_state.is_some(), size >= terminal_end && terminal_present, "terminal size {size}");
+            assert_eq!(
+                normalized.broker_routing.is_some(),
+                size >= routing_end,
+                "routing size {size}"
+            );
+            assert_eq!(
+                normalized.native_terminal_state.is_some(),
+                size >= terminal_end && terminal_present,
+                "terminal size {size}"
+            );
+            if let Some(query) = normalized.native_terminal_state {
+                assert_eq!(
+                    unsafe { query(normalized.host_ctx) },
+                    TB_NATIVE_TERMINAL_LIVE
+                );
+            }
         }
     }
 }

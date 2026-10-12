@@ -755,7 +755,8 @@ fn an_older_host_prefix_is_copied_without_reading_the_additive_tail() {
 fn an_incomplete_host_tail_never_reads_the_callback() {
     let mut current = host(b"{}");
     current.size = (std::mem::offset_of!(TbHostVtable, broker_routing)
-        + size_of::<Option<unsafe extern "C" fn(*mut c_void) -> u32>>() - 1) as u32;
+        + size_of::<Option<unsafe extern "C" fn(*mut c_void) -> u32>>()
+        - 1) as u32;
     let normalized = unsafe { TbHostVtable::read_compatible(&current) }.unwrap();
     assert!(normalized.broker_routing.is_none());
     assert!(normalized.native_terminal_state.is_none());
