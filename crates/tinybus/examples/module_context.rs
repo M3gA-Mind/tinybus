@@ -19,6 +19,7 @@ impl Interface for ContextService {
             "Inspect".parse().unwrap(),
             "Callback".parse().unwrap(),
             "ConfidentialCallback".parse().unwrap(),
+            "WaitForWatchChanged".parse().unwrap(),
         ]
     }
     async fn call(&self, _: &MemberName, _: Value) -> Result<Value> {
