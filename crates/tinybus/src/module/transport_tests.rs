@@ -940,3 +940,51 @@ async fn an_actual_delivery_failure_overlapping_stop_is_retained() {
     assert!(transport.is_faulted(), "S66");
     assert!(!transport.is_ready(), "S67");
 }
+
+#[tokio::test]
+async fn lifecycle_waiters_do_not_reenter_a_transport_disposed_by_the_prior_shutdown() {
+    let _lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    let _release = ShutdownRelease;
+    SHUTDOWN_BLOCKED.store(true, Ordering::Release);
+    SHUTDOWN_ENTERED.store(false, Ordering::Release);
+    SHUTDOWN_CALLS.store(0, Ordering::Release);
+    let (transport, host) = ModuleTransport::new("lifecycle-stop".into(), vec![]);
+    transport.defer_initialize(initialize_ok, host);
+    transport.ensure_initialized().await.expect("S71");
+    let stopping = tokio::spawn(transport.clone().stop(Duration::from_millis(100)));
+    shutdown_entry().await;
+    assert!(
+        matches!(stopping.await.expect("S72"), Err(StopError::Started(_))),
+        "S73"
+    );
+    let mut retry = std::pin::pin!(transport.clone().stop(Duration::from_secs(2)));
+    let mut reinitializing =
+        std::pin::pin!(transport.reinitialize(crate::Secret::new(b"{}".to_vec())));
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(
+        std::future::Future::poll(retry.as_mut(), &mut context).is_pending(),
+        "S74"
+    );
+    assert!(
+        std::future::Future::poll(reinitializing.as_mut(), &mut context).is_pending(),
+        "S75"
+    );
+    SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+    assert!(
+        matches!(
+            retry.await,
+            Err(StopError::NotStarted(Error::ConnectionClosed))
+        ),
+        "S76"
+    );
+    assert!(
+        matches!(reinitializing.await, Err(Error::ConnectionClosed)),
+        "S77"
+    );
+    assert_eq!(SHUTDOWN_CALLS.load(Ordering::Acquire), 1, "S78");
+    assert!(transport.stop_task_spawned(), "S79");
+    assert!(!transport.is_faulted(), "S80");
+}
