@@ -93,7 +93,9 @@ struct Control {
     published: bool, completion: Option<TerminalCompletion>, job: Option<Arc<FinishJob>>,
     payloads: PrimaryPayloads,
 }
-type Setup = Box<dyn FnOnce(Connection) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send>;
+pub(super) type Setup = Box<dyn FnOnce(Connection) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send>;
+pub(super) type SetupFutureSlot = Arc<StdMutex<Option<Pin<Box<dyn Future<Output = Result<()>> + Send>>>>>;
+
 /// Resources are attached here before the next fallible startup boundary.
 /// Taking values is mechanical; all foreign destruction occurs off this lock.
 pub(super) struct StartupResources {
@@ -106,12 +108,14 @@ pub(super) struct StartupResources {
     pub connection: Arc<StdMutex<Option<Connection>>>,
     pub inbound: Option<mpsc::Sender<IncomingFrame>>,
     pub initial: Option<tokio::task::JoinHandle<Result<()>>>,
+    pub initial_future: SetupFutureSlot,
 }
 impl Default for StartupResources {
     fn default() -> Self {
         Self { runtime: None, setup: None, retained_factory: None, config: None,
             reinitializer_factory: None, reinitialize: Arc::new(StdMutex::new(None)),
-            connection: Arc::new(StdMutex::new(None)), inbound: None, initial: None }
+            connection: Arc::new(StdMutex::new(None)), inbound: None, initial: None,
+            initial_future: Arc::new(StdMutex::new(None)) }
     }
 }
 pub(super) struct TerminalState {
@@ -175,8 +179,12 @@ impl TerminalState {
     fn commit(&self, reason: TerminalReason) {
         let next = match reason { TerminalReason::Stop => 1, TerminalReason::HostClosed => 2,
             TerminalReason::Fault => 3, TerminalReason::SetupFailed => 4 };
-        let _ = self.reason.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old|
-            if old == 0 || (old < 3 && next >= 3) { Some(next) } else { None });
+        let mut old = self.reason.load(Ordering::Acquire);
+        while old == 0 || (old < 3 && next >= 3) {
+            match self.reason.compare_exchange_weak(old, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break, Err(actual) => old = actual,
+            }
+        }
         self.terminal_notify.notify_waiters();
     }
     pub fn signal(self: &Arc<Self>, reason: TerminalReason) {
@@ -203,8 +211,8 @@ impl TerminalState {
         let cell = control.payloads.cell(kind);
         // Once/terminal admission prevents a second primary in this category.
         // A violated internal invariant cannot discard a foreign payload here.
-        if cell.is_none() { *cell = Some(payload); }
-        else { std::mem::forget(payload); }
+        assert!(cell.is_none(), "terminal primary boundary is once-only");
+        *cell = Some(payload);
     }
     pub fn register(self: &Arc<Self>, hooks: RuntimeHooks) {
         { let mut control = self.lock();
@@ -303,9 +311,9 @@ impl TerminalState {
         if completion == TerminalCompletion::PhysicallyStopped { self.remove_anchor(); }
     }
     fn settle_setup(self: &Arc<Self>) -> bool {
-        let (initial, handle, reinitialize) = {
+        let (initial, handle, reinitialize, future) = {
             let mut resources = self.resources.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            (resources.initial.take(), resources.runtime.as_ref().map(|runtime| runtime.handle().clone()), resources.reinitialize.clone())
+            (resources.initial.take(), resources.runtime.as_ref().map(|runtime| runtime.handle().clone()), resources.reinitialize.clone(), resources.initial_future.clone())
         };
         if let Some(initial) = initial {
             initial.abort();
@@ -320,6 +328,8 @@ impl TerminalState {
                 }
             }
         }
+        let future = future.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+        drop(future);
         let callback = reinitialize.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
         if let Some(owner) = &self.owner { owner.stop(); }
         drop(callback);
@@ -339,6 +349,8 @@ impl TerminalState {
         // and its resource count. Unknown surviving ownership stays anchored.
         self.sdk_owners.load(Ordering::Acquire) == 0
     }
+    pub fn has_fault(&self) -> bool { self.reason.load(Ordering::Acquire) >= 3 }
+    pub fn mark_uncertain(&self) { self.uncertain.store(true, Ordering::Release); }
     pub fn wait(&self, deadline: Duration) -> TerminalCompletion {
         let control = self.lock();
         let (control, _) = self.changed.wait_timeout_while(control, deadline, |control| control.completion.is_none())
