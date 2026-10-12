@@ -23,6 +23,27 @@ and names, but code, TLS, panic metadata and callback addresses remain mapped
 until process exit. Replacing or removing an already loaded artifact requires a
 restart.
 
+## SDK instance execution and replacement
+
+Stopping an instance and loading the same unchanged artifact can start a fresh
+instance after the broker releases the previous peer's names. A live duplicate
+still refuses; changing the mapped artifact's code still requires process restart.
+
+The native SDK scopes its tracing subscriber to each instance's initialization
+caller, reinitialization caller, Tokio workers and blocking pool. Nested caller
+scopes restore the previous subscriber and owner. Shutdown suppresses subsequent
+log and panic callbacks from that instance; this does not cancel accepted bus RPC
+or prove completion of module-created background work. Runtime worker teardown
+removes its scoped context, without selecting a replacement owner.
+
+The native panic hook resolves the current execution owner and reports location
+only, never the panic payload. Module-created `std::thread` threads are outside
+SDK runtime ownership: they receive no host logging callback, and an unowned panic
+prints only its sanitized location to stderr. The SDK never falls back to the
+last initialized instance. Linked modules keep the embedding host's tracing and
+panic hook. The existing instance-wide last panic location is diagnostic state,
+not a proof of exact attribution among concurrently panicking methods.
+
 ## Loading sequence
 
 1. Check every directory component's ownership/mode, require a regular
