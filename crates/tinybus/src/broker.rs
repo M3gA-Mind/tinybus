@@ -50,6 +50,11 @@ pub struct Broker {
     // failed upgrade by falling back to the ordinary routing error.
     #[cfg(feature = "modules")]
     modules: Arc<Mutex<Option<Weak<dyn crate::module::host::ModuleControl>>>>,
+    // None is legacy permissive mode. Some(empty) denies all mutating module
+    // calls until the host attaches one concrete controller transport. The
+    // binding never follows a well-known name or changes on disconnect.
+    #[cfg(feature = "modules")]
+    module_controller: Option<Arc<Mutex<Option<BusName>>>>,
 }
 
 impl Broker {
@@ -59,6 +64,8 @@ impl Broker {
             router: Arc::new(Mutex::new(Router::default())),
             #[cfg(feature = "modules")]
             modules: Arc::new(Mutex::new(None)),
+            #[cfg(feature = "modules")]
+            module_controller: None,
             // The id changes per broker *process*, so a peer that reconnects
             // can tell "the bus restarted" (every name is gone, re-register)
             // from "my socket blipped" (state is intact).
@@ -66,16 +73,52 @@ impl Broker {
         }
     }
 
-    /// Create a broker whose module control belongs to one host-selected peer.
+    /// Create a broker that denies mutating module calls except from one
+    /// host-selected controller connection.
+    ///
+    /// Initially no connection may load, reinitialize, stop, enable, or rescan
+    /// modules. Select the concrete controller transport with
+    /// [`Broker::attach_module_controller`]. Ordinary attachment never grants
+    /// control, and read-only module inspection remains available to peers.
+    /// Clones share the restriction; replacing a module host cannot relax it.
+    /// [`Broker::new`] retains the existing permissive behavior.
     #[cfg(feature = "modules")]
     pub fn new_restricted_module_control() -> Self {
-        Self::new()
+        Self {
+            module_controller: Some(Arc::new(Mutex::new(None))),
+            ..Self::new()
+        }
     }
 
-    /// Attach the concrete transport selected by the host as module controller.
+    /// Attach the transport the trusted host selected as module controller.
+    ///
+    /// The binding uses the broker-minted unique connection identity, not a
+    /// caller-supplied name or request field. Selection is exactly once across
+    /// all clones, even if the selected connection later disconnects. Create
+    /// a new restricted broker to select a replacement controller. An already
+    /// admitted operation may finish after the controller disconnects.
+    ///
+    /// This is a trusted embedding API, not a bus method. The host must keep
+    /// the controller's other transport endpoint away from untrusted code.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ModuleControlDenied` without attaching the transport if this
+    /// broker is permissive or a controller has already been selected.
     #[cfg(feature = "modules")]
     pub fn attach_module_controller(&self, transport: Arc<dyn Transport>) -> Result<BusName> {
-        Ok(self.attach(transport))
+        let Some(binding) = &self.module_controller else {
+            return Err(module_control_denied());
+        };
+        let mut controller = binding.lock().expect("module controller lock");
+        if controller.is_some() {
+            return Err(module_control_denied());
+        }
+        // Keep selection locked across attachment: a spawned reader cannot
+        // admit control until its immutable connection binding is published.
+        let unique = self.attach(transport);
+        *controller = Some(unique.clone());
+        Ok(unique)
     }
 
     /// This broker's id, as reported by the bus's `GetId`.
@@ -343,7 +386,9 @@ impl Broker {
         body: Value,
     ) -> (Result<Value>, Vec<NameChange>, Vec<Value>) {
         #[cfg(feature = "modules")]
-        if let Some((result, module_states)) = self.module_method(member, body.clone()).await {
+        if let Some((result, module_states)) =
+            self.module_method(from_name, member, body.clone()).await
+        {
             return (result, Vec::new(), module_states);
         }
 
@@ -448,6 +493,7 @@ impl Broker {
     #[cfg(feature = "modules")]
     async fn module_method(
         &self,
+        from_name: &BusName,
         member: &MemberName,
         body: Value,
     ) -> Option<(Result<Value>, Vec<Value>)> {
@@ -477,6 +523,16 @@ impl Broker {
             "RescanModules" => ModuleMember::Rescan,
             _ => return None,
         };
+        if !matches!(
+            operation,
+            ModuleMember::List | ModuleMember::Get | ModuleMember::GetManifest
+        ) && self.module_controller.as_ref().is_some_and(|binding| {
+            binding.lock().expect("module controller lock").as_ref() != Some(from_name)
+        }) {
+            // Admission precedes argument parsing and every control callback;
+            // neither body fields nor a forged sender header can select it.
+            return Some((Err(module_control_denied()), Vec::new()));
+        }
         let control = self
             .modules
             .lock()
@@ -773,6 +829,14 @@ async fn reader_task(broker: Broker, transport: Arc<dyn Transport>, id: u64, nam
                 ]))
                 .await;
         }
+    }
+}
+
+#[cfg(feature = "modules")]
+fn module_control_denied() -> Error {
+    Error::MethodFailed {
+        name: "ai.tinyhumans.tinybus.Error.ModuleControlDenied".into(),
+        message: "module control requires the host-selected controller connection".into(),
     }
 }
 
