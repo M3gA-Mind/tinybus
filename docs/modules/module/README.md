@@ -119,6 +119,19 @@ Reinitialization has a mandatory four-second module-side deadline and is
 serialized with both other reinitializations and shutdown. A host timeout never
 permits a later lifecycle callback to overlap code that is still returning.
 
+Stopping a module loaded with `HostCallbackBinding` revokes new callback
+admission and waits for already admitted user futures before starting native
+shutdown. Both phases share the stop deadline. A drain timeout refuses shutdown;
+it does not report unfinished provider work as stopped. Accounting stays attached
+to the loaded record even after the routing capability is revoked or dropped.
+Detached provider tasks need their own completion fence.
+
+Canceling or timing out a public lifecycle waiter does not end a running native
+callback. Enable/disable remains unavailable until that callback actually
+returns. Queued stop and reinitialize operations retain their existing mutex
+serialization. See [callback lifecycle validation](callback-lifecycle-validation.md)
+for regression evidence and the limits of this guarantee.
+
 When present, `modules.toml` is authoritative for its directory. Keys are
 artifact file names (or stems) and values are lowercase SHA-256 hashes. An
 artifact absent from the file or with a mismatched hash is refused. For remote
