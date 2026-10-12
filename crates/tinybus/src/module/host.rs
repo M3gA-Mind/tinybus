@@ -1499,7 +1499,7 @@ impl ModuleControl for ModuleHostInner {
                 .lock()
                 .expect("router lock")
                 .revoke_callbacks_for_peer(&module.unique_name);
-            module.transition_from = Some(old);
+            module.transition_from.get_or_insert(old);
             module.lifecycle_busy = true;
             module.transport.clone()
         };
