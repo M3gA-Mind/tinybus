@@ -46,15 +46,15 @@ omitted field and a `null` field identically.
 
 | Field | Type | Present on |
 | --- | --- | --- |
-| `kind` | `method_call` \| `method_return` \| `error` \| `signal` | always |
+| `kind` | `method_call` \| `method_return` \| `error` \| `signal` \| `directed_signal` | always |
 | `serial` | u64, ≥ 1, per-sender monotonic | always |
 | `reply_serial` | u64 | `method_return`, `error` |
 | `sender` | bus name | stamped by the broker on everything it forwards |
 | `expected_responder` | unique bus name | optional, conditional method-call owner |
-| `destination` | bus name | `method_call`, `method_return`, `error` |
-| `path` | object path | `method_call`, `signal` |
-| `interface` | interface name | `method_call`, `signal` |
-| `member` | member name | `method_call`, `signal` |
+| `destination` | bus name | `method_call`, `method_return`, `error`, `directed_signal` |
+| `path` | object path | `method_call`, `signal`, `directed_signal` |
+| `interface` | interface name | `method_call`, `signal`, `directed_signal` |
+| `member` | member name | `method_call`, `signal`, `directed_signal` |
 | `error_name` | dotted string | `error` |
 | `confidential` | bool, omitted when false | `method_call`, `method_return` |
 | `sensitive` | bool, omitted when false | private module-control calls |
@@ -63,6 +63,15 @@ omitted field and a `null` field identically.
 `body` is a positional JSON array for calls and signals, and a single JSON value
 for returns. `error` bodies are a string: the human-readable message, without
 the error name, which travels in `error_name`.
+
+`signal` remains a broadcast selected by match rules. `directed_signal` is a
+separate protocol kind and routes to one unique destination only. The broker
+accepts it only when the sender is a live SDK-created callback binding, the
+destination is that binding's exact currently loaded module, and path,
+interface and member were declared for the binding. Ordinary peers cannot
+address another peer with this kind. Directed signals cannot be confidential
+or sensitive and are never broadcast. The protocol revision is 2 because a
+revision-1 reader cannot parse this message kind safely.
 
 A peer **may** set `sender`; the broker overwrites it unconditionally. Nothing
 downstream may trust a `sender` that did not come from the broker.

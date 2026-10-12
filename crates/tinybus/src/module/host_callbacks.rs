@@ -108,8 +108,8 @@ impl CallbackState {
         let state = self.lifetime.lock().expect("callback lifetime lock");
         state.active
             && self.module_live()
-            && state.module.as_ref() == Some(source)
-            && source == destination
+            && &self.destination == source
+            && state.module.as_ref() == Some(destination)
             && self.signals.iter().any(|signal| {
                 header.path.as_ref() == Some(&signal.path)
                     && header.interface.as_ref() == Some(&signal.interface)
