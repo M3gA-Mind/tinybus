@@ -721,7 +721,12 @@ where
     F: FnOnce(Connection, C) -> Fut + Send + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
-    let caller_owner = (!linked).then(|| ExecutionOwner::new(HostCalls(unsafe { *host })));
+    let Some((_, compatible_host)) =
+        (unsafe { validate_start_arguments(host, out, worker_threads) })
+    else {
+        return TB_BAD_ARGUMENT;
+    };
+    let caller_owner = Some(ExecutionOwner::new(HostCalls(compatible_host)));
     if caller_owner.is_some() {
         ExecutionOwner::install_panic_hook();
     }
@@ -903,10 +908,12 @@ where
     F: Fn(Connection, C) -> Fut + Clone + Send + Sync + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
-    if unsafe { validate_start_arguments(host, out, worker_threads) }.is_none() {
+    let Some((_, compatible_host)) =
+        (unsafe { validate_start_arguments(host, out, worker_threads) })
+    else {
         return TB_BAD_ARGUMENT;
-    }
-    let caller_owner = (!linked).then(|| ExecutionOwner::new(HostCalls(unsafe { *host })));
+    };
+    let caller_owner = (!linked).then(|| ExecutionOwner::new(HostCalls(compatible_host)));
     if caller_owner.is_some() {
         ExecutionOwner::install_panic_hook();
     }
