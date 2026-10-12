@@ -96,7 +96,40 @@ struct LoadedModule {
     transition_from: Option<ModuleState>,
     descriptor_info: Option<DescriptorInfo>,
     lifecycle_busy: bool,
-    callback_config: Option<serde_json::Value>,
+    callback_config: Option<[u8; 32]>,
+}
+
+/// Fingerprints only bytes produced by serde_json::to_vec, never arbitrary JSON.
+/// Sorted object keys give stable serialization. Float signed zero is the sole
+/// serialization difference between equal Values: normalize its numeric token
+/// while hashing borrowed segments, without another plaintext allocation.
+fn callback_config_fingerprint(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    let mut quoted = false;
+    let mut index = 0;
+    let mut segment = 0;
+    while index < bytes.len() {
+        if quoted {
+            match bytes[index] {
+                b'\\' => index += 1,
+                b'"' => quoted = false,
+                _ => {}
+            }
+        } else if bytes[index] == b'"' {
+            quoted = true;
+        } else if bytes[index..].starts_with(b"-0.0")
+            && (index == 0 || matches!(bytes[index - 1], b'[' | b',' | b':'))
+            && (index + 4 == bytes.len() || matches!(bytes[index + 4], b']' | b',' | b'}'))
+        {
+            hash.update(&bytes[segment..index]);
+            segment = index + 1;
+            index += 3;
+        }
+        index += 1;
+    }
+    hash.update(&bytes[segment..]);
+    hash.finalize().into()
 }
 
 enum PendingModule {
@@ -1490,6 +1523,12 @@ impl ModuleControl for ModuleHostInner {
     }
 
     async fn reinitialize(&self, name: &str, config: serde_json::Value) -> Result<ModuleInfo> {
+        let bytes = crate::Secret::new(
+            serde_json::to_vec(&config)
+                .map_err(|_| Error::failed("module configuration is invalid"))?,
+        );
+        drop(config);
+        let fingerprint = callback_config_fingerprint(bytes.expose_secret());
         let transport = {
             let mut loaded = self.loaded.lock().expect("module list lock");
             let module = loaded
@@ -1500,7 +1539,7 @@ impl ModuleControl for ModuleHostInner {
             if module
                 .callback_config
                 .as_ref()
-                .is_some_and(|initial| initial != &config)
+                .is_some_and(|initial| initial != &fingerprint)
             {
                 return Err(Error::failed("scoped callback configuration is immutable"));
             }
@@ -1520,7 +1559,7 @@ impl ModuleControl for ModuleHostInner {
             module.transport.clone()
         };
         let _lifecycle_busy = LifecycleBusyGuard::for_reinitialize(self, name);
-        let reinitialized = transport.reinitialize(config).await;
+        let reinitialized = transport.reinitialize(bytes).await;
         let mut loaded = self.loaded.lock().expect("module list lock");
         let module = loaded
             .iter_mut()

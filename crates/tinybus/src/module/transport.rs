@@ -305,7 +305,7 @@ impl ModuleTransport {
         config.shrink_to_fit();
     }
 
-    pub(crate) async fn reinitialize(self: &Arc<Self>, config: serde_json::Value) -> Result<()> {
+    pub(crate) async fn reinitialize(self: &Arc<Self>, bytes: crate::Secret) -> Result<()> {
         let started = std::time::Instant::now();
         let lifecycle =
             tokio::time::timeout(MODULE_INIT_DEADLINE, self.lifecycle.clone().lock_owned())
@@ -327,10 +327,6 @@ impl ModuleTransport {
             .reinitialize
             .ok_or_else(|| Error::failed("module does not support reinitialization"))?;
         let module = SendModuleVtable(module);
-        let bytes = crate::Secret::new(
-            serde_json::to_vec(&config)
-                .map_err(|_| Error::failed("module configuration is invalid"))?,
-        );
         let remaining = MODULE_INIT_DEADLINE.saturating_sub(started.elapsed());
         let task = tokio::task::spawn_blocking(move || {
             let _lifecycle = lifecycle;

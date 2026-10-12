@@ -524,6 +524,8 @@ impl ModuleHost {
             // deferred even for an eager module until routes and identity exist.
             let bytes = serde_json::to_vec(&config)
                 .map_err(|_| Error::failed("module configuration is invalid"))?;
+            let fingerprint = callback_config_fingerprint(&bytes);
+            drop(config);
             let (transport, host) = ModuleTransport::new(admitted.name.clone(), bytes);
             transport.pause_initialization();
             transport.defer_initialize(artifact.init, host);
@@ -564,7 +566,7 @@ impl ModuleHost {
                 state.module = Some(module.unique_name.clone());
                 state.active = true;
             }
-            module.callback_config = Some(config);
+            module.callback_config = Some(fingerprint);
             self.inner
                 .broker
                 .router
@@ -690,10 +692,6 @@ impl Drop for ModuleHostInner {
     }
 }
 
-#[cfg(test)]
-#[path = "host_callbacks_tests.rs"]
-mod tests;
-
 struct PeerRollback {
     broker: Broker,
     peer: BusName,
@@ -712,3 +710,7 @@ impl Drop for PeerRollback {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "host_callbacks_tests.rs"]
+mod tests;

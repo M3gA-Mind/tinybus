@@ -134,10 +134,11 @@ impl Proxy {
     /// happened to claim the name first is the outcome this exists to prevent,
     /// and it is better to fail a deploy than to succeed at that.
     ///
-    /// Use [`Proxy::attestation`] first if the caller wants to distinguish
-    /// "not installed" from "not trusted" before it assembles the secret.
-    /// A scoped host callback deliberately has no artifact attestation; its
-    /// authority comes only from the local ModuleHost capability.
+    /// For artifact-backed modules, use [`Proxy::attestation`] first to
+    /// distinguish "not installed" from "not trusted" before assembling a secret.
+    /// For scoped host callbacks, use the SDK-created binding and its scope
+    /// checks: callback authority comes from that local ModuleHost capability,
+    /// which deliberately has no artifact attestation.
     pub async fn call_confidential<R: DeserializeOwned>(
         &self,
         member: &str,
