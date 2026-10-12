@@ -90,23 +90,6 @@ impl NativeInstanceLiveness {
     }
     #[doc(hidden)]
     #[cfg(feature = "__native-fixture-support")]
-    pub fn __fixture_runtime_builder_error(&self) -> bool {
-        self.inner.startup_failure_stage.load(Ordering::Acquire) == 9
-    }
-    #[doc(hidden)]
-    #[cfg(feature = "__native-fixture-support")]
-    pub fn __fixture_received_resources_are_retained(&self) -> bool {
-        let resources = self
-            .inner
-            .resources
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        resources.runtime.is_some()
-            && resources.retained_factory.is_some()
-            && resources.initial.is_some()
-    }
-    #[doc(hidden)]
-    #[cfg(feature = "__native-fixture-support")]
     pub fn __fixture_reject_startup(&self, stage: u8) {
         self.inner.reject_startup_for_test(stage);
     }

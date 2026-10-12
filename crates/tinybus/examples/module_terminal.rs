@@ -11,7 +11,6 @@ use tinybus::{Connection, Result};
 static DROPPED: AtomicUsize = AtomicUsize::new(0);
 static EARLY: Mutex<Option<Controls>> = Mutex::new(None);
 static NEXT_FACTORY_MODE: AtomicUsize = AtomicUsize::new(0);
-static REJECTED: Mutex<Option<std::sync::Weak<Controller>>> = Mutex::new(None);
 static FACTORIES: AtomicUsize = AtomicUsize::new(0);
 static RETAINED_VIEWS: Mutex<Vec<NativeInstanceLiveness>> = Mutex::new(Vec::new());
 #[derive(Clone, Copy)]
@@ -167,11 +166,8 @@ fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)>
     controller.observe(10);
     #[cfg(feature = "__native-fixture-support")]
     match factory_mode {
-        20 => {
-            controller.view.__fixture_reject_worker_spawn();
-            *REJECTED.lock().unwrap() = Some(Arc::downgrade(&controller));
-        }
-        21..=29 => controller
+        20 => controller.view.__fixture_reject_worker_spawn(),
+        21..=28 => controller
             .view
             .__fixture_reject_startup((factory_mode - 20) as u8),
         _ => {}
@@ -462,40 +458,4 @@ pub extern "C" fn terminal_test_release_one_view() -> bool {
     let released = view.is_some();
     drop(view);
     released
-}
-
-/// Externally controlled fixture cleanup, NOT original SDK finish or completion.
-#[unsafe(no_mangle)]
-pub extern "C" fn terminal_test_external_controller_join() -> bool {
-    let controller = REJECTED
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(std::sync::Weak::upgrade);
-    let Some(controller) = controller else {
-        return false;
-    };
-    *controller.wake.0.lock().unwrap() = true;
-    controller.wake.1.notify_all();
-    let worker = controller.worker.lock().unwrap().take();
-    let joined = worker.is_some_and(|worker| matches!(worker.join(), Ok(true)));
-    controller.emit(20, u32::from(joined));
-    joined
-}
-/// Inspects actual SDK-received resources through the genuine rejected view.
-#[unsafe(no_mangle)]
-pub extern "C" fn terminal_test_rejected_resources() -> bool {
-    #[cfg(feature = "__native-fixture-support")]
-    return REJECTED
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(std::sync::Weak::upgrade)
-        .is_some_and(|controller| {
-            controller.view.__fixture_received_resources_are_retained()
-                && controller.view.__fixture_request_done()
-                && !controller.view.is_live()
-        });
-    #[cfg(not(feature = "__native-fixture-support"))]
-    false
 }
