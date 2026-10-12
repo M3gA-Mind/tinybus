@@ -2884,3 +2884,114 @@ impl crate::Interface for NativeBlockingCallback {
         Ok(serde_json::json!(context.authenticated_sender().unwrap()))
     }
 }
+
+static BLOCKING_STOP_RECEIVER: OnceLock<StdMutex<Option<std::sync::mpsc::Receiver<()>>>> =
+    OnceLock::new();
+static BLOCKING_STOP_STARTED: AtomicBool = AtomicBool::new(false);
+static BLOCKING_STOP_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "C" fn blocking_shutdown(_: *mut std::ffi::c_void, _: u64) -> i32 {
+    BLOCKING_STOP_CALLS.fetch_add(1, Ordering::AcqRel);
+    BLOCKING_STOP_STARTED.store(true, Ordering::Release);
+    if let Some(receiver) = BLOCKING_STOP_RECEIVER
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .expect("H00")
+        .take()
+    {
+        let _ = receiver.recv();
+    }
+    TB_OK
+}
+unsafe extern "C" fn blocking_shutdown_init(
+    host: *const crate::module::abi::TbHostVtable,
+    out: *mut TbModuleVtable,
+) -> i32 {
+    let code = unsafe { lazy_echo_init(host, out) };
+    if code == TB_OK {
+        unsafe {
+            (*out).shutdown = blocking_shutdown;
+        }
+    }
+    code
+}
+struct StopRelease(Option<std::sync::mpsc::SyncSender<()>>);
+impl Drop for StopRelease {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+#[tokio::test]
+async fn ordinary_stop_never_fabricates_faulted_before_or_after_callback_completion() {
+    let _test_guard = FAKE_MODULE_TEST_LOCK.lock().await;
+    let host = ModuleHost::new(Broker::new());
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let release = StopRelease(Some(sender));
+    *BLOCKING_STOP_RECEIVER
+        .get_or_init(|| StdMutex::new(None))
+        .lock()
+        .expect("H01") = Some(receiver);
+    BLOCKING_STOP_STARTED.store(false, Ordering::Release);
+    BLOCKING_STOP_CALLS.store(0, Ordering::Release);
+    unsafe {
+        host.attach_raw(
+            "clock.so",
+            TbAbiDescriptor::current("clock", "0.1.0"),
+            manifest(),
+            blocking_shutdown_init,
+        )
+    }
+    .expect("H02");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while host.list()[0].state != ModuleState::Ready {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("H03");
+    let inner = host.inner.clone();
+    let stopping =
+        tokio::spawn(async move { inner.stop("clock", Duration::from_millis(100)).await });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !BLOCKING_STOP_STARTED.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("H04");
+    assert!(stopping.await.expect("H05").is_err(), "H06");
+    assert_eq!(host.list()[0].state, ModuleState::Ready, "H07");
+    let retry = host.inner.stop("clock", Duration::from_millis(10)).await;
+    assert!(matches!(retry, Err(Error::MethodFailed { .. })), "H08");
+    assert_eq!(BLOCKING_STOP_CALLS.load(Ordering::Acquire), 1, "H09");
+    // Hold the host observer's lock while the blocking callback returns. The
+    // real broker cannot commit peer detach until this assertion is finished.
+    // No await occurs under this lock, and the opaque callback needs no host lock.
+    {
+        let loaded = host.inner.loaded.lock().expect("H10");
+        drop(release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while loaded[0].transport.is_ready() {
+            assert!(std::time::Instant::now() < deadline, "H11");
+            std::thread::yield_now();
+        }
+        assert!(!loaded[0].transport.is_faulted(), "H12");
+        assert!(
+            !matches!(
+                loaded[0].snapshot().state,
+                ModuleState::Faulted { .. } | ModuleState::Failed { .. }
+            ),
+            "H13"
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while host.list()[0].state != ModuleState::Stopped {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("H14");
+}

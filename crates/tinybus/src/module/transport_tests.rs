@@ -597,6 +597,7 @@ struct ShutdownRelease;
 impl Drop for ShutdownRelease {
     fn drop(&mut self) {
         SHUTDOWN_BLOCKED.store(false, Ordering::Release);
+        DELIVERY_CODE.store(TB_OK, Ordering::Release);
     }
 }
 
@@ -720,6 +721,7 @@ async fn stopping_initialized_module_before_ready_releases_observers_and_queued_
     })
     .await
     .expect("S25");
+    assert!(transport.pending.lock().expect("S36").is_empty(), "S37");
     assert!(!transport.is_faulted(), "S26");
     assert!(!transport.is_ready(), "S27");
     assert!(
@@ -734,6 +736,7 @@ async fn stopping_initialized_module_before_ready_releases_observers_and_queued_
 
 #[tokio::test]
 async fn ordinary_stop_wakes_backpressure_without_turning_closure_into_a_fault() {
+    let _release = ShutdownRelease;
     let _lock = VTABLE_TEST_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
@@ -769,4 +772,68 @@ async fn ordinary_stop_wakes_backpressure_without_turning_closure_into_a_fault()
     assert!(!transport.is_faulted(), "S34");
     assert_eq!(DELIVERIES.load(Ordering::Acquire), 1, "S35");
     DELIVERY_CODE.store(TB_OK, Ordering::Release);
+}
+
+#[tokio::test]
+async fn a_send_waiting_for_initialization_admission_closes_without_an_initializer_fault() {
+    let (transport, host) = ModuleTransport::new("admission-stop".into(), vec![]);
+    transport.defer_initialize(initialize_ok, host);
+    transport.pause_initialization();
+    let sending_transport = transport.clone();
+    let sending = tokio::spawn(async move { sending_transport.send(call()).await });
+    tokio::task::yield_now().await;
+    transport.stop_sync(Duration::ZERO);
+    assert!(
+        matches!(
+            tokio::time::timeout(Duration::from_secs(2), sending)
+                .await
+                .expect("S38")
+                .expect("S39"),
+            Err(Error::ConnectionClosed)
+        ),
+        "S40"
+    );
+    assert!(!transport.init_started(), "S41");
+    assert!(!transport.init_failed(), "S42");
+    assert!(!transport.is_faulted(), "S43");
+    assert!(transport.pending.lock().expect("S44").is_empty(), "S45");
+    assert!(!transport.drain_started.load(Ordering::Acquire), "S46");
+}
+
+struct InitializerRelease(Option<std::sync::mpsc::SyncSender<()>>);
+impl Drop for InitializerRelease {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _ = sender.send(());
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_actual_initializer_failure_during_stop_is_retained() {
+    let (transport, host) = ModuleTransport::new("failed-stop".into(), vec![]);
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let release = InitializerRelease(Some(sender));
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    transport.defer_initializer(host, move |_| {
+        let _ = entered.send(());
+        let _ = receiver.recv();
+        Err("module initialization failed".into())
+    });
+    let sending_transport = transport.clone();
+    let sending = tokio::spawn(async move { sending_transport.send(call()).await });
+    tokio::time::timeout(Duration::from_secs(2), observed)
+        .await
+        .expect("S47")
+        .expect("S48");
+    transport.stop_sync(Duration::ZERO);
+    drop(release);
+    tokio::time::timeout(Duration::from_secs(2), sending)
+        .await
+        .expect("S49")
+        .expect("S50")
+        .expect("S51");
+    assert!(transport.init_failed(), "S52");
+    assert!(transport.is_faulted(), "S53");
+    assert!(!transport.is_ready(), "S54");
 }

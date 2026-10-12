@@ -83,7 +83,6 @@ enum InitFailure {
     Failed(String),
 }
 
-
 // The opaque host context is process-lifetime state and every callback is
 // required by the ABI to be thread-safe.
 unsafe impl Send for DeferredInitializer {}
@@ -309,12 +308,21 @@ impl ModuleTransport {
                         self.clear_config();
                         return Err(InitFailure::Failed(reason));
                     }
-                    Ok(Err(_)) => return Err(InitFailure::Failed("module initialization panicked".to_string())),
-                    Err(_) => return Err(InitFailure::Failed("module initialization exceeded its deadline".to_string())),
+                    Ok(Err(_)) => {
+                        return Err(InitFailure::Failed(
+                            "module initialization panicked".to_string(),
+                        ));
+                    }
+                    Err(_) => {
+                        return Err(InitFailure::Failed(
+                            "module initialization exceeded its deadline".to_string(),
+                        ));
+                    }
                 };
                 self.clear_config();
-                self.initialize(module.0)
-                    .map_err(|_| InitFailure::Failed("module returned an invalid vtable".to_string()))?;
+                self.initialize(module.0).map_err(|_| {
+                    InitFailure::Failed("module returned an invalid vtable".to_string())
+                })?;
                 Ok(())
             })
             .await;
