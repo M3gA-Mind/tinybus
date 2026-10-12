@@ -71,6 +71,19 @@ fn call() -> Message {
 struct CaptureLevel(Arc<AtomicBool>);
 
 impl tracing::Subscriber for CaptureLevel {
+    fn register_callsite(
+        &self,
+        _: &'static tracing::Metadata<'static>,
+    ) -> tracing::subscriber::Interest {
+        // Scoped subscribers coexist with logs from other test threads.
+        // Re-check the active dispatcher instead of caching global interest.
+        tracing::subscriber::Interest::sometimes()
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::TRACE)
+    }
+
     fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
         true
     }
@@ -99,9 +112,6 @@ fn a_module_log_line_reaches_the_hosts_subscriber_with_its_level() {
     let (_transport, host) = ModuleTransport::new("logger".to_string(), Vec::new());
     let observed = Arc::new(AtomicBool::new(false));
     let bytes = b"module log line";
-    // Register the shared host-log callsite before installing a scoped
-    // subscriber. Other tests may first log without a subscriber concurrently.
-    unsafe { (host.log)(host.host_ctx, 1, bytes.as_ptr(), bytes.len()) };
     tracing::subscriber::with_default(CaptureLevel(observed.clone()), || unsafe {
         (host.log)(host.host_ctx, 1, bytes.as_ptr(), bytes.len());
     });
