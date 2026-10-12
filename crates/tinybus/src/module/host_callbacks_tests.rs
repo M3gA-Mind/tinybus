@@ -810,6 +810,54 @@ async fn actual_native_fault_at_ready_commit_dominates_ordinary_stop() {
     native_callback_decision_race(true, true).await;
 }
 
+async fn await_native_attach<T: std::fmt::Debug>(
+    attached: &Notify,
+    load: &mut tokio::task::JoinHandle<T>,
+) {
+    tokio::select! {
+        _ = attached.notified() => {},
+        result = load => panic!("native callback load ended before attach: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(2)) => {
+            panic!("native callback load did not reach attach before the setup deadline");
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn setup_attachment_wait_allows_preload_to_outlive_product_deadlines() {
+    let attached = Arc::new(Notify::new());
+    let observed = attached.clone();
+    let (release, preload) = tokio::sync::oneshot::channel::<()>();
+    let mut load = tokio::spawn(async move {
+        preload.await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let wait = tokio::spawn(async move {
+        await_native_attach(&observed, &mut load).await;
+        load.abort();
+        assert!(load.await.unwrap_err().is_cancelled());
+    });
+    tokio::task::yield_now().await;
+    // The setup assertion starts after attachment, regardless of how long
+    // admission, hashing, and native loading take to establish that precondition.
+    tokio::time::advance(Duration::from_secs(3)).await;
+    tokio::task::yield_now().await;
+    assert!(!wait.is_finished(), "valid preload was mistaken for setup failure");
+    release.send(()).unwrap();
+    attached.notify_one();
+    wait.await.unwrap();
+}
+
+#[tokio::test]
+async fn setup_attachment_wait_reports_an_early_load_failure() {
+    let attached = Arc::new(Notify::new());
+    let mut load = tokio::spawn(async { Err::<(), _>(Error::ConnectionClosed) });
+    let wait = tokio::spawn(async move {
+        await_native_attach(&attached, &mut load).await;
+    });
+    assert!(wait.await.unwrap_err().is_panic());
+}
+
 async fn native_callback_setup_failure_race(panic_setup: bool) {
     use super::super::super::transport::tests::{native_fixture, native_fixture_json};
     let (unused, _, _, barrier) = native_fixture();
@@ -840,13 +888,7 @@ async fn native_callback_setup_failure_race(panic_setup: bool) {
             .load_file_with_host_callbacks(artifact, config, &loading_binding)
             .await
     });
-    tokio::select! {
-        _ = attached.notified() => {},
-        result = &mut load => panic!("native callback load ended before attach: {result:?}"),
-        _ = tokio::time::sleep(Duration::from_secs(2)) => {
-            panic!("native callback load did not reach attach before the setup deadline");
-        }
-    }
+    await_native_attach(&attached, &mut load).await;
     let transport = host.inner.loaded.lock().unwrap()[0].transport.clone();
     // Actual ordinary lifecycle ownership, before the callback initialization
     // gate opens. This instance proves C never entered, rather than any join.
