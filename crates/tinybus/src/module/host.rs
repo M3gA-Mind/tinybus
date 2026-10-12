@@ -1673,11 +1673,11 @@ impl ModuleControl for ModuleHostInner {
         let module = loaded
             .iter_mut()
             .find(|module| &module.unique_name == unique_name)?;
-        if !module.transport.is_faulted()
-            && let Some(old) = module.transition_from.take()
-        {
-            module.info.state = ModuleState::Stopped;
-            return Some((module.info.name.clone(), old, ModuleState::Stopped));
+        if !module.transport.is_faulted() {
+            if let Some(old) = module.transition_from.take() {
+                module.info.state = ModuleState::Stopped;
+                return Some((module.info.name.clone(), old, ModuleState::Stopped));
+            }
         }
         if !module.transport.is_faulted()
             || matches!(
