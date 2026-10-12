@@ -3029,11 +3029,10 @@ async fn ordinary_stop_never_fabricates_faulted_before_or_after_callback_complet
             "H22"
         );
     }
-    assert_eq!(
-        host.inner.loaded.lock().expect("H23")[0].transition_from,
-        Some(ModuleState::Ready),
-        "H24"
-    );
+    let origin = host.inner.loaded.lock().expect("H23")[0]
+        .transition_from
+        .clone();
+    assert!(matches!(origin, Some(ModuleState::Ready)), "H24");
     tokio::time::timeout(Duration::from_secs(2), async {
         while host.list()[0].state != ModuleState::Stopped {
             tokio::task::yield_now().await;
