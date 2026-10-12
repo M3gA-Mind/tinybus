@@ -91,12 +91,9 @@ impl Drop for SetupFuture {
         );
     }
 }
-fn factory(
-    view: NativeInstanceLiveness,
-) -> Result<(
-    impl Fn(Connection, Config) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync,
-    RuntimeHooks,
-)> {
+type FixtureFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+type FixtureSetup = Box<dyn Fn(Connection, Config) -> FixtureFuture + Send + Sync>;
+fn factory(view: NativeInstanceLiveness) -> Result<(FixtureSetup, RuntimeHooks)> {
     let early = EARLY
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -198,7 +195,7 @@ fn factory(
             }
         },
     );
-    Ok((setup, hooks))
+    Ok((Box::new(setup), hooks))
 }
 #[unsafe(no_mangle)]
 pub static TINYBUS_MODULE_ABI_V1: TbAbiDescriptor =
