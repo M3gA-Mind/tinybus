@@ -74,7 +74,13 @@ fn a_directed_signal_requires_one_unique_recipient_and_cannot_be_private() {
     assert!(signal.validate().is_err());
     signal.header.destination = Some(":1.9".parse().unwrap());
     signal.header.confidential = true;
-    assert!(signal.validate().unwrap_err().to_string().contains("signal"));
+    assert!(
+        signal
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("signal")
+    );
 }
 
 #[test]

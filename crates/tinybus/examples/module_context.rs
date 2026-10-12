@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 use tinybus::{CallContext, Connection, Error, Interface, InterfaceName, MemberName, Result};
 
-struct ContextService(Connection, std::sync::Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<tinybus::message::Message>>>);
+struct ContextService(
+    Connection,
+    std::sync::Arc<tokio::sync::Mutex<tokio::sync::broadcast::Receiver<tinybus::message::Message>>>,
+);
 
 #[async_trait]
 impl Interface for ContextService {
@@ -47,7 +50,12 @@ impl Interface for ContextService {
                 Ok(serde_json::json!([sender, reply]))
             }
             "WaitForWatchChanged" => {
-                let message = self.1.lock().await.recv().await
+                let message = self
+                    .1
+                    .lock()
+                    .await
+                    .recv()
+                    .await
                     .map_err(|_| Error::failed("directed signal receiver closed"))?;
                 Ok(message.body)
             }
@@ -62,7 +70,13 @@ async fn setup(connection: Connection) -> Result<()> {
         .receive_directed_signal("WatchChanged")
         .await?;
     connection
-        .serve_at("/context".parse()?, ContextService(connection.clone(), std::sync::Arc::new(tokio::sync::Mutex::new(signals))))
+        .serve_at(
+            "/context".parse()?,
+            ContextService(
+                connection.clone(),
+                std::sync::Arc::new(tokio::sync::Mutex::new(signals)),
+            ),
+        )
         .await?;
     connection.request_name("org.example.Context").await
 }
