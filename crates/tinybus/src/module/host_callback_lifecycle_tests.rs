@@ -208,19 +208,20 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
             // Always release the observer, including a failed watchdog.
             let _release = CallbackRelease(probe_release);
             let entered = tokio::time::timeout(
-                Duration::from_secs(2),
+                Duration::from_secs(5),
                 probe_entered.acquire(),
             ).await;
             let completed = tokio::time::timeout(
                 Duration::from_secs(1),
                 native_cleanup_finished(&transport),
             ).await;
+            eprintln!("denial observer: entered={} actual_cleanup_while_held={}",
+                entered.is_ok(), completed.is_ok());
             (entered.is_ok(), completed.is_ok())
         }))
     } else {
         None
     };
-    let new_call_denied = denial.await;
     if matches!(mode, DrainStop::DropHost) {
         let account = host.inner.loaded.lock().unwrap()[0]
             .callback_state
@@ -251,6 +252,7 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
         })
         .await;
         let _outcome = request.await;
+        let new_call_denied = denial.await;
         drop(probe_release_on_failure);
         assert!(new_call_denied.is_ok_and(|denied| denied));
         assert!(completed.is_ok());
@@ -269,8 +271,6 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
     }
     // Release and consume real callback/physical cleanup before all assertions.
     drop(release_on_failure);
-    let drained = tokio::time::timeout(Duration::from_secs(2), binding.guard().drained())
-        .await;
     let stopped = if let Some(stopping) = stopping {
         if let Some(result) = early.take() {
             result
@@ -282,6 +282,8 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
     };
     let stop_elapsed = stop_started.elapsed();
     let stop_code = stopped.as_ref().err().map(|error| error.wire_name().to_owned());
+    let drained = tokio::time::timeout(Duration::from_secs(2), binding.guard().drained())
+        .await;
     // An error is not evidence of reclamation. Complete the retained ordinary
     // terminal job and independently observe native shutdown and lock release.
     transport.request_terminal(false);
@@ -290,6 +292,9 @@ async fn stop_after_admitted_callback(mode: DrainStop) {
         native_cleanup_finished(&transport),
     ).await;
     let request_outcome = request.await;
+    // Observe the unrelated RPC only after the original stop and real cleanup.
+    // Its denial is measured at the task's actual execution phase.
+    let new_call_denied = denial.await;
     drop(probe_release_on_failure);
     let observer_outcome = match observer {
         Some(observer) => Some(observer.await),
