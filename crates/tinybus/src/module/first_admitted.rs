@@ -26,7 +26,7 @@ use super::host::is_placement_refusal;
 use super::{CachedRelease, ModuleHost, ModuleInfo, artifact_dir};
 
 /// One published artifact of a release and the digest that makes it legitimate.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReleaseAsset<'a> {
     /// Host identifier this artifact targets, e.g. `ubuntu-24.04-x86_64`.
     pub host_key: &'a str,

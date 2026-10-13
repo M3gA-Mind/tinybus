@@ -759,7 +759,7 @@ impl ModuleHost {
     /// Refusals are returned per artifact so one bad file cannot prevent the
     /// remaining modules from loading.
     pub fn load_dir(&self, directory: impl AsRef<Path>) -> Result<Vec<Result<ModuleInfo>>> {
-        self.load_dir_inner(directory.as_ref(), None)
+        self.load_dir_inner(directory.as_ref(), None, &[])
     }
 
     /// Load modules from a directory while requiring each discovered manifest
@@ -770,13 +770,14 @@ impl ModuleHost {
         directory: impl AsRef<Path>,
         expected_name: &str,
     ) -> Result<Vec<Result<ModuleInfo>>> {
-        self.load_dir_inner(directory.as_ref(), Some(expected_name))
+        self.load_dir_inner(directory.as_ref(), Some(expected_name), &[])
     }
 
     fn load_dir_inner(
         &self,
         directory: &Path,
         expected_name: Option<&str>,
+        skip: &[String],
     ) -> Result<Vec<Result<ModuleInfo>>> {
         check_directory(directory)?;
         let mut directories = self
@@ -793,6 +794,16 @@ impl ModuleHost {
             .filter(|path| has_library_extension(path))
             .collect::<Vec<_>>();
         paths.sort();
+        // Skipped artifacts are dropped before anything opens them, so the
+        // remaining modules still resolve and initialise as one batch with
+        // their dependency order and configuration.
+        paths.retain(|path| {
+            let skipped = is_search_skipped(path, skip);
+            if skipped {
+                tracing::debug!("[tinybus::module] directory artifact skipped by host");
+            }
+            !skipped
+        });
         let loaded_files = self
             .inner
             .loaded
@@ -914,6 +925,26 @@ impl ModuleHost {
             .filter(|path| path.is_dir())
         {
             match self.load_dir(path) {
+                Ok(results) => outcomes.extend(results),
+                Err(error) => outcomes.push(Err(error)),
+            }
+        }
+        outcomes
+    }
+
+    /// [`Self::load_search_paths`], minus artifacts whose file stem is in `skip`.
+    ///
+    /// A skipped artifact is never opened, so a library the host has switched
+    /// off is not mapped (and never unloaded) just by sitting on the path. The
+    /// remaining artifacts of each directory load exactly as
+    /// [`Self::load_dir`] loads them.
+    pub fn load_search_paths_except(&self, skip: &[String]) -> Vec<Result<ModuleInfo>> {
+        let mut outcomes = Vec::new();
+        for directory in Self::search_paths()
+            .into_iter()
+            .filter(|path| path.is_dir())
+        {
+            match self.load_dir_inner(&directory, None, skip) {
                 Ok(results) => outcomes.extend(results),
                 Err(error) => outcomes.push(Err(error)),
             }
@@ -2097,6 +2128,13 @@ fn allowlisted_hash(path: &Path, file: std::fs::File) -> Result<Option<String>> 
         ));
     }
     Ok(Some(actual))
+}
+
+/// Whether `path`'s file stem is one of `skip`.
+fn is_search_skipped(path: &Path, skip: &[String]) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| skip.iter().any(|s| s == stem))
 }
 
 fn has_library_extension(path: &Path) -> bool {
