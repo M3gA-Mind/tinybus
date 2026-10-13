@@ -9,6 +9,9 @@ description = "Module-side runtime and export macro for trusted tinybus cdylibs.
 
 [features]
 static-link = []
+# Private, off-by-default instrumentation for compiled native lifecycle fixtures.
+# Not a production API or a source of native authority.
+__native-fixture-support = []
 
 [dependencies]
 async-trait.workspace = true

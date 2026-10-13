@@ -18,7 +18,7 @@ support. The host initializes the output vtable's leading `size` field with its
 allocation capacity before calling init. A newer module reads only that frozen
 field first and writes no more than the advertised capacity, so the additive
 tail is safe in both compatibility directions.
-The SDK bounds reinitialization setup to four seconds and returns `TB_TIMEOUT`
+The legacy SDK bounds reinitialization setup to four seconds and returns `TB_TIMEOUT`
 after cancelling the setup future. The host serializes this callback with
 shutdown and retains the lifecycle lock even if its own outer deadline expires.
 The final host callback, `ready`, marks completion of asynchronous setup. This
@@ -54,9 +54,31 @@ including independent workers after runtime shutdown or host destruction.
 Host destruction must leave a terminal tombstone; this context must never be
 recycled or reopened. Custom unsafe C hosts must truthfully uphold this
 contract, which cannot cryptographically authenticate an in-process host.
-This tail defines an optional ABI capability; ordinary SDK hosts currently
-supply `None`. It introduces no retain/release ABI or aggregate resource bound:
-the existing process-lifetime host-context and library retention is unbounded.
+This tail defines an optional ABI capability. Unsupported hosts supply `None`;
+terminal factories reject them before factory evaluation. It introduces no
+retain/release ABI or aggregate resource bound: the existing process-lifetime
+host-context and library retention is unbounded.
+
+Opted-in SDK instances use the existing opaque `module_ctx` field for a private
+slot/generation address token. No callback dereferences it and no ABI field or
+context allocation is added. Each SDK image has 256 slots; callback lookup
+clones the exact matching State under registry exclusion, then releases that
+lock before instance operations. Successful resource teardown may retire the
+anchor, but slot reuse waits for actual State last-Drop, including retained
+liveness views and SDK resources. Generation exhaustion permanently denies the
+slot instead of wrapping. Null, unknown or retired tokens return `TB_CLOSED`
+when the callback's other arguments are valid; legacy shutdown retains its
+existing null-context behavior. An old instance token cannot act on a
+replacement. These tokens are not serialized or
+logged and do not authenticate a native host.
+
+Terminal reinitialization uses result-first polling when completion and terminal
+intent are simultaneously ready. Cancellation leaves its foreign future owned
+by the instance until physical cleanup. Its runtime and terminal captures are
+destroyed on the independent physical cleanup thread. Uncertainty remains
+sticky and cannot be refunded by a timeout or shutdown return. Genuine native
+Fault is sampled even after local Stop, and faulted published instances retain
+their context anchor instead of earning successful retirement.
 
 ## Symbols
 

@@ -47,9 +47,30 @@ pub(crate) struct CallbackState {
     module_transport: Mutex<Option<std::sync::Weak<ModuleTransport>>>,
     lifetime: Mutex<Lifetime>,
     drained: Notify,
+    physical_drained: std::sync::Condvar,
+    #[cfg(test)]
+    pub(crate) physical_wait_started: Notify,
 }
 
 impl CallbackState {
+    /// Physical cleanup waits offruntime, without a watchdog or native exclusion.
+    pub(crate) fn wait_drained(&self) {
+        let mut state = self
+            .lifetime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active = false;
+        state.revoked = true;
+        #[cfg(test)]
+        self.physical_wait_started.notify_one();
+        while state.running != 0 {
+            state = self
+                .physical_drained
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
     pub(crate) async fn drain(self: &Arc<Self>, deadline: Duration) -> Result<()> {
         tokio::time::timeout(deadline, HostCallbackGuard(self.clone()).drained())
             .await
@@ -210,6 +231,8 @@ pub struct HostCallbackBinding {
     fixture_controller: Mutex<Option<Arc<dyn Send + Sync>>>,
     #[cfg(test)]
     before_load_decision: Mutex<Option<(Arc<Notify>, tokio::sync::oneshot::Receiver<()>)>>,
+    #[cfg(test)]
+    after_load_termination: Mutex<Option<Arc<Notify>>>,
 }
 
 /// Outgoing operations on the binding's private connection.
@@ -435,10 +458,15 @@ struct GuardedInterface<I> {
 struct Running(Arc<CallbackState>);
 impl Drop for Running {
     fn drop(&mut self) {
-        let mut state = self.0.lifetime.lock().expect("callback lifetime lock");
+        let mut state = self
+            .0
+            .lifetime
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.running -= 1;
         if state.running == 0 {
             self.0.drained.notify_waiters();
+            self.0.physical_drained.notify_all();
         }
     }
 }
@@ -476,9 +504,14 @@ impl<I: Interface> Interface for GuardedInterface<I> {
             state.running += 1;
             Running(self.state.clone())
         };
-        self.interface
-            .call_with_context(member, args, context)
-            .await
+        // The later-created user future is destroyed before Running on both
+        // completion and cancellation; no response queue owns this accounting.
+        let result = {
+            let user = self.interface.call_with_context(member, args, context);
+            user.await
+        };
+        drop(_running);
+        result
     }
 }
 
@@ -570,6 +603,8 @@ impl ModuleHost {
             fixture_controller: Mutex::new(None),
             #[cfg(test)]
             before_load_decision: Mutex::new(None),
+            #[cfg(test)]
+            after_load_termination: Mutex::new(None),
             state: Arc::new(CallbackState {
                 destination,
                 endpoints,
@@ -585,6 +620,9 @@ impl ModuleHost {
                     registering: Vec::new(),
                 }),
                 drained: Notify::new(),
+                physical_drained: std::sync::Condvar::new(),
+                #[cfg(test)]
+                physical_wait_started: Notify::new(),
             }),
         })
     }
@@ -667,6 +705,7 @@ impl ModuleHost {
             let fingerprint = callback_config_fingerprint(&bytes);
             drop(config);
             let (transport, host) = ModuleTransport::new(admitted.name.clone(), bytes);
+            transport.bind_host_callbacks(binding.state.clone())?;
             #[cfg(test)]
             {
                 // Transfer the fixture config borrow before C can enter, so
@@ -775,6 +814,10 @@ impl ModuleHost {
             let fault = transport.commit_admission_termination(cause);
             binding.revoke();
             transport.request_terminal(fault);
+            #[cfg(test)]
+            if let Some(entered) = binding.after_load_termination.lock().unwrap().take() {
+                entered.notify_one();
+            }
             let _ = transport.close().await;
             self.inner
                 .loaded

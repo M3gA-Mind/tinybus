@@ -15,6 +15,7 @@ async fn setup_runs_before_the_runtime_is_handed_out() {
     let runtime = ModuleRuntime::start(&RuntimeNames::default(), Some(setup)).unwrap();
     assert!(ran.load(Ordering::SeqCst));
     assert!(runtime.host().list().is_empty());
+    assert!(runtime.connection().unique_name().is_some());
 }
 
 #[tokio::test]
