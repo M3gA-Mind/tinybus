@@ -3,13 +3,63 @@
 //! Constructing a client starts nothing. The first call loads the module through
 //! the resolver, which resolves once per process and caches the outcome.
 
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Serialize, de::DeserializeOwned};
 
-use crate::module::failure::Reason;
-use crate::module::resolve::{ReleaseRecord, Resolver};
+use crate::module::failure::{FailureReporter, Reason};
+use crate::module::release::ReleaseRecord;
 use crate::{Error, Proxy};
+
+/// A boxed future returned by a [`ModuleAccess`].
+pub type AccessFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// Why a [`ModuleAccess`] could not hand out a proxy for a serving module.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProxyFailure {
+    /// The module bus could not be started or reached.
+    Transport,
+    /// The module's bus name or object path is not well formed.
+    Contract,
+}
+
+/// What a [`ModuleClient`] needs from the host to reach a registry module.
+///
+/// With the `modules` feature the host's `Resolver` implements it, loading the
+/// module lazily. A host built without the loader implements it over its bare
+/// registry and refuses every load, so callers compile and behave the same way
+/// (every call is unavailable and reported) with or without the loader.
+pub trait ModuleAccess: Send + Sync {
+    /// The registry record for `id`, if the host has one.
+    fn find(&self, id: &str) -> Option<&'static ReleaseRecord>;
+
+    /// Whether modules are enabled at all.
+    fn enabled(&self) -> bool;
+
+    /// The reporter terminal outcomes go through.
+    fn reporter(&self) -> &FailureReporter;
+
+    /// Ensure `id` is loaded and serving.
+    ///
+    /// # Errors
+    ///
+    /// A message fit for a user or a model when the module cannot be loaded.
+    fn ensure_loaded<'a>(&'a self, id: &'a str) -> AccessFuture<'a, Result<(), String>>;
+
+    /// A proxy for `object_path` on the serving module at `bus_name`.
+    ///
+    /// # Errors
+    ///
+    /// [`ProxyFailure`] when the bus cannot be reached or the names are invalid.
+    fn proxy<'a>(
+        &'a self,
+        bus_name: &'a str,
+        object_path: &'a str,
+    ) -> AccessFuture<'a, Result<Proxy, ProxyFailure>>;
+}
 
 /// A sanitised terminal module outcome. Arguments and remote error text are
 /// absent.
@@ -44,18 +94,19 @@ impl std::error::Error for ModuleCallError {}
 /// Calls contract members on registry modules, loading them lazily.
 #[derive(Clone)]
 pub struct ModuleClient {
-    resolver: Resolver,
+    access: Arc<dyn ModuleAccess>,
     timeout: Option<Duration>,
     /// Routes calls to a proxy instead of loading a module. For tests.
     fixture: Option<Proxy>,
 }
 
 impl ModuleClient {
-    /// A client that loads modules through `resolver`.
+    /// A client that reaches modules through `access` (a `Resolver`, with the
+    /// `modules` feature).
     #[must_use]
-    pub fn new(resolver: Resolver) -> Self {
+    pub fn new(access: impl ModuleAccess + 'static) -> Self {
         Self {
-            resolver,
+            access: Arc::new(access),
             timeout: None,
             fixture: None,
         }
@@ -182,28 +233,28 @@ impl ModuleClient {
 
     /// Report a structurally invalid reply from a known module invocation.
     pub fn report_malformed_reply(&self, module: &str) {
-        if let Some(record) = self.resolver.find(module) {
-            self.resolver.report_invocation(record, Reason::ModuleFault);
+        if let Some(record) = self.access.find(module) {
+            report_invocation(&*self.access, record, Reason::ModuleFault);
         }
     }
 
     /// Report a registered module that advertises an older wire contract.
     pub fn report_incompatible_contract(&self, module: &str) {
-        if let Some(record) = self.resolver.find(module) {
-            self.resolver.report(record, Reason::IncompatibleContract);
+        if let Some(record) = self.access.find(module) {
+            report(&*self.access, record, Reason::IncompatibleContract);
         }
     }
 
     /// Report a known module that does not provide the requested capability.
     pub fn report_unavailable(&self, module: &str) {
-        if let Some(record) = self.resolver.find(module) {
-            self.resolver.report(record, Reason::ModuleUnavailable);
+        if let Some(record) = self.access.find(module) {
+            report(&*self.access, record, Reason::ModuleUnavailable);
         }
     }
 
     fn object(&self, record: &'static ReleaseRecord, proxy: Proxy) -> ModuleObjectClient {
         ModuleObjectClient {
-            resolver: self.resolver.clone(),
+            access: Arc::clone(&self.access),
             record,
             proxy: self.with_deadline(proxy),
         }
@@ -215,12 +266,12 @@ impl ModuleClient {
     }
 
     fn record(&self, module: &str) -> Result<&'static ReleaseRecord, ModuleCallError> {
-        let Some(record) = self.resolver.find(module) else {
-            self.resolver.reporter().report_unknown_module();
+        let Some(record) = self.access.find(module) else {
+            self.access.reporter().report_unknown_module();
             return Err(ModuleCallError::Unavailable);
         };
-        if !self.resolver.enabled() {
-            self.resolver.report(record, Reason::Disabled);
+        if !self.access.enabled() {
+            report(&*self.access, record, Reason::Disabled);
             return Err(ModuleCallError::Unavailable);
         }
         Ok(record)
@@ -232,18 +283,23 @@ impl ModuleClient {
         record: &'static ReleaseRecord,
         object_path: &str,
     ) -> Result<Proxy, ModuleCallError> {
-        self.resolver
+        self.access
             .ensure_loaded(record.id)
             .await
             .map_err(|_| ModuleCallError::Unavailable)?;
-        let runtime = self.resolver.runtime().await.map_err(|_| {
-            self.resolver.report(record, Reason::TransportFailed);
-            ModuleCallError::TransportFailed
-        })?;
-        runtime.proxy(record.bus_name, object_path).map_err(|_| {
-            self.resolver.report(record, Reason::IncompatibleContract);
-            ModuleCallError::IncompatibleContract
-        })
+        self.access
+            .proxy(record.bus_name, object_path)
+            .await
+            .map_err(|failure| match failure {
+                ProxyFailure::Transport => {
+                    report(&*self.access, record, Reason::TransportFailed);
+                    ModuleCallError::TransportFailed
+                }
+                ProxyFailure::Contract => {
+                    report(&*self.access, record, Reason::IncompatibleContract);
+                    ModuleCallError::IncompatibleContract
+                }
+            })
     }
 
     async fn invoke<R: DeserializeOwned>(
@@ -260,7 +316,7 @@ impl ModuleClient {
             self.load_proxy(record, record.object_path).await?
         };
         let proxy = self.with_deadline(proxy);
-        invoke_proxy(&self.resolver, record, &proxy, member, args, confidential).await
+        invoke_proxy(&*self.access, record, &proxy, member, args, confidential).await
     }
 
     fn decode_json<R: DeserializeOwned>(

@@ -22,7 +22,7 @@ pub struct ReleaseAsset<'a> {
 /// Every field is supplied by the host's compiled registry rather than
 /// discovered: which modules exist, which interface they claim and which bytes
 /// are legitimate are build decisions, not whatever a release page serves today.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReleaseRecord {
     /// Stable identifier used by config, RPC and `ensure_loaded`.
     pub id: &'static str,
