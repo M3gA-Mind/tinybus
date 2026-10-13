@@ -1,7 +1,5 @@
 use super::*;
 use crate::module::failure::{FailureReport, FailureReporter, FailureSink};
-use crate::module::resolve::{ResolverInputs, RuntimeProvider};
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 #[derive(Default)]
@@ -25,28 +23,50 @@ static RECORD: ReleaseRecord = ReleaseRecord {
     assets: &[],
 };
 
-fn resolver(enabled: bool) -> (Arc<Recording>, Resolver) {
+/// A host without the loader: it knows its registry and refuses every load.
+struct Loaderless {
+    enabled: bool,
+    reporter: FailureReporter,
+}
+
+impl ModuleAccess for Loaderless {
+    fn find(&self, id: &str) -> Option<&'static ReleaseRecord> {
+        (id == RECORD.id).then_some(&RECORD)
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn reporter(&self) -> &FailureReporter {
+        &self.reporter
+    }
+
+    fn ensure_loaded<'a>(&'a self, id: &'a str) -> AccessFuture<'a, Result<(), String>> {
+        let _ = id;
+        Box::pin(async {
+            self.reporter()
+                .report(RECORD.id, RECORD.version, Reason::LoaderDisabled);
+            Err("this build has no module loader".to_string())
+        })
+    }
+
+    fn proxy<'a>(
+        &'a self,
+        _bus_name: &'a str,
+        _object_path: &'a str,
+    ) -> AccessFuture<'a, Result<Proxy, ProxyFailure>> {
+        Box::pin(async { Err(ProxyFailure::Transport) })
+    }
+}
+
+fn resolver(enabled: bool) -> (Arc<Recording>, Loaderless) {
     let sink = Arc::new(Recording::default());
-    let runtime: RuntimeProvider = Arc::new(|| {
-        Box::pin(async { Err(Error::Transport("no runtime in this test".to_string())) })
-    });
-    let resolver = Resolver::new(ResolverInputs {
+    let access = Loaderless {
         enabled,
-        install_dir: None,
-        allow_download: false,
-        bundled_dir: None,
-        sources: HashMap::new(),
-        linked: HashMap::new(),
-        search_skip: Vec::new(),
-        gate: None,
-        on_resolved: None,
-        records: vec![&RECORD],
-        terminal_marker: String::new(),
-        runtime,
-        module_config: Arc::new(|_| serde_json::json!({})),
-        reporter: Arc::new(FailureReporter::new(sink.clone())),
-    });
-    (sink, resolver)
+        reporter: FailureReporter::new(sink.clone()),
+    };
+    (sink, access)
 }
 
 fn method_failed(name: &str) -> Error {

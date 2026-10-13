@@ -7,9 +7,7 @@
 pub mod abi;
 #[cfg(feature = "modules")]
 mod cache;
-#[cfg(feature = "modules")]
 pub mod client;
-#[cfg(feature = "modules")]
 pub mod failure;
 #[cfg(feature = "modules")]
 mod first_admitted;
@@ -18,6 +16,7 @@ mod github;
 mod hash;
 pub mod manifest;
 pub mod platform;
+mod release;
 #[cfg(feature = "modules")]
 pub mod resolution;
 
@@ -38,12 +37,13 @@ mod windows_acl;
 
 #[cfg(feature = "modules")]
 pub use cache::{artifact_dir, is_safe_path_component, prune_stale_versions};
-#[cfg(feature = "modules")]
-pub use client::{ModuleCallError, ModuleClient, ModuleObjectClient, classify};
-#[cfg(feature = "modules")]
+pub use client::{
+    AccessFuture, ModuleAccess, ModuleCallError, ModuleClient, ModuleObjectClient, ProxyFailure,
+    classify,
+};
 pub use failure::{FailureReport, FailureReporter, FailureSink, Reason};
 #[cfg(feature = "modules")]
-pub use first_admitted::{ReleaseAsset, ReleasePlan, load_first_admitted};
+pub use first_admitted::{ReleasePlan, load_first_admitted};
 #[cfg(feature = "modules")]
 pub use github::CachedRelease;
 #[cfg(feature = "modules")]
@@ -53,10 +53,11 @@ pub use host::callbacks::{
 };
 #[cfg(feature = "modules")]
 pub use host::{ModuleHost, ModuleInfo, ModuleState};
+pub use release::{ReleaseAsset, ReleaseRecord};
 #[cfg(feature = "modules")]
 pub use resolve::{
     Availability, LinkedFactory, LoadError, ModuleConfigProvider, ModuleGate, ModuleSource,
-    ReleaseRecord, ResolvedHook, Resolver, ResolverInputs, RuntimeFuture, RuntimeProvider,
+    ResolvedHook, Resolver, ResolverInputs, RuntimeFuture, RuntimeProvider,
 };
 #[cfg(feature = "modules")]
 pub use runtime::{ModuleRuntime, RuntimeNames, RuntimeSetup};

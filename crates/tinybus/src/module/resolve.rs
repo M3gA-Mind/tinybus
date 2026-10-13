@@ -28,13 +28,17 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::Proxy;
 use crate::module::LinkedModule;
+use crate::module::client::{AccessFuture, ModuleAccess, ProxyFailure};
 use crate::module::failure::{FailureReporter, Reason};
 use crate::module::manifest::ModuleManifest;
 use crate::module::platform::host_candidates;
 use crate::module::resolution::{self, Claim, Resolution, ResolutionState, Waited};
 use crate::module::runtime::ModuleRuntime;
-use crate::module::{ReleaseAsset, ReleasePlan, load_first_admitted, prune_stale_versions};
+use crate::module::{
+    ReleaseAsset, ReleasePlan, ReleaseRecord, load_first_admitted, prune_stale_versions,
+};
 
 /// Result indexes refer to the input manifest slice.
 pub(crate) struct LoadOrder {
@@ -143,44 +147,6 @@ fn duplicates<T: Eq + std::hash::Hash>(values: impl Iterator<Item = T>) -> HashS
         .collect()
 }
 
-/// A first-party module a host knows how to load.
-///
-/// Every field is supplied by the host's compiled registry rather than
-/// discovered: which modules exist, which interface they claim and which bytes
-/// are legitimate are build decisions, not whatever a release page serves today.
-#[derive(Debug, Clone, Copy)]
-pub struct ReleaseRecord {
-    /// Stable identifier used by config, RPC and `ensure_loaded`.
-    pub id: &'static str,
-    /// Well-known bus name the module claims once it is serving.
-    pub bus_name: &'static str,
-    /// Object path the module serves its interface at.
-    pub object_path: &'static str,
-    /// Release version, matching the tag the assets come from.
-    pub version: &'static str,
-    /// GitHub release tag URL the artifacts are published under.
-    pub release_url: &'static str,
-    /// Per-host artifacts and the digests that make them legitimate.
-    pub assets: &'static [ReleaseAsset<'static>],
-}
-
-impl ReleaseRecord {
-    /// The asset for `host_key`, if this release publishes one.
-    #[must_use]
-    pub fn asset_for(&self, host_key: &str) -> Option<&'static ReleaseAsset<'static>> {
-        self.assets.iter().find(|asset| asset.host_key == host_key)
-    }
-
-    /// Whether this release publishes an artifact any candidate key of this
-    /// host can run.
-    #[must_use]
-    pub fn supports_this_host(&self) -> bool {
-        host_candidates()
-            .iter()
-            .any(|key| self.asset_for(key).is_some())
-    }
-}
-
 /// Where a module's artifact should come from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -271,6 +237,37 @@ pub type ResolvedHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// Builds the [`LinkedModule`] compiled into the host for one module id. A plain
 /// `fn` so a registration carries no state.
 pub type LinkedFactory = fn() -> crate::Result<LinkedModule>;
+
+impl ModuleAccess for Resolver {
+    fn find(&self, id: &str) -> Option<&'static ReleaseRecord> {
+        Resolver::find(self, id)
+    }
+
+    fn enabled(&self) -> bool {
+        Resolver::enabled(self)
+    }
+
+    fn reporter(&self) -> &FailureReporter {
+        Resolver::reporter(self)
+    }
+
+    fn ensure_loaded<'a>(&'a self, id: &'a str) -> AccessFuture<'a, Result<(), String>> {
+        Box::pin(Resolver::ensure_loaded(self, id))
+    }
+
+    fn proxy<'a>(
+        &'a self,
+        bus_name: &'a str,
+        object_path: &'a str,
+    ) -> AccessFuture<'a, Result<Proxy, ProxyFailure>> {
+        Box::pin(async move {
+            let runtime = self.runtime().await.map_err(|_| ProxyFailure::Transport)?;
+            runtime
+                .proxy(bus_name, object_path)
+                .map_err(|_| ProxyFailure::Contract)
+        })
+    }
+}
 
 /// Plain inputs a host builds a [`Resolver`] from.
 pub struct ResolverInputs {

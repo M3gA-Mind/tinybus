@@ -577,6 +577,76 @@ mod resolver {
         assert_eq!(resolver.state_of(record.id), Availability::Failed);
     }
 
+    #[tokio::test]
+    async fn a_client_over_a_resolver_is_unavailable_and_reports_when_modules_are_disabled() {
+        use crate::module::{ModuleCallError, ModuleClient};
+        let record = record("resolver-client-disabled");
+        let f = fixture(record, false, HashMap::new(), None);
+        let client = ModuleClient::new(f.resolver.clone());
+        let result = client.call::<()>(record.id, "Anything", ()).await;
+        assert_eq!(result, Err(ModuleCallError::Unavailable));
+        assert_eq!(
+            f.sink.0.lock().unwrap().as_slice(),
+            &[(record.id.to_string(), Reason::Disabled)]
+        );
+        assert_eq!(f.runtime_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn the_access_trait_delegates_to_the_resolver() {
+        use crate::module::{ModuleAccess, ProxyFailure};
+        let record = record("resolver-access");
+        let f = fixture(record, true, HashMap::new(), None);
+        let access: &dyn ModuleAccess = &f.resolver;
+        assert_eq!(access.find(record.id), Some(record));
+        assert!(access.find("nobody").is_none());
+        assert!(access.enabled());
+        access.reporter().report_unknown_module();
+        // A valid bus address yields a proxy once the runtime is up.
+        assert!(
+            access
+                .proxy("ai.tinyhumans.test.Access", "/ai/tinyhumans/test/Access")
+                .await
+                .is_ok()
+        );
+        // A malformed address is a contract failure, not a transport one.
+        assert_eq!(
+            access.proxy("not a bus name", "/nope").await.err(),
+            Some(ProxyFailure::Contract)
+        );
+        // Loading goes through the ladder and fails here for lack of an artifact.
+        assert!(access.ensure_loaded(record.id).await.is_err());
+
+        let failing = Resolver::new(ResolverInputs {
+            enabled: true,
+            install_dir: None,
+            allow_download: false,
+            bundled_dir: None,
+            sources: HashMap::new(),
+            linked: HashMap::new(),
+            search_skip: Vec::new(),
+            gate: None,
+            on_resolved: None,
+            records: vec![record],
+            terminal_marker: String::new(),
+            runtime: Arc::new(|| {
+                Box::pin(async { Err(crate::Error::Transport("no runtime".to_string())) })
+            }),
+            module_config: Arc::new(|_| serde_json::json!({})),
+            reporter: Arc::new(FailureReporter::new(f.sink.clone())),
+        });
+        assert_eq!(
+            ModuleAccess::proxy(
+                &failing,
+                "ai.tinyhumans.test.Access",
+                "/ai/tinyhumans/test/Access"
+            )
+            .await
+            .err(),
+            Some(ProxyFailure::Transport)
+        );
+    }
+
     #[test]
     fn mark_terminal_is_idempotent() {
         let record = record("resolver-marker");

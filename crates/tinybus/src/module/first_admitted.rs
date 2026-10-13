@@ -23,18 +23,7 @@ use std::path::Path;
 
 use super::cache::{digest_marker_path, secure_release_cache};
 use super::host::is_placement_refusal;
-use super::{CachedRelease, ModuleHost, ModuleInfo, artifact_dir};
-
-/// One published artifact of a release and the digest that makes it legitimate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ReleaseAsset<'a> {
-    /// Host identifier this artifact targets, e.g. `ubuntu-24.04-x86_64`.
-    pub host_key: &'a str,
-    /// Exact release asset name.
-    pub archive: &'a str,
-    /// Lowercase hex SHA-256 of the archive, pinned by the host.
-    pub sha256: &'a str,
-}
+use super::{CachedRelease, ModuleHost, ModuleInfo, ReleaseAsset, artifact_dir};
 
 /// The pinned release and where its artifacts live on this machine.
 #[derive(Debug, Clone, Copy)]
