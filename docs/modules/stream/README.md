@@ -38,6 +38,11 @@ while let Some(chunk) = reader.next_chunk().await? {
 }
 ```
 
+A handler that knows its caller should bind the accept to it with
+`conn.accept_stream_from(&handle, &caller)`, where `caller` is the
+broker-stamped sender of the call. A stream opened by any other peer is refused
+as an unknown stream and stays available to its owner.
+
 `Connection::call_with_stream` does the interleaving for the common case, and
 `Connection::read_stream` buffers a whole payload for when it is too big for a
 frame but not too big for memory.

@@ -64,7 +64,9 @@ omitted field and a `null` field identically.
 for returns. `error` bodies are a string: the human-readable message, without
 the error name, which travels in `error_name`.
 
-`signal` remains a broadcast selected by match rules. `directed_signal` is a
+`signal` remains a broadcast selected by match rules. A `signal` may carry a
+unique-name `destination` (`Connection::emit_to`); the broker then delivers it
+only to that peer, and only if the peer has a matching rule. `directed_signal` is a
 separate protocol kind and routes to one unique destination only. The broker
 accepts it only when the sender is a live SDK-created callback binding, the
 destination is that binding's exact currently loaded module, and path,
