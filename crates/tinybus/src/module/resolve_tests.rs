@@ -281,7 +281,12 @@ mod resolver {
         let error = f.resolver.ensure_loaded(record.id).await.unwrap_err();
         assert!(error.contains("modules are disabled"));
         let error = f.resolver.ensure_loaded("nobody").await.unwrap_err();
+        // Disabled is checked before the registry, as it always was.
+        assert!(error.contains("modules are disabled"));
+        let enabled = fixture(record, true, HashMap::new(), None);
+        let error = enabled.resolver.ensure_loaded("nobody").await.unwrap_err();
         assert_eq!(error, "unknown module 'nobody'");
+        assert_eq!(enabled.runtime_calls.load(Ordering::SeqCst), 0);
         assert_eq!(f.runtime_calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             f.sink.0.lock().unwrap().as_slice(),
