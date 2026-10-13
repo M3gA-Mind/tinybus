@@ -135,3 +135,237 @@ fn two_modules_claiming_one_bus_name_are_both_reported_and_neither_is_initialize
     assert!(result.order.is_empty());
     assert_eq!(result.unresolved.len(), 2);
 }
+
+mod resolver {
+    use super::super::*;
+    use crate::module::failure::{FailureReport, FailureSink};
+    use crate::module::runtime::RuntimeNames;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<(String, Reason)>>);
+
+    impl FailureSink for Recording {
+        fn capture(&self, report: &FailureReport<'_>) {
+            self.0
+                .lock()
+                .unwrap()
+                .push((report.module.to_string(), report.reason));
+        }
+    }
+
+    fn shared_runtime() -> &'static ModuleRuntime {
+        static RUNTIME: std::sync::OnceLock<ModuleRuntime> = std::sync::OnceLock::new();
+        RUNTIME.get_or_init(|| ModuleRuntime::start(&RuntimeNames::default(), None).unwrap())
+    }
+
+    /// The resolution table is process-global, so each test owns a distinct id.
+    fn record(id: &'static str) -> &'static ReleaseRecord {
+        Box::leak(Box::new(ReleaseRecord {
+            id,
+            bus_name: Box::leak(format!("ai.tinyhumans.test.{id}").into_boxed_str()),
+            object_path: "/ai/tinyhumans/test/Module",
+            version: "0.0.0",
+            release_url: "https://github.com/tinyhumansai/tinybus/releases/tag/v0.0.0",
+            assets: &[],
+        }))
+    }
+
+    struct Fixture {
+        sink: Arc<Recording>,
+        config_calls: Arc<AtomicUsize>,
+        runtime_calls: Arc<AtomicUsize>,
+        resolver: Resolver,
+    }
+
+    fn fixture(
+        record: &'static ReleaseRecord,
+        enabled: bool,
+        sources: HashMap<String, ModuleSource>,
+        install_dir: Option<PathBuf>,
+    ) -> Fixture {
+        let sink = Arc::new(Recording::default());
+        let config_calls = Arc::new(AtomicUsize::new(0));
+        let runtime_calls = Arc::new(AtomicUsize::new(0));
+        let counted = config_calls.clone();
+        let started = runtime_calls.clone();
+        let resolver = Resolver::new(ResolverInputs {
+            enabled,
+            install_dir,
+            allow_download: false,
+            bundled_dir: None,
+            sources,
+            records: vec![record],
+            terminal_marker: "This is terminal for the running process".to_string(),
+            runtime: Arc::new(move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(shared_runtime()) })
+            }),
+            module_config: Arc::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                serde_json::json!({})
+            }),
+            reporter: Arc::new(FailureReporter::new(sink.clone())),
+        });
+        Fixture {
+            sink,
+            config_calls,
+            runtime_calls,
+            resolver,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_faulted_module_is_never_retried_in_process() {
+        let record = record("resolver-faulted");
+        let dir = tempfile::tempdir().unwrap();
+        let f = fixture(record, true, HashMap::new(), Some(dir.path().to_path_buf()));
+
+        let first = f.resolver.ensure_loaded(record.id).await.unwrap_err();
+        assert!(first.contains("not available for this platform"), "{first}");
+        assert!(first.contains("restart the app to try again"), "{first}");
+        assert_eq!(f.resolver.state_of(record.id), Availability::Failed);
+        assert_eq!(f.config_calls.load(Ordering::SeqCst), 1);
+
+        // The cached outcome is returned verbatim, without another attempt.
+        for _ in 0..3 {
+            let again = f.resolver.ensure_loaded(record.id).await.unwrap_err();
+            assert_eq!(again, first);
+        }
+        assert_eq!(f.config_calls.load(Ordering::SeqCst), 1, "retried a faulted module");
+        // One terminal report, however many callers asked.
+        assert_eq!(
+            f.sink.0.lock().unwrap().as_slice(),
+            &[(record.id.to_string(), Reason::ResolutionFailed)]
+        );
+    }
+
+    #[tokio::test]
+    async fn status_of_reports_the_failure_reason_and_unsupported_platforms() {
+        let record = record("resolver-status");
+        let dir = tempfile::tempdir().unwrap();
+        let f = fixture(record, true, HashMap::new(), Some(dir.path().to_path_buf()));
+
+        // No asset is published for this host.
+        assert_eq!(
+            f.resolver.status_of(record),
+            (
+                Availability::Unsupported,
+                Some("no artifact is published for this platform".to_string())
+            )
+        );
+        let _ = f.resolver.ensure_loaded(record.id).await;
+        let (state, detail) = f.resolver.status_of(record);
+        assert_eq!(state, Availability::Failed);
+        assert!(detail.unwrap().contains("restart the app"));
+    }
+
+    #[test]
+    fn disabled_configuration_wins_over_a_loaded_module() {
+        let record = record("resolver-disabled-status");
+        let f = fixture(record, false, HashMap::new(), None);
+        assert_eq!(
+            f.resolver.status_of(record),
+            (
+                Availability::Unsupported,
+                Some("modules are disabled in configuration".to_string())
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn refusals_never_start_the_module_runtime() {
+        let record = record("resolver-refusal");
+        let f = fixture(record, false, HashMap::new(), None);
+        let error = f.resolver.ensure_loaded(record.id).await.unwrap_err();
+        assert!(error.contains("modules are disabled"));
+        let error = f.resolver.ensure_loaded("nobody").await.unwrap_err();
+        assert_eq!(error, "unknown module 'nobody'");
+        assert_eq!(f.runtime_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            f.sink.0.lock().unwrap().as_slice(),
+            &[(record.id.to_string(), Reason::Disabled)]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_install_dir_is_terminal() {
+        let record = record("resolver-no-install-dir");
+        let f = fixture(record, true, HashMap::new(), None);
+        let error = f.resolver.ensure_loaded(record.id).await.unwrap_err();
+        assert!(error.contains("no directory is available to install modules into"));
+    }
+
+    #[tokio::test]
+    async fn a_local_override_is_tried_before_the_release_cache() {
+        let record = record("resolver-override");
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent-module");
+        let sources = HashMap::from([(
+            record.id.to_string(),
+            ModuleSource::LocalFile {
+                path: missing.to_string_lossy().into_owned(),
+            },
+        )]);
+        // No install dir: reaching the cache rung would say so instead.
+        let f = fixture(record, true, sources, None);
+        let error = f.resolver.ensure_loaded(record.id).await.unwrap_err();
+        assert!(error.contains("could not be loaded from its local artifact"), "{error}");
+        assert!(!error.contains("no directory is available"), "{error}");
+        assert_eq!(error.matches("This is terminal for the running process").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_bounded_wait_reports_still_loading_without_cancelling_the_resolution() {
+        let record = record("resolver-bounded");
+        let dir = tempfile::tempdir().unwrap();
+        let f = fixture(record, true, HashMap::new(), Some(dir.path().to_path_buf()));
+        let table = resolution::global();
+        let Claim::Run { sender, .. } = table.claim(record.id) else {
+            panic!("first claim must run");
+        };
+        let waited = f
+            .resolver
+            .ensure_loaded_within(record.id, Some(Duration::from_millis(20)))
+            .await;
+        assert_eq!(waited, Err(LoadError::StillLoading));
+        assert_eq!(f.resolver.state_of(record.id), Availability::Loading);
+        table.complete(record.id, Resolution::Ready, sender);
+        assert_eq!(f.resolver.ensure_loaded(record.id).await, Ok(()));
+        assert_eq!(f.resolver.state_of(record.id), Availability::Ready);
+    }
+
+    #[test]
+    fn mark_terminal_is_idempotent() {
+        let record = record("resolver-marker");
+        let f = fixture(record, true, HashMap::new(), None);
+        let once = f.resolver.mark_terminal("boom".to_string());
+        assert_eq!(
+            once,
+            "boom. This is terminal for the running process; restart the app to try again"
+        );
+        assert_eq!(f.resolver.mark_terminal(once.clone()), once);
+    }
+
+    #[test]
+    fn wire_forms_of_source_and_availability_are_stable() {
+        assert_eq!(
+            serde_json::to_value(ModuleSource::Pinned).unwrap(),
+            serde_json::json!({"kind": "pinned"})
+        );
+        assert_eq!(
+            serde_json::to_value(ModuleSource::LocalFile { path: "/x".into() }).unwrap(),
+            serde_json::json!({"kind": "local_file", "path": "/x"})
+        );
+        for (state, wire) in [
+            (Availability::Available, "available"),
+            (Availability::Loading, "loading"),
+            (Availability::Ready, "ready"),
+            (Availability::Failed, "failed"),
+            (Availability::Unsupported, "unsupported"),
+        ] {
+            assert_eq!(serde_json::to_value(state).unwrap(), serde_json::json!(wire));
+        }
+    }
+}
