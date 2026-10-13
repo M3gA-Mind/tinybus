@@ -18,7 +18,7 @@ for artifact in "$module" "$module_two" "$wrong_target" "$context_module" "$cont
     exit 1
   fi
 done
-private="$PWD/target/private-module-tests/module-clock-two"
+private="$PWD/target/private-module-coverage/module-clock-two"
 mkdir -p "$private"
 chmod 700 "$private"
 cp "$module_two" "$private/"
@@ -31,7 +31,7 @@ fi
 printf '"%s" = "%s"\n' "$library" "$digest" > "$private/modules.toml"
 # Terminal fixtures can retain uncertain owners; pin a private copy and run
 # each SDK scenario in a fresh process so its retained state cannot leak.
-terminal_private="$PWD/target/private-module-tests/module-terminal"
+terminal_private="$PWD/target/private-module-coverage/module-terminal"
 mkdir -p "$terminal_private"
 chmod 700 "$terminal_private"
 cp "$terminal_module" "$terminal_private/"
