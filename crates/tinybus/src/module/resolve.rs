@@ -34,7 +34,9 @@ use crate::module::manifest::ModuleManifest;
 use crate::module::platform::host_candidates;
 use crate::module::resolution::{self, Claim, Resolution, ResolutionState, Waited};
 use crate::module::runtime::ModuleRuntime;
-use crate::module::{ReleaseAsset, ReleasePlan, load_first_admitted, prune_stale_versions};
+use crate::module::{
+    ReleaseAsset, ReleasePlan, ReleaseRecord, load_first_admitted, prune_stale_versions,
+};
 
 /// Result indexes refer to the input manifest slice.
 pub(crate) struct LoadOrder {
@@ -141,44 +143,6 @@ fn duplicates<T: Eq + std::hash::Hash>(values: impl Iterator<Item = T>) -> HashS
         .into_iter()
         .filter_map(|(value, count)| (count > 1).then_some(value))
         .collect()
-}
-
-/// A first-party module a host knows how to load.
-///
-/// Every field is supplied by the host's compiled registry rather than
-/// discovered: which modules exist, which interface they claim and which bytes
-/// are legitimate are build decisions, not whatever a release page serves today.
-#[derive(Debug, Clone, Copy)]
-pub struct ReleaseRecord {
-    /// Stable identifier used by config, RPC and `ensure_loaded`.
-    pub id: &'static str,
-    /// Well-known bus name the module claims once it is serving.
-    pub bus_name: &'static str,
-    /// Object path the module serves its interface at.
-    pub object_path: &'static str,
-    /// Release version, matching the tag the assets come from.
-    pub version: &'static str,
-    /// GitHub release tag URL the artifacts are published under.
-    pub release_url: &'static str,
-    /// Per-host artifacts and the digests that make them legitimate.
-    pub assets: &'static [ReleaseAsset<'static>],
-}
-
-impl ReleaseRecord {
-    /// The asset for `host_key`, if this release publishes one.
-    #[must_use]
-    pub fn asset_for(&self, host_key: &str) -> Option<&'static ReleaseAsset<'static>> {
-        self.assets.iter().find(|asset| asset.host_key == host_key)
-    }
-
-    /// Whether this release publishes an artifact any candidate key of this
-    /// host can run.
-    #[must_use]
-    pub fn supports_this_host(&self) -> bool {
-        host_candidates()
-            .iter()
-            .any(|key| self.asset_for(key).is_some())
-    }
 }
 
 /// Where a module's artifact should come from.
