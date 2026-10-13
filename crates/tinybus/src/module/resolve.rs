@@ -28,7 +28,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::Proxy;
 use crate::module::LinkedModule;
+use crate::module::client::{AccessFuture, ModuleAccess, ProxyFailure};
 use crate::module::failure::{FailureReporter, Reason};
 use crate::module::manifest::ModuleManifest;
 use crate::module::platform::host_candidates;
@@ -235,6 +237,37 @@ pub type ResolvedHook = Arc<dyn Fn(&str) + Send + Sync>;
 /// Builds the [`LinkedModule`] compiled into the host for one module id. A plain
 /// `fn` so a registration carries no state.
 pub type LinkedFactory = fn() -> crate::Result<LinkedModule>;
+
+impl ModuleAccess for Resolver {
+    fn find(&self, id: &str) -> Option<&'static ReleaseRecord> {
+        Resolver::find(self, id)
+    }
+
+    fn enabled(&self) -> bool {
+        Resolver::enabled(self)
+    }
+
+    fn reporter(&self) -> &FailureReporter {
+        Resolver::reporter(self)
+    }
+
+    fn ensure_loaded<'a>(&'a self, id: &'a str) -> AccessFuture<'a, Result<(), String>> {
+        Box::pin(Resolver::ensure_loaded(self, id))
+    }
+
+    fn proxy<'a>(
+        &'a self,
+        bus_name: &'a str,
+        object_path: &'a str,
+    ) -> AccessFuture<'a, Result<Proxy, ProxyFailure>> {
+        Box::pin(async move {
+            let runtime = self.runtime().await.map_err(|_| ProxyFailure::Transport)?;
+            runtime
+                .proxy(bus_name, object_path)
+                .map_err(|_| ProxyFailure::Contract)
+        })
+    }
+}
 
 /// Plain inputs a host builds a [`Resolver`] from.
 pub struct ResolverInputs {

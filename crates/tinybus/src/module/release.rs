@@ -54,4 +54,3 @@ impl ReleaseRecord {
             .any(|key| self.asset_for(key).is_some())
     }
 }
-

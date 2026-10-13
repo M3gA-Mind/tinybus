@@ -44,7 +44,6 @@ pub use client::{
 pub use failure::{FailureReport, FailureReporter, FailureSink, Reason};
 #[cfg(feature = "modules")]
 pub use first_admitted::{ReleasePlan, load_first_admitted};
-pub use release::{ReleaseAsset, ReleaseRecord};
 #[cfg(feature = "modules")]
 pub use github::CachedRelease;
 #[cfg(feature = "modules")]
@@ -54,6 +53,7 @@ pub use host::callbacks::{
 };
 #[cfg(feature = "modules")]
 pub use host::{ModuleHost, ModuleInfo, ModuleState};
+pub use release::{ReleaseAsset, ReleaseRecord};
 #[cfg(feature = "modules")]
 pub use resolve::{
     Availability, LinkedFactory, LoadError, ModuleConfigProvider, ModuleGate, ModuleSource,

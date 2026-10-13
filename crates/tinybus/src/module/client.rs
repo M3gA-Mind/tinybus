@@ -1,7 +1,8 @@
 //! Shared module access for hosts: a [`ModuleClient`] over a [`Resolver`].
 //!
 //! Constructing a client starts nothing. The first call loads the module through
-//! the resolver, which resolves once per process and caches the outcome.
+//! its [`ModuleAccess`] (a `Resolver`, with the `modules` feature), which
+//! resolves once per process and caches the outcome.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -337,7 +338,7 @@ impl ModuleClient {
 /// controller responses.
 #[derive(Clone)]
 pub struct ModuleObjectClient {
-    resolver: Resolver,
+    access: Arc<dyn ModuleAccess>,
     record: &'static ReleaseRecord,
     proxy: Proxy,
 }
@@ -353,15 +354,7 @@ impl ModuleObjectClient {
         member: &str,
         args: impl Serialize,
     ) -> Result<R, ModuleCallError> {
-        invoke_proxy(
-            &self.resolver,
-            self.record,
-            &self.proxy,
-            member,
-            args,
-            false,
-        )
-        .await
+        invoke_proxy(&*self.access, self.record, &self.proxy, member, args, false).await
     }
 
     /// Call a confidential member of the object.
@@ -374,12 +367,12 @@ impl ModuleObjectClient {
         member: &str,
         args: impl Serialize,
     ) -> Result<R, ModuleCallError> {
-        invoke_proxy(&self.resolver, self.record, &self.proxy, member, args, true).await
+        invoke_proxy(&*self.access, self.record, &self.proxy, member, args, true).await
     }
 }
 
 async fn invoke_proxy<R: DeserializeOwned>(
-    resolver: &Resolver,
+    access: &dyn ModuleAccess,
     record: &'static ReleaseRecord,
     proxy: &Proxy,
     member: &str,
@@ -391,23 +384,33 @@ async fn invoke_proxy<R: DeserializeOwned>(
     } else {
         proxy.call(member, args).await
     };
-    result.map_err(|error| report_proxy_failure(resolver, record, &error))
+    result.map_err(|error| report_proxy_failure(access.reporter(), record, &error))
 }
 
 /// Report a bus failure without exposing its payload. Product adapters may
 /// separately decode a structured provider refusal for display.
 pub fn report_proxy_failure(
-    resolver: &Resolver,
+    reporter: &FailureReporter,
     record: &ReleaseRecord,
     error: &Error,
 ) -> ModuleCallError {
     let (outcome, reason) = classify(error);
     if reason == Reason::ModuleUnavailable {
-        resolver.report(record, reason);
+        reporter.report(record.id, record.version, reason);
     } else {
-        resolver.report_invocation(record, reason);
+        reporter.report_invocation(record.id, record.version, reason);
     }
     outcome
+}
+
+fn report(access: &dyn ModuleAccess, record: &ReleaseRecord, reason: Reason) {
+    access.reporter().report(record.id, record.version, reason);
+}
+
+fn report_invocation(access: &dyn ModuleAccess, record: &ReleaseRecord, reason: Reason) {
+    access
+        .reporter()
+        .report_invocation(record.id, record.version, reason);
 }
 
 /// Map a bus error to a sanitised outcome and its closed reason.
