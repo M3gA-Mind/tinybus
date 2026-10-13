@@ -1267,14 +1267,8 @@ impl Connection {
     /// handle (the unique name). A stream opened by anyone else, or an id that
     /// does not exist, fails with the same [`Error::UnknownStream`], and the
     /// stream stays available to its real owner.
-    pub fn accept_stream_from(
-        &self,
-        stream: &StreamRef,
-        opener: &BusName,
-    ) -> Result<StreamReader> {
-        self.inner
-            .streams
-            .take_reader_opened_by(&stream.id, opener)
+    pub fn accept_stream_from(&self, stream: &StreamRef, opener: &BusName) -> Result<StreamReader> {
+        self.inner.streams.take_reader_opened_by(&stream.id, opener)
     }
 
     /// Read a whole stream into memory, refusing to exceed

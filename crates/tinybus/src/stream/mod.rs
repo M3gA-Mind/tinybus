@@ -540,11 +540,7 @@ impl StreamRegistry {
     /// Take a reader only when `opener` opened the stream. A mismatch is
     /// reported as an unknown stream, so a peer cannot probe other peers' ids,
     /// and leaves the entry in place for its real owner.
-    pub(crate) fn take_reader_opened_by(
-        &self,
-        id: &str,
-        opener: &BusName,
-    ) -> Result<StreamReader> {
+    pub(crate) fn take_reader_opened_by(&self, id: &str, opener: &BusName) -> Result<StreamReader> {
         let owned = {
             let streams = self.inbound.lock().expect("stream registry lock");
             streams

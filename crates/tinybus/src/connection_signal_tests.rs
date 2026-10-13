@@ -312,3 +312,88 @@ async fn an_admitted_local_handler_refuses_identical_remote_payload_and_only_acc
         "same-claimed-tenant"
     );
 }
+
+fn watch_rule() -> crate::MatchRule {
+    crate::MatchRule::new()
+        .signals()
+        .interface(InterfaceName::new("ai.tinyhumans.Events").unwrap())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn emit_to_reaches_only_the_addressed_subscriber() {
+    let bus = MemoryBus::new();
+    crate::broker::Broker::new().spawn(bus.clone());
+    let publisher = connect(&bus).await;
+    let target = connect(&bus).await;
+    let bystander = connect(&bus).await;
+    let mut target_rx = target.add_match(watch_rule()).await.unwrap();
+    let mut bystander_rx = bystander.add_match(watch_rule()).await.unwrap();
+
+    publisher
+        .emit_to(
+            target.unique_name().unwrap(),
+            ObjectPath::new("/events/artifact").unwrap(),
+            InterfaceName::new("ai.tinyhumans.Events").unwrap(),
+            MemberName::new("Published").unwrap(),
+            ["private"],
+        )
+        .await
+        .unwrap();
+    // A later broadcast proves the bystander is subscribed and listening.
+    publisher
+        .emit(
+            ObjectPath::new("/events/artifact").unwrap(),
+            InterfaceName::new("ai.tinyhumans.Events").unwrap(),
+            MemberName::new("Published").unwrap(),
+            ["public"],
+        )
+        .await
+        .unwrap();
+
+    let first = tokio::time::timeout(Duration::from_secs(2), target_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.body, serde_json::json!(["private"]));
+    let seen = tokio::time::timeout(Duration::from_secs(2), bystander_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(seen.body, serde_json::json!(["public"]));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn emit_to_still_requires_the_target_to_have_subscribed() {
+    let bus = MemoryBus::new();
+    crate::broker::Broker::new().spawn(bus.clone());
+    let publisher = connect(&bus).await;
+    let target = connect(&bus).await;
+    let mut rx = target.signals();
+    publisher
+        .emit_to(
+            target.unique_name().unwrap(),
+            ObjectPath::new("/events/artifact").unwrap(),
+            InterfaceName::new("ai.tinyhumans.Events").unwrap(),
+            MemberName::new("Published").unwrap(),
+            ["x"],
+        )
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), rx.recv())
+            .await
+            .is_err()
+    );
+}
+
+#[test]
+fn a_signal_addressed_to_a_well_known_name_is_refused() {
+    let message = Message::signal_to(
+        BusName::new("ai.tinyhumans.Storage").unwrap(),
+        ObjectPath::new("/events/artifact").unwrap(),
+        InterfaceName::new("ai.tinyhumans.Events").unwrap(),
+        MemberName::new("Published").unwrap(),
+        serde_json::json!([]),
+    );
+    assert!(message.validate().is_err());
+}

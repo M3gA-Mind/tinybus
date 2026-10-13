@@ -1022,3 +1022,56 @@ fn an_ordinary_body_is_not_mistaken_for_a_stream_handle() {
     assert!(!body_contains_stream_ref(&serde_json::json!([])));
     assert!(!body_contains_stream_ref(&serde_json::Value::Null));
 }
+
+#[tokio::test]
+async fn accept_stream_from_binds_the_stream_to_the_peer_that_opened_it() {
+    let bus = MemoryBus::new();
+    Broker::new().spawn(bus.clone());
+    let owner = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let intruder = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let service = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    service.request_name(SINK).await.unwrap();
+
+    let writer = owner
+        .open_stream(&BusName::new(SINK).unwrap(), StreamDescriptor::default())
+        .await
+        .unwrap();
+    let stream = writer.stream_ref();
+
+    // Another peer's claim fails exactly like an id that does not exist, and
+    // leaves the stream for its owner.
+    let refused = service
+        .accept_stream_from(&stream, &intruder.unique_name().unwrap())
+        .unwrap_err();
+    assert!(matches!(refused, Error::UnknownStream { .. }));
+
+    let mut reader = service
+        .accept_stream_from(&stream, &owner.unique_name().unwrap())
+        .unwrap();
+    let mut writer = writer;
+    writer.write(b"mine").await.unwrap();
+    writer.finish().await.unwrap();
+    assert_eq!(reader.next_chunk().await.unwrap().unwrap(), b"mine");
+}
+
+#[tokio::test]
+async fn accept_stream_from_refuses_an_unknown_id() {
+    let (client, service) = bus().await;
+    let error = service
+        .accept_stream_from(
+            &StreamRef {
+                id: "s404".to_string(),
+                content_type: None,
+                len: None,
+            },
+            &client.unique_name().unwrap(),
+        )
+        .unwrap_err();
+    assert!(matches!(error, Error::UnknownStream { .. }));
+}
