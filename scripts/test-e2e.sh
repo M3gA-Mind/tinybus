@@ -50,9 +50,11 @@ export TINYBUS_TEST_TERMINAL_MODULE="$terminal_private/$terminal_library"
 export TINYBUS_TEST_MODULE="$module" TINYBUS_TEST_MODULE_TWO="$private/$library" TINYBUS_TEST_WRONG_TARGET="$wrong_target" TINYBUS_TEST_CONTEXT_MODULE="$context_module" TINYBUS_TEST_CONTEXT_EAGER_MODULE="$context_eager_module" TINYBUS_TEST_HOST_CALLBACK_MODULE="$host_callback_module" TINYBUS_TEST_CONTROLLED_INIT_MODULE="$controlled_init_module"
 cargo test --locked --no-default-features --workspace --features modules,macros,test-support,__native-fixture-support -- --ignored --skip terminal_runtime_tests::compiled_native_
 
+terminal_tests=$(cargo test --locked -p tinybus-module --features __native-fixture-support -- --list --ignored | sed -n 's/^\(terminal_runtime_tests::compiled_native_.*\): test$/\1/p')
+[ -n "$terminal_tests" ] || { echo "no compiled terminal scenarios found" >&2; exit 1; }
 while IFS= read -r test; do
   cargo test --locked -p tinybus-module --features __native-fixture-support "$test" -- --ignored --exact
-done < <(cargo test --locked -p tinybus-module --features __native-fixture-support -- --list --ignored | sed -n 's/^\(terminal_runtime_tests::compiled_native_.*\): test$/\1/p')
+done <<< "$terminal_tests"
 
 cargo test --locked --no-default-features --features modules,macros admission_tests -- --include-ignored
 TINYBUS_TEST_UMASK=1 cargo test --locked --no-default-features --features modules,macros permissive_umask -- --test-threads=1
