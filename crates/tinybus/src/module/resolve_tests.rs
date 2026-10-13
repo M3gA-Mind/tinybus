@@ -196,6 +196,10 @@ mod resolver {
             allow_download: false,
             bundled_dir: None,
             sources,
+            linked: HashMap::new(),
+            search_skip: Vec::new(),
+            gate: None,
+            on_resolved: None,
             records: vec![record],
             terminal_marker: "This is terminal for the running process".to_string(),
             runtime: Arc::new(move || {
@@ -353,6 +357,113 @@ mod resolver {
         assert_eq!(f.resolver.state_of(record.id), Availability::Ready);
     }
 
+    #[tokio::test]
+    async fn a_gated_module_is_refused_before_anything_starts_or_is_reported() {
+        let record = record("resolver-gated");
+        let mut f = fixture(record, true, HashMap::new(), None);
+        let sink = Arc::new(Recording::default());
+        let runtime_calls = Arc::new(AtomicUsize::new(0));
+        let started = runtime_calls.clone();
+        f.resolver = Resolver::new(ResolverInputs {
+            enabled: true,
+            install_dir: None,
+            allow_download: false,
+            bundled_dir: None,
+            sources: HashMap::new(),
+            linked: HashMap::new(),
+            search_skip: Vec::new(),
+            gate: Some(Arc::new(|id| (id == "resolver-gated").then_some("test-switch"))),
+            on_resolved: None,
+            records: vec![record],
+            terminal_marker: String::new(),
+            runtime: Arc::new(move || {
+                started.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(shared_runtime()) })
+            }),
+            module_config: Arc::new(|_| serde_json::json!({})),
+            reporter: Arc::new(FailureReporter::new(sink.clone())),
+        });
+        let refused = f
+            .resolver
+            .ensure_loaded_within(record.id, None)
+            .await
+            .unwrap_err();
+        assert_eq!(refused, LoadError::Disabled("test-switch"));
+        assert!(refused.into_message().contains("test-switch"));
+        assert_eq!(runtime_calls.load(Ordering::SeqCst), 0);
+        assert!(sink.0.lock().unwrap().is_empty(), "a switch is not a failure");
+        assert_eq!(f.resolver.state_of(record.id), Availability::Available);
+    }
+
+    #[tokio::test]
+    async fn a_linked_source_without_a_factory_is_terminal_and_never_retried() {
+        let record = record("resolver-linked-missing");
+        let sources = HashMap::from([(record.id.to_string(), ModuleSource::Linked)]);
+        let f = fixture(record, true, sources, None);
+        let first = f.resolver.ensure_loaded(record.id).await.unwrap_err();
+        assert!(first.contains("no linked factory is registered"), "{first}");
+        assert!(!first.contains("no directory is available"), "{first}");
+        assert_eq!(f.resolver.state_of(record.id), Availability::Failed);
+        assert_eq!(f.resolver.ensure_loaded(record.id).await.unwrap_err(), first);
+        assert_eq!(f.config_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failing_linked_factory_is_terminal_and_names_no_cause() {
+        let record = record("resolver-linked-failing");
+        let sources = HashMap::from([(record.id.to_string(), ModuleSource::Linked)]);
+        let mut f = fixture(record, true, sources.clone(), None);
+        f.resolver = Resolver::new(ResolverInputs {
+            enabled: true,
+            install_dir: None,
+            allow_download: false,
+            bundled_dir: None,
+            sources,
+            linked: HashMap::from([(
+                record.id.to_string(),
+                (|| Err(crate::Error::Transport("secret path /home/x".into()))) as LinkedFactory,
+            )]),
+            search_skip: Vec::new(),
+            gate: None,
+            on_resolved: None,
+            records: vec![record],
+            terminal_marker: String::new(),
+            runtime: Arc::new(|| Box::pin(async { Ok(shared_runtime()) })),
+            module_config: Arc::new(|_| serde_json::json!({})),
+            reporter: Arc::new(FailureReporter::new(f.sink.clone())),
+        });
+        let error = f.resolver.ensure_loaded(record.id).await.unwrap_err();
+        assert!(error.contains("its linked factory could not be started"), "{error}");
+        assert!(!error.contains("/home/x"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn the_resolved_hook_runs_once_before_waiters_are_released() {
+        let record = record("resolver-hook");
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = seen.clone();
+        let sink = Arc::new(Recording::default());
+        let resolver = Resolver::new(ResolverInputs {
+            enabled: true,
+            install_dir: None,
+            allow_download: false,
+            bundled_dir: None,
+            sources: HashMap::new(),
+            linked: HashMap::new(),
+            search_skip: Vec::new(),
+            gate: None,
+            on_resolved: Some(Arc::new(move |id| recorded.lock().unwrap().push(id.into()))),
+            records: vec![record],
+            terminal_marker: String::new(),
+            runtime: Arc::new(|| Box::pin(async { Ok(shared_runtime()) })),
+            module_config: Arc::new(|_| serde_json::json!({})),
+            reporter: Arc::new(FailureReporter::new(sink)),
+        });
+        let _ = resolver.ensure_loaded(record.id).await;
+        let _ = resolver.ensure_loaded(record.id).await;
+        assert_eq!(seen.lock().unwrap().as_slice(), &[record.id.to_string()]);
+    }
+
     #[test]
     fn mark_terminal_is_idempotent() {
         let record = record("resolver-marker");
@@ -374,6 +485,10 @@ mod resolver {
         assert_eq!(
             serde_json::to_value(ModuleSource::LocalFile { path: "/x".into() }).unwrap(),
             serde_json::json!({"kind": "local_file", "path": "/x"})
+        );
+        assert_eq!(
+            serde_json::to_value(ModuleSource::Linked).unwrap(),
+            serde_json::json!({"kind": "linked"})
         );
         for (state, wire) in [
             (Availability::Available, "available"),
