@@ -1,4 +1,4 @@
-//! Shared module access for hosts: a [`ModuleClient`] over a [`Resolver`].
+//! Shared module access for hosts: a [`ModuleClient`] over a [`ModuleAccess`].
 //!
 //! Constructing a client starts nothing. The first call loads the module through
 //! its [`ModuleAccess`] (a `Resolver`, with the `modules` feature), which
