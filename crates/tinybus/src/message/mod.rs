@@ -305,6 +305,10 @@ impl Message {
     /// Build a signal for one peer. The router delivers it only to the peer
     /// that owns the unique name `destination`, and only if that peer has a
     /// match rule accepting it; every other subscriber sees nothing.
+    ///
+    /// Only a broker that implements addressed signals honours the
+    /// destination; a broker that predates it ignores the field and broadcasts
+    /// by match rules, so use this only against a broker of the same release.
     pub fn signal_to(
         destination: BusName,
         path: ObjectPath,
