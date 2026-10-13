@@ -217,6 +217,8 @@ pub enum Availability {
     Failed,
     /// No artifact is published for this host, or modules are disabled.
     Unsupported,
+    /// Switched off by the host's [`ModuleGate`].
+    Disabled,
 }
 
 /// Why a bounded [`Resolver::ensure_loaded_within`] did not end with the module
@@ -459,11 +461,19 @@ impl Resolver {
                 Some("modules are disabled in configuration".to_string()),
             );
         }
+        if let Some(label) = self.inner.gate.as_ref().and_then(|gate| gate(record.id)) {
+            return (
+                Availability::Disabled,
+                Some(format!("switched off by host policy ({label})")),
+            );
+        }
         match resolution::global().peek(record.id) {
             ResolutionState::Ready => (Availability::Ready, None),
             ResolutionState::Loading => (Availability::Loading, None),
             ResolutionState::Failed(reason) => (Availability::Failed, Some(reason)),
-            ResolutionState::Unresolved if record.supports_this_host() => {
+            ResolutionState::Unresolved
+                if record.supports_this_host() || self.has_local_source(record.id) =>
+            {
                 (Availability::Available, None)
             }
             ResolutionState::Unresolved => (
@@ -471,6 +481,15 @@ impl Resolver {
                 Some("no artifact is published for this platform".to_string()),
             ),
         }
+    }
+
+    /// Whether `id` has a source other than the pinned release, which can serve
+    /// it on a host the release publishes no artifact for.
+    fn has_local_source(&self, id: &str) -> bool {
+        matches!(
+            self.inner.sources.get(id),
+            Some(ModuleSource::LocalFile { .. } | ModuleSource::Linked)
+        )
     }
 
     /// Run the resolution for `record` as a process-lifetime task and record its
@@ -504,7 +523,11 @@ impl Resolver {
                 }
             };
             if let Some(hook) = &this.inner.on_resolved {
-                hook(id);
+                // A hook that panics must not strand the callers waiting on
+                // this resolution.
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| hook(id))).is_err() {
+                    tracing::warn!(module = id, "[tinybus::module] resolved hook panicked");
+                }
             }
             resolution::global().complete(id, resolution, sender);
         };
@@ -680,19 +703,29 @@ impl Resolver {
     /// admission refuses the module.
     pub fn load_linked(
         runtime: &ModuleRuntime,
-        id: &str,
+        record: &ReleaseRecord,
         factory: Option<LinkedFactory>,
         module_config: serde_json::Value,
     ) -> Result<(), String> {
+        let id = record.id;
         let Some(factory) = factory else {
             return Err(format!(
                 "module '{id}' is unavailable: no linked factory is registered in this binary"
             ));
         };
-        let module = factory().map_err(|error| {
-            tracing::warn!(module = id, %error, "[tinybus::module] linked factory failed");
+        let module = factory().map_err(|_| {
+            // The factory's error can carry a path or a credential; only the
+            // module id and a fixed reason are logged.
+            tracing::warn!(module = id, "[tinybus::module] linked factory failed");
             format!("module '{id}' is unavailable: its linked factory could not be started")
         })?;
+        if module.manifest.bus_name.as_str() != record.bus_name
+            || module.manifest.object_path.as_str() != record.object_path
+        {
+            return Err(format!(
+                "module '{id}' is unavailable: its linked manifest does not match the registry record"
+            ));
+        }
         match runtime
             .host()
             .attach_linked_with_config(module, module_config)
