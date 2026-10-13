@@ -932,11 +932,7 @@ impl ModuleHost {
         if skip.is_empty() {
             return self.load_search_paths();
         }
-        let is_skipped = |path: &Path| {
-            path.file_stem()
-                .and_then(|stem| stem.to_str())
-                .is_some_and(|stem| skip.iter().any(|s| s == stem))
-        };
+        let is_skipped = |path: &Path| is_search_skipped(path, skip);
         let mut outcomes = Vec::new();
         for directory in Self::search_paths()
             .into_iter()
@@ -2146,6 +2142,13 @@ fn allowlisted_hash(path: &Path, file: std::fs::File) -> Result<Option<String>> 
         ));
     }
     Ok(Some(actual))
+}
+
+/// Whether `path`'s file stem is one of `skip`.
+fn is_search_skipped(path: &Path, skip: &[String]) -> bool {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .is_some_and(|stem| skip.iter().any(|s| s == stem))
 }
 
 fn has_library_extension(path: &Path) -> bool {

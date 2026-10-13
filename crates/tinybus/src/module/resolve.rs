@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::module::failure::{FailureReporter, Reason};
 use crate::module::LinkedModule;
+use crate::module::failure::{FailureReporter, Reason};
 use crate::module::manifest::ModuleManifest;
 use crate::module::platform::host_candidates;
 use crate::module::resolution::{self, Claim, Resolution, ResolutionState, Waited};
@@ -554,9 +554,7 @@ impl Resolver {
                 let factory = self.inner.linked.get(record.id).copied();
                 let module_config = (self.inner.module_config)(record.id);
                 return self
-                    .blocking(move || {
-                        Self::load_linked(runtime, record.id, factory, module_config)
-                    })
+                    .blocking(move || Self::load_linked(runtime, record.id, factory, module_config))
                     .await;
             }
             Some(ModuleSource::Pinned) | None => {}

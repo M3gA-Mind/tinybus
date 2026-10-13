@@ -372,7 +372,9 @@ mod resolver {
             sources: HashMap::new(),
             linked: HashMap::new(),
             search_skip: Vec::new(),
-            gate: Some(Arc::new(|id| (id == "resolver-gated").then_some("test-switch"))),
+            gate: Some(Arc::new(|id| {
+                (id == "resolver-gated").then_some("test-switch")
+            })),
             on_resolved: None,
             records: vec![record],
             terminal_marker: String::new(),
@@ -391,7 +393,10 @@ mod resolver {
         assert_eq!(refused, LoadError::Disabled("test-switch"));
         assert!(refused.into_message().contains("test-switch"));
         assert_eq!(runtime_calls.load(Ordering::SeqCst), 0);
-        assert!(sink.0.lock().unwrap().is_empty(), "a switch is not a failure");
+        assert!(
+            sink.0.lock().unwrap().is_empty(),
+            "a switch is not a failure"
+        );
         assert_eq!(f.resolver.state_of(record.id), Availability::Available);
     }
 
@@ -404,7 +409,10 @@ mod resolver {
         assert!(first.contains("no linked factory is registered"), "{first}");
         assert!(!first.contains("no directory is available"), "{first}");
         assert_eq!(f.resolver.state_of(record.id), Availability::Failed);
-        assert_eq!(f.resolver.ensure_loaded(record.id).await.unwrap_err(), first);
+        assert_eq!(
+            f.resolver.ensure_loaded(record.id).await.unwrap_err(),
+            first
+        );
         assert_eq!(f.config_calls.load(Ordering::SeqCst), 1);
     }
 
@@ -433,7 +441,10 @@ mod resolver {
             reporter: Arc::new(FailureReporter::new(f.sink.clone())),
         });
         let error = f.resolver.ensure_loaded(record.id).await.unwrap_err();
-        assert!(error.contains("its linked factory could not be started"), "{error}");
+        assert!(
+            error.contains("its linked factory could not be started"),
+            "{error}"
+        );
         assert!(!error.contains("/home/x"), "{error}");
     }
 

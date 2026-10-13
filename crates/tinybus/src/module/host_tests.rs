@@ -3331,3 +3331,16 @@ async fn actual_native_rejected_stop_submission_retains_guard_through_host_drop(
     drop(barrier);
     assert!(controller.upgrade().is_some());
 }
+
+#[test]
+fn search_skip_matches_file_stems_only() {
+    let skip = vec!["libclock".to_string(), "clock".to_string()];
+    assert!(is_search_skipped(Path::new("/m/libclock.so"), &skip));
+    assert!(is_search_skipped(Path::new("/m/clock.dll"), &skip));
+    assert!(!is_search_skipped(Path::new("/m/libclocks.so"), &skip));
+    assert!(!is_search_skipped(
+        Path::new("/m/libclock"),
+        &["clock".into()]
+    ));
+    assert!(!is_search_skipped(Path::new("/m/libclock.so"), &[]));
+}
