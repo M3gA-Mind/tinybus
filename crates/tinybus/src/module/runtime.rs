@@ -39,9 +39,8 @@ use crate::{Connection, Proxy};
 ///
 /// A host uses it to install the callback services its modules call back into,
 /// so they are being served before any module resolves.
-pub type RuntimeSetup = Box<
-    dyn FnOnce(Connection) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send>> + Send,
->;
+pub type RuntimeSetup =
+    Box<dyn FnOnce(Connection) -> Pin<Box<dyn Future<Output = crate::Result<()>> + Send>> + Send>;
 
 /// Thread names for a [`ModuleRuntime`], so a host's threads are recognisable.
 #[derive(Debug, Clone)]

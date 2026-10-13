@@ -297,7 +297,15 @@ impl ModuleObjectClient {
         member: &str,
         args: impl Serialize,
     ) -> Result<R, ModuleCallError> {
-        invoke_proxy(&self.resolver, self.record, &self.proxy, member, args, false).await
+        invoke_proxy(
+            &self.resolver,
+            self.record,
+            &self.proxy,
+            member,
+            args,
+            false,
+        )
+        .await
     }
 
     /// Call a confidential member of the object.

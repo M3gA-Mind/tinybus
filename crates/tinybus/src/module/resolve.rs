@@ -235,7 +235,8 @@ impl LoadError {
 }
 
 /// Future returned by a [`RuntimeProvider`].
-pub type RuntimeFuture = Pin<Box<dyn Future<Output = crate::Result<&'static ModuleRuntime>> + Send>>;
+pub type RuntimeFuture =
+    Pin<Box<dyn Future<Output = crate::Result<&'static ModuleRuntime>> + Send>>;
 
 /// Starts (or returns) the host's process-wide [`ModuleRuntime`], lazily, so a
 /// refusal or a cached outcome never starts a broker.
@@ -314,7 +315,9 @@ impl Resolver {
 
     /// Report a terminal outcome for `record`, once per process.
     pub fn report(&self, record: &ReleaseRecord, reason: Reason) {
-        self.inner.reporter.report(record.id, record.version, reason);
+        self.inner
+            .reporter
+            .report(record.id, record.version, reason);
     }
 
     /// Report a failure of one invocation of `record`.
@@ -439,7 +442,11 @@ impl Resolver {
         let this = self.clone();
         let id = record.id;
         let work = async move {
-            tracing::info!(module = id, version = record.version, "[tinybus::module] resolving");
+            tracing::info!(
+                module = id,
+                version = record.version,
+                "[tinybus::module] resolving"
+            );
             let resolution = match this.ladder(record).await {
                 Ok(()) => {
                     tracing::info!(module = id, "[tinybus::module] serving");
@@ -616,7 +623,10 @@ impl Resolver {
     ) -> Result<(), String> {
         match runtime.host().load_file_with_config(path, module_config) {
             Ok(_) => {
-                tracing::info!(module = id, "[tinybus::module] loaded from a local artifact");
+                tracing::info!(
+                    module = id,
+                    "[tinybus::module] loaded from a local artifact"
+                );
                 Ok(())
             }
             Err(err) => Err(format!(

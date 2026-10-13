@@ -103,7 +103,11 @@ fn call_errors_render_the_already_reported_prefix() {
         ModuleCallError::TransportFailed,
         ModuleCallError::ModuleFault,
     ] {
-        assert!(error.to_string().starts_with("MODULE_CALL_REPORTED: module "));
+        assert!(
+            error
+                .to_string()
+                .starts_with("MODULE_CALL_REPORTED: module ")
+        );
     }
 }
 

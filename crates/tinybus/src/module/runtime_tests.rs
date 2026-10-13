@@ -1,6 +1,6 @@
 use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[tokio::test]
 async fn setup_runs_before_the_runtime_is_handed_out() {

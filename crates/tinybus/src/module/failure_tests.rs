@@ -80,7 +80,11 @@ fn reason_codes_and_stages_are_the_closed_vocabulary() {
         (Reason::Disabled, "disabled", "availability"),
         (Reason::LoaderDisabled, "loader_disabled", "availability"),
         (Reason::ResolutionFailed, "resolution_failed", "resolve"),
-        (Reason::IncompatibleContract, "incompatible_contract", "contract"),
+        (
+            Reason::IncompatibleContract,
+            "incompatible_contract",
+            "contract",
+        ),
         (Reason::TransportFailed, "transport_failed", "transport"),
         (Reason::ModuleFault, "module_fault", "execution"),
         (Reason::ModuleUnavailable, "module_unavailable", "execution"),

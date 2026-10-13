@@ -233,7 +233,11 @@ mod resolver {
             let again = f.resolver.ensure_loaded(record.id).await.unwrap_err();
             assert_eq!(again, first);
         }
-        assert_eq!(f.config_calls.load(Ordering::SeqCst), 1, "retried a faulted module");
+        assert_eq!(
+            f.config_calls.load(Ordering::SeqCst),
+            1,
+            "retried a faulted module"
+        );
         // One terminal report, however many callers asked.
         assert_eq!(
             f.sink.0.lock().unwrap().as_slice(),
@@ -316,9 +320,17 @@ mod resolver {
         // No install dir: reaching the cache rung would say so instead.
         let f = fixture(record, true, sources, None);
         let error = f.resolver.ensure_loaded(record.id).await.unwrap_err();
-        assert!(error.contains("could not be loaded from its local artifact"), "{error}");
+        assert!(
+            error.contains("could not be loaded from its local artifact"),
+            "{error}"
+        );
         assert!(!error.contains("no directory is available"), "{error}");
-        assert_eq!(error.matches("This is terminal for the running process").count(), 1);
+        assert_eq!(
+            error
+                .matches("This is terminal for the running process")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -370,7 +382,10 @@ mod resolver {
             (Availability::Failed, "failed"),
             (Availability::Unsupported, "unsupported"),
         ] {
-            assert_eq!(serde_json::to_value(state).unwrap(), serde_json::json!(wire));
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::json!(wire)
+            );
         }
     }
 }
