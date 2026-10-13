@@ -51,7 +51,7 @@ omitted field and a `null` field identically.
 | `reply_serial` | u64 | `method_return`, `error` |
 | `sender` | bus name | stamped by the broker on everything it forwards |
 | `expected_responder` | unique bus name | optional, conditional method-call owner |
-| `destination` | bus name | `method_call`, `method_return`, `error`, `directed_signal` |
+| `destination` | bus name | `method_call`, `method_return`, `error`, `signal`, `directed_signal` |
 | `path` | object path | `method_call`, `signal`, `directed_signal` |
 | `interface` | interface name | `method_call`, `signal`, `directed_signal` |
 | `member` | member name | `method_call`, `signal`, `directed_signal` |
@@ -64,7 +64,9 @@ omitted field and a `null` field identically.
 for returns. `error` bodies are a string: the human-readable message, without
 the error name, which travels in `error_name`.
 
-`signal` remains a broadcast selected by match rules. `directed_signal` is a
+`signal` remains a broadcast selected by match rules. A `signal` may carry a
+unique-name `destination` (`Connection::emit_to`); the broker then delivers it
+only to that peer, and only if the peer has a matching rule. A broker that predates addressed signals ignores the field and broadcasts by match rules, so use `emit_to` only against a broker of the same release. `directed_signal` is a
 separate protocol kind and routes to one unique destination only. The broker
 accepts it only when the sender is a live SDK-created callback binding, the
 destination is that binding's exact currently loaded module, and path,
