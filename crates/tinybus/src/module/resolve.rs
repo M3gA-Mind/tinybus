@@ -577,7 +577,7 @@ impl Resolver {
                 let factory = self.inner.linked.get(record.id).copied();
                 let module_config = (self.inner.module_config)(record.id);
                 return self
-                    .blocking(move || Self::load_linked(runtime, record.id, factory, module_config))
+                    .blocking(move || Self::load_linked(runtime, record, factory, module_config))
                     .await;
             }
             Some(ModuleSource::Pinned) | None => {}

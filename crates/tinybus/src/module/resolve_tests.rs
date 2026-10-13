@@ -475,6 +475,108 @@ mod resolver {
         assert_eq!(seen.lock().unwrap().as_slice(), &[record.id.to_string()]);
     }
 
+    unsafe extern "C" fn never_initialised(
+        _: *const crate::module::abi::TbHostVtable,
+        _: *mut crate::module::abi::TbModuleVtable,
+    ) -> i32 {
+        panic!("a mismatched linked module must be refused before init");
+    }
+
+    #[tokio::test]
+    async fn a_linked_module_that_is_not_the_requested_record_is_refused_before_attach() {
+        fn impostor() -> crate::Result<LinkedModule> {
+            Ok(LinkedModule {
+                descriptor: crate::module::abi::TbAbiDescriptor::current("impostor", "1.0.0"),
+                manifest: super::module("Impostor", &[], &[]),
+                init: never_initialised,
+            })
+        }
+        let record = record("resolver-linked-impostor");
+        let sources = HashMap::from([(record.id.to_string(), ModuleSource::Linked)]);
+        let mut f = fixture(record, true, sources.clone(), None);
+        f.resolver = Resolver::new(ResolverInputs {
+            enabled: true,
+            install_dir: None,
+            allow_download: false,
+            bundled_dir: None,
+            sources,
+            linked: HashMap::from([(record.id.to_string(), impostor as LinkedFactory)]),
+            search_skip: Vec::new(),
+            gate: None,
+            on_resolved: None,
+            records: vec![record],
+            terminal_marker: String::new(),
+            runtime: Arc::new(|| Box::pin(async { Ok(shared_runtime()) })),
+            module_config: Arc::new(|_| serde_json::json!({})),
+            reporter: Arc::new(FailureReporter::new(f.sink.clone())),
+        });
+        let error = f.resolver.ensure_loaded(record.id).await.unwrap_err();
+        assert!(
+            error.contains("does not match the registry record"),
+            "{error}"
+        );
+        assert_eq!(f.resolver.state_of(record.id), Availability::Failed);
+    }
+
+    #[test]
+    fn status_reflects_the_gate_and_a_local_source_on_an_unsupported_host() {
+        let record = record("resolver-status-policy");
+        let sources = HashMap::from([(record.id.to_string(), ModuleSource::Linked)]);
+        // No asset is published for this host, but a linked source can serve it.
+        let f = fixture(record, true, sources, None);
+        assert_eq!(
+            f.resolver.status_of(record),
+            (Availability::Available, None)
+        );
+
+        let gated = Resolver::new(ResolverInputs {
+            enabled: true,
+            install_dir: None,
+            allow_download: false,
+            bundled_dir: None,
+            sources: HashMap::new(),
+            linked: HashMap::new(),
+            search_skip: Vec::new(),
+            gate: Some(Arc::new(|_| Some("test-switch"))),
+            on_resolved: None,
+            records: vec![record],
+            terminal_marker: String::new(),
+            runtime: Arc::new(|| Box::pin(async { Ok(shared_runtime()) })),
+            module_config: Arc::new(|_| serde_json::json!({})),
+            reporter: Arc::new(FailureReporter::new(f.sink.clone())),
+        });
+        let (state, detail) = gated.status_of(record);
+        assert_eq!(state, Availability::Disabled);
+        assert!(detail.unwrap().contains("test-switch"));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_resolved_hook_does_not_strand_waiters() {
+        let record = record("resolver-hook-panics");
+        let sink = Arc::new(Recording::default());
+        let resolver = Resolver::new(ResolverInputs {
+            enabled: true,
+            install_dir: None,
+            allow_download: false,
+            bundled_dir: None,
+            sources: HashMap::new(),
+            linked: HashMap::new(),
+            search_skip: Vec::new(),
+            gate: None,
+            on_resolved: Some(Arc::new(|_| panic!("hook bug"))),
+            records: vec![record],
+            terminal_marker: String::new(),
+            runtime: Arc::new(|| Box::pin(async { Ok(shared_runtime()) })),
+            module_config: Arc::new(|_| serde_json::json!({})),
+            reporter: Arc::new(FailureReporter::new(sink)),
+        });
+        let outcome = resolver
+            .ensure_loaded_within(record.id, Some(Duration::from_secs(10)))
+            .await;
+        assert!(matches!(outcome, Err(LoadError::Failed(_))), "{outcome:?}");
+        assert_eq!(resolver.state_of(record.id), Availability::Failed);
+    }
+
     #[test]
     fn mark_terminal_is_idempotent() {
         let record = record("resolver-marker");
@@ -507,6 +609,7 @@ mod resolver {
             (Availability::Ready, "ready"),
             (Availability::Failed, "failed"),
             (Availability::Unsupported, "unsupported"),
+            (Availability::Disabled, "disabled"),
         ] {
             assert_eq!(
                 serde_json::to_value(state).unwrap(),
