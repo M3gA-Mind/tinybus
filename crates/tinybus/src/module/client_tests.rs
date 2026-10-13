@@ -58,7 +58,8 @@ fn bus_errors_classify_to_closed_outcomes() {
         (
             Error::ModuleUnavailable {
                 module: "m".to_string(),
-                reason: String::new(),
+                state: String::new(),
+                detail: String::new(),
             },
             ModuleCallError::Unavailable,
             Reason::ModuleUnavailable,
