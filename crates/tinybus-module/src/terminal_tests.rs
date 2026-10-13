@@ -303,3 +303,48 @@ fn first_cleanup_drop_panic_retains_all_unprocessed_resource_owners() {
     );
     assert!(state.resources.lock().unwrap().retained_factory.is_some());
 }
+
+#[cfg(feature = "__native-fixture-support")]
+#[test]
+fn retained_view_reports_exact_execution_owner_and_surviving_sdk_resources() {
+    let _serial = TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    FLAGS.store(TB_NATIVE_TERMINAL_LIVE, Ordering::Release);
+    let admission = Admission::new();
+    let owner = ExecutionOwner::new(host());
+    let state = TerminalState::admit_in(&admission, host(), Some(owner.clone())).unwrap();
+    let view = state.view();
+    assert!(!view.__fixture_owner_is_current());
+    assert!(!view.__fixture_owner_is_stopped());
+    {
+        let _scope = owner.enter();
+        assert!(view.__fixture_owner_is_current());
+        let other = ExecutionOwner::new(host());
+        {
+            let _other_scope = other.enter();
+            assert!(!view.__fixture_owner_is_current());
+        }
+        assert!(view.__fixture_owner_is_current());
+    }
+    assert!(!view.__fixture_owner_is_current());
+    assert_eq!(view.__fixture_resources(), 0);
+    let sdk_owner = state.sdk_owner();
+    assert_eq!(view.__fixture_sdk_owners(), 1);
+    assert!(!view.__fixture_request_done());
+    drop(sdk_owner);
+    assert_eq!(view.__fixture_sdk_owners(), 0);
+    state.register(RuntimeHooks::new(
+        |_| {},
+        || TerminalCompletion::PhysicallyStopped,
+    ));
+    state.publish();
+    view.request_fault();
+    assert_eq!(
+        state.wait(Duration::from_secs(3)),
+        TerminalCompletion::PhysicallyStopped
+    );
+    assert!(view.__fixture_request_done());
+    assert!(view.__fixture_owner_is_stopped());
+    assert!(!view.is_live());
+}
