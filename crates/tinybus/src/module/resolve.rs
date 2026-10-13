@@ -36,7 +36,7 @@ use crate::module::runtime::ModuleRuntime;
 use crate::module::{ReleaseAsset, ReleasePlan, load_first_admitted, prune_stale_versions};
 
 /// Result indexes refer to the input manifest slice.
-pub(crate) struct Resolution {
+pub(crate) struct LoadOrder {
     pub(crate) order: Vec<usize>,
     pub(crate) unresolved: Vec<(usize, String)>,
 }
@@ -46,7 +46,7 @@ pub(crate) struct Resolution {
 pub(crate) fn resolve(
     manifests: &[ModuleManifest],
     initially_available: &HashSet<String>,
-) -> Resolution {
+) -> LoadOrder {
     let duplicate_modules = duplicates(manifests.iter().map(|manifest| &manifest.module.name));
     let duplicate_bus_names = duplicates(manifests.iter().map(|manifest| &manifest.bus_name));
     let mut unresolved = Vec::new();
@@ -128,7 +128,7 @@ pub(crate) fn resolve(
             unresolved.push((index, "module dependency cycle detected".to_string()));
         }
     }
-    Resolution { order, unresolved }
+    LoadOrder { order, unresolved }
 }
 
 fn duplicates<T: Eq + std::hash::Hash>(values: impl Iterator<Item = T>) -> HashSet<T> {
