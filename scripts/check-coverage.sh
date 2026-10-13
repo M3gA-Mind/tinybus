@@ -53,9 +53,9 @@ export TINYBUS_TEST_TERMINAL_MODULE="$terminal_private/$terminal_library"
 export TINYBUS_TEST_MODULE="$module" TINYBUS_TEST_MODULE_TWO="$private/$library" TINYBUS_TEST_WRONG_TARGET="$wrong_target" TINYBUS_TEST_CONTEXT_MODULE="$context_module" TINYBUS_TEST_CONTEXT_EAGER_MODULE="$context_eager_module" TINYBUS_TEST_HOST_CALLBACK_MODULE="$host_callback_module" TINYBUS_TEST_CONTROLLED_INIT_MODULE="$controlled_init_module"
 cargo llvm-cov --workspace --all-features --ignore-filename-regex 'crates/tinybus/src/ports/(listener|transport)\.rs$|crates/tinybus/src/module/github\.rs$|crates/tinybus/src/module/(host|mod)\.rs$|crates/tinybus/src/bin/(tinybus\.rs|tinybus/unix\.rs)$|crates/tinybus/src/connection\.rs$|crates/tinybus/src/test_support\.rs$' --no-report -- --include-ignored --skip terminal_runtime_tests::compiled_native_
 
-terminal_tests=$(cargo test --locked -p tinybus-module --all-features -- --list --ignored | sed -n 's/^\(terminal_runtime_tests::compiled_native_.*\): test$/\1/p')
+terminal_tests=$(cargo test --locked -p tinybus-module --all-features --features tinybus/macros -- --list --ignored | sed -n 's/^\(terminal_runtime_tests::compiled_native_.*\): test$/\1/p')
 [ -n "$terminal_tests" ] || { echo "no compiled terminal scenarios found" >&2; exit 1; }
 while IFS= read -r test; do
-  cargo llvm-cov --no-clean --no-report -p tinybus-module --all-features "$test" -- --ignored --exact
+  cargo llvm-cov --no-clean --no-report -p tinybus-module --all-features --features tinybus/macros "$test" -- --ignored --exact
 done <<< "$terminal_tests"
 cargo llvm-cov report --ignore-filename-regex 'crates/tinybus/src/ports/(listener|transport)\.rs$|crates/tinybus/src/module/github\.rs$|crates/tinybus/src/module/(host|mod)\.rs$|crates/tinybus/src/bin/(tinybus\.rs|tinybus/unix\.rs)$|crates/tinybus/src/connection\.rs$|crates/tinybus/src/test_support\.rs$' --fail-under-file-lines 90
