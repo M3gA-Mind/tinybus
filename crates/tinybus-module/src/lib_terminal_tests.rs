@@ -2733,7 +2733,13 @@ async fn compiled_native_method_payload_and_whole_connection_drop_retain_actual_
                 seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
             }
         }
-        stopping.await.unwrap(); // actual SDK Runtime shutdown_timeout elapsed
+        stopping.await.unwrap();
+        // Host shutdown has a deadline and can return before the physical
+        // worker finishes. Observe the original finish/join directly while
+        // the SDK-owned destructor is still held by the fixture barrier.
+        while !seen.contains(&(5, 1)) || !seen.contains(&(7, 1)) {
+            seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
+        }
         let held_owners = owners();
         let timed_out_native = flags();
         seen.extend(receiver.try_iter());
