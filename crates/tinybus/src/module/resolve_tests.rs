@@ -577,6 +577,21 @@ mod resolver {
         assert_eq!(resolver.state_of(record.id), Availability::Failed);
     }
 
+    #[tokio::test]
+    async fn a_client_over_a_resolver_is_unavailable_and_reports_when_modules_are_disabled() {
+        use crate::module::{ModuleCallError, ModuleClient};
+        let record = record("resolver-client-disabled");
+        let f = fixture(record, false, HashMap::new(), None);
+        let client = ModuleClient::new(f.resolver.clone());
+        let result = client.call::<()>(record.id, "Anything", ()).await;
+        assert_eq!(result, Err(ModuleCallError::Unavailable));
+        assert_eq!(
+            f.sink.0.lock().unwrap().as_slice(),
+            &[(record.id.to_string(), Reason::Disabled)]
+        );
+        assert_eq!(f.runtime_calls.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn mark_terminal_is_idempotent() {
         let record = record("resolver-marker");
