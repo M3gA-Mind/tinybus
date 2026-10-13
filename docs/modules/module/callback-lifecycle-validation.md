@@ -25,18 +25,32 @@ artifact cases, plus the existing helper, admission and umask controls.
 
 ## Implementation
 
-The loaded record retains its exact `CallbackState`, including operation
-accounting, after routing revocation removes its route. Stop revokes first and
-then waits for admitted user futures with its remaining deadline, before native
-shutdown. No loaded, router or callback-state lock is held across that wait.
+The loaded record and transport retain one exact `CallbackState`, including
+operation accounting, after routing revocation removes its route. The account
+is bound before callback admission and cannot be replaced. Its backlink to the
+transport remains weak.
 
-A marker owned by the actual blocking native callback survives public waiter
-cancellation or timeout. Enable/disable checks it under the same loaded mutex
-that admits lifecycle transitions. The marker drops before the native lifecycle
-mutex unlocks, so a finishing callback cannot clear a successor's marker. Stop
-and reinitialize keep their canonical queued semantics.
+Stop revokes routing and commits native stop intent before waiting for admitted
+user futures with its remaining deadline. This closes native admission without
+submitting physical shutdown. Drain timeout or public waiter cancellation keeps
+stop intent pending; enable cannot restore admission. Once the actual provider
+account drains, stop submits the existing physical owner. Ordinary stop intent
+is not upgraded to a fault.
 
-## Fresh acceptance
+Last-host drop also uses that physical owner. Its OS worker revokes the exact
+account and waits for its actual running count to reach zero before acquiring
+the native lifecycle mutex or calling opaque shutdown. This wait has no runtime
+dependency or deadline. A provider that never releases its future keeps the
+physical job pending. Provider futures are destroyed before their running
+accounts decrement, including when their runtime is destroyed. No provider code
+or destructor runs under the accounting mutex.
+
+Reinitialize retains its marker in the actual blocking callback until it
+returns. Enable/disable also checks committed stop intent and the retained
+physical job, including uncertain cleanup. Public waiter completion or timeout
+is not evidence of physical reclamation.
+
+## Upstream acceptance before integration
 
 Run 87340 completed with exit 0 on source
 `372a0ddd97d23daf58203d59b95b7be79fc3393a`. All 3,068 output lines were inspected:

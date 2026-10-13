@@ -364,7 +364,7 @@ async fn a_failed_initializer_is_reported_to_callers() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn a_pending_call_is_failed_when_the_module_closes_its_delivery_queue() {
-    let _lock = VTABLE_TEST_LOCK
+    let lock = VTABLE_TEST_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await;
@@ -376,21 +376,122 @@ async fn a_pending_call_is_failed_when_the_module_closes_its_delivery_queue() {
     transport.defer_initialize(initialize_ok, host);
     transport.send(call()).await.unwrap();
     unsafe { (host.ready)(host.host_ctx) };
-    let reply = tokio::time::timeout(Duration::from_secs(1), transport.recv())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(reply.header.kind, MessageKind::Error);
-    assert!(transport.is_faulted());
-    shutdown_entry().await;
+    let reply = tokio::time::timeout(Duration::from_secs(1), transport.recv()).await;
+    let faulted = transport.is_faulted();
+    // A failed receive may have no fault-owned cleanup job. Commit cleanup
+    // before reporting the captured result; this does not clear an actual fault.
+    transport.request_terminal(false);
+    let shutdown_entered = tokio::time::timeout(Duration::from_secs(2), async {
+        while !SHUTDOWN_ENTERED.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // Unblock the callback before observing physical completion, while the
+    // fixture lock still protects the callback flags and delivery result.
     SHUTDOWN_BLOCKED.store(false, Ordering::Release);
     wait_physical_cleanup(&transport).await;
+    // The release guard also resets shared flags; drop it before giving the
+    // fixture lock to another test.
+    drop(_release);
+    finish_closed_delivery_fixture(&transport, lock).await;
+    let reply = reply.unwrap().unwrap().unwrap();
+    assert_eq!(reply.header.kind, MessageKind::Error);
+    assert!(faulted);
+    assert!(
+        shutdown_entered.is_ok(),
+        "fault cleanup must enter shutdown"
+    );
+}
+
+// Keep the shared vtable fixture serialized through its final global writes.
+async fn finish_closed_delivery_fixture(
+    transport: &ModuleTransport,
+    lock: tokio::sync::MutexGuard<'_, ()>,
+) {
+    wait_physical_cleanup(transport).await;
     assert!(
         transport.is_stopped(),
         "a failed-delivery fixture must finish shutdown before reusing callback flags"
     );
     DELIVERY_CODE.store(TB_OK, Ordering::Release);
+    drop(lock);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_fault_reply_does_not_release_the_fixture_before_physical_cleanup() {
+    use std::future::Future;
+
+    struct WorkerRelease(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for WorkerRelease {
+        fn drop(&mut self) {
+            if let Some(release) = self.0.take() {
+                let _ = release.send(());
+            }
+        }
+    }
+
+    let lock = VTABLE_TEST_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+    SHUTDOWN_ENTERED.store(false, Ordering::Release);
+    SHUTDOWN_CALLS.store(0, Ordering::Release);
+    let (transport, host) = ModuleTransport::new("serialized-fault-cleanup".into(), vec![]);
+    transport.defer_initialize(initialize_ok, host);
+    transport.ensure_initialized().await.unwrap();
+    let (started, started_rx) = tokio::sync::oneshot::channel();
+    let (release, release_rx) = std::sync::mpsc::channel();
+    let worker_release = WorkerRelease(Some(release));
+    *transport.before_worker_lock.lock().unwrap() = Some(Box::new(move || {
+        let _ = started.send(());
+        let _ = release_rx.recv();
+    }));
+    DELIVERY_CODE.store(TB_CLOSED, Ordering::Release);
+    transport.send(call()).await.unwrap();
+    unsafe { (host.ready)(host.host_ctx) };
+    // The actual independently owned fault worker cannot acquire lifecycle yet.
+    let reply = tokio::time::timeout(Duration::from_secs(2), transport.recv()).await;
+    let started = tokio::time::timeout(Duration::from_secs(2), started_rx).await;
+    let faulted_before_cleanup = transport.is_faulted();
+    let callback_pending = !SHUTDOWN_ENTERED.load(Ordering::Acquire)
+        && !matches!(
+            transport.context.physical.lock().unwrap().cleanup,
+            CleanupState::Complete | CleanupState::Uncertain | CleanupState::NoCallbackRequired
+        );
+    let mut completion = Box::pin(finish_closed_delivery_fixture(&transport, lock));
+    let completed_early =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(completion.as_mut().poll(cx).is_ready()))
+            .await;
+    let released_early = VTABLE_TEST_LOCK.get().unwrap().try_lock().is_ok();
+
+    // Release and observe the real callback before any regression assertion.
+    // The transport retains the actual context; cancelling an observer is not cleanup.
+    drop(worker_release);
+    wait_physical_cleanup(&transport).await;
+    let callback_entered = SHUTDOWN_ENTERED.load(Ordering::Acquire);
+    let callback_calls = SHUTDOWN_CALLS.load(Ordering::Acquire);
+    if !completed_early {
+        completion.await;
+    }
+    // Another queued fixture can acquire first; await our turn rather than
+    // treating legitimate contention after release as a failure.
+    let next_fixture = tokio::time::timeout(
+        Duration::from_secs(2),
+        VTABLE_TEST_LOCK.get().unwrap().lock(),
+    )
+    .await;
+    assert!(matches!(reply, Ok(Ok(Some(ref reply))) if reply.header.kind == MessageKind::Error));
+    assert!(matches!(started, Ok(Ok(()))));
+    assert!(faulted_before_cleanup && callback_pending);
+    assert!(callback_entered);
+    assert_eq!(callback_calls, 1);
+    assert!(
+        !completed_early,
+        "fault reply is not physical fixture completion"
+    );
+    assert!(!released_early, "next fixture must wait for actual cleanup");
+    assert!(next_fixture.is_ok());
 }
 
 #[tokio::test]
@@ -801,11 +902,11 @@ async fn stopping_initialized_module_before_ready_releases_observers_and_queued_
 
 #[tokio::test]
 async fn ordinary_stop_wakes_backpressure_without_turning_closure_into_a_fault() {
-    let _release = ShutdownRelease;
     let _lock = VTABLE_TEST_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await;
+    let _release = ShutdownRelease;
     SHUTDOWN_BLOCKED.store(false, Ordering::Release);
     DELIVERY_CODE.store(TB_BACKPRESSURE, Ordering::Release);
     DELIVERIES.store(0, Ordering::Release);
@@ -1536,24 +1637,49 @@ unsafe impl Send for NativeBarrier {}
 unsafe impl Sync for NativeBarrier {}
 unsafe extern "C" fn native_entered(ctx: *mut c_void, host: *const TbHostVtable) {
     let barrier = unsafe { &*ctx.cast::<NativeBarrier>() };
-    let mut state = barrier.state.lock().unwrap();
+    let mut state = barrier
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     state.0 = Some(unsafe { *host });
     barrier.entered.notify_one();
     while !state.1 {
-        state = barrier.changed.wait(state).unwrap();
+        state = barrier
+            .changed
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
     }
 }
 unsafe extern "C" fn native_joined(ctx: *mut c_void) {
     let barrier = unsafe { &*ctx.cast::<NativeBarrier>() };
-    let mut state = barrier.state.lock().unwrap();
+    let mut state = barrier
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert!(!state.2, "one actual native shutdown/join");
     state.2 = true;
     barrier.joined.notify_one();
     drop(state);
-    let gate = barrier.finish_gate.lock().unwrap().take();
+    let gate = barrier
+        .finish_gate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    // This artificial gate runs after the fixture's actual worker join. A failed
+    // Rust assertion may disconnect it; never unwind through the C callback.
+    finish_native_control(gate);
+}
+fn finish_native_control(gate: Option<std::sync::mpsc::Receiver<()>>) {
     if let Some(gate) = gate {
-        gate.recv().unwrap();
+        let _ = gate.recv();
     }
+}
+#[test]
+fn disconnected_artificial_finish_gate_does_not_unwind() {
+    let (release, receive) = std::sync::mpsc::channel();
+    drop(release);
+    let result = std::panic::catch_unwind(|| finish_native_control(Some(receive)));
+    assert!(result.is_ok());
 }
 pub(crate) fn native_fixture() -> (
     Arc<ModuleTransport>,
@@ -2186,7 +2312,15 @@ async fn rejected_observer_after_ordinary_stop_preserves_nonfault_cause() {
 
 #[tokio::test]
 async fn completed_shutdown_has_already_released_its_native_lifecycle_marker() {
-    let _guard = VTABLE_TEST_LOCK
+    struct WorkerRelease(Option<std::sync::mpsc::Sender<()>>);
+    impl Drop for WorkerRelease {
+        fn drop(&mut self) {
+            if let Some(sender) = self.0.take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+    let guard = VTABLE_TEST_LOCK
         .get_or_init(|| tokio::sync::Mutex::new(()))
         .lock()
         .await;
@@ -2197,17 +2331,45 @@ async fn completed_shutdown_has_already_released_its_native_lifecycle_marker() {
     let published = Arc::new(Notify::new());
     let entered = published.clone();
     let (release, worker) = std::sync::mpsc::channel();
+    let release = WorkerRelease(Some(release));
     *transport.after_cleanup_publication.lock().unwrap() = Some(Box::new(move || {
         entered.notify_one();
-        worker.recv().unwrap();
+        let _ = worker.recv();
     }));
-    let stopping = tokio::spawn(transport.clone().stop(Duration::from_secs(2)));
-    published.notified().await;
-    let result = stopping.await.unwrap();
+    let mut stopping = tokio::spawn(transport.clone().stop(Duration::from_secs(2)));
+    let publication = tokio::time::timeout(Duration::from_secs(2), published.notified()).await;
+    let result = tokio::time::timeout(Duration::from_secs(2), &mut stopping).await;
     let still_pending = transport.native_lifecycle_pending();
-    // Always release the worker before asserting, even against the unfixed code.
-    release.send(()).unwrap();
-    assert_eq!(result.unwrap(), TB_OK);
+    drop(release);
+    transport.request_terminal(false);
+    let cleanup = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let changed = transport.context.physical_notify.notified();
+            if matches!(
+                transport.context.physical.lock().unwrap().cleanup,
+                CleanupState::Complete | CleanupState::NoCallbackRequired
+            ) {
+                break;
+            }
+            changed.await;
+        }
+        // Publication precedes native lifecycle unlock. Observe that actual
+        // exclusion release separately; this is not an OS-worker-exit claim.
+        let lifecycle = transport.lifecycle.clone().lock_owned().await;
+        drop(lifecycle);
+    })
+    .await;
+    if cleanup.is_err() {
+        // Keep fixture exclusion with the actual transport/job if cleanup is
+        // unresolved. Neither timeout nor dropped async waiter reclaims it.
+        *transport.fixture_controller.lock().unwrap() = Some(Arc::new(guard));
+    }
+    assert!(publication.is_ok(), "cleanup publication watchdog expired");
+    assert!(
+        cleanup.is_ok(),
+        "actual cleanup/lifecycle release remains pending"
+    );
+    assert_eq!(result.unwrap().unwrap().unwrap(), TB_OK);
     assert!(
         !still_pending,
         "completed cleanup still reports native work"

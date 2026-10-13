@@ -33,6 +33,8 @@ fn state(source: BusName, destination: BusName) -> Arc<CallbackState> {
             registering: vec![],
         }),
         drained: Notify::new(),
+        physical_drained: std::sync::Condvar::new(),
+        physical_wait_started: Notify::new(),
     })
 }
 
@@ -633,6 +635,186 @@ fn configuration_fingerprints_preserve_json_equality_without_normalizing_strings
     );
 }
 
+// Private fixture-only release ownership. Drop never joins or asserts.
+struct ControlledRelease {
+    barrier: Arc<super::super::super::transport::tests::NativeBarrier>,
+    finish: Option<std::sync::mpsc::Sender<()>>,
+    resume: Option<tokio::sync::oneshot::Sender<()>>,
+    transport: Option<Arc<ModuleTransport>>,
+}
+impl ControlledRelease {
+    fn new(barrier: Arc<super::super::super::transport::tests::NativeBarrier>) -> Self {
+        Self {
+            barrier,
+            finish: None,
+            resume: None,
+            transport: None,
+        }
+    }
+}
+impl ControlledRelease {
+    fn release(&mut self) {
+        self.barrier
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .1 = true;
+        self.barrier.changed.notify_all();
+        if let Some(resume) = self.resume.take() {
+            let _ = resume.send(());
+        }
+        if let Some(finish) = self.finish.take() {
+            let _ = finish.send(());
+        }
+    }
+}
+impl Drop for ControlledRelease {
+    fn drop(&mut self) {
+        self.release();
+        // Commit and schedule synchronously, before any Tokio cleanup observer
+        // could be canceled. request_terminal anchors PhysicalJob in the actual
+        // context and submits its OS thread; neither depends on this runtime.
+        // Only fixture-local locks can be poisoned by test assertions; release
+        // above recovers those. No SDK internal lock is held by this guard.
+        if let Some(transport) = self.transport.take() {
+            transport.request_terminal(false);
+        }
+    }
+}
+
+#[test]
+fn controlled_release_wakes_entry_and_releases_channels_on_early_unwind() {
+    use super::super::super::transport::tests::NativeBarrier;
+    let barrier = Arc::new(NativeBarrier {
+        state: Mutex::new((None, false, false)),
+        changed: std::sync::Condvar::new(),
+        entered: Notify::new(),
+        joined: Notify::new(),
+        finish_gate: Mutex::new(None),
+    });
+    let (finish, receive) = std::sync::mpsc::channel();
+    let (resume, decision) = tokio::sync::oneshot::channel();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut cleanup = ControlledRelease::new(barrier.clone());
+        cleanup.finish = Some(finish);
+        cleanup.resume = Some(resume);
+        panic!("fixture assertion before controlled release");
+    }));
+    let finish_result = receive.try_recv();
+    let mut decision = decision;
+    let decision_result = decision.try_recv();
+    assert!(result.is_err());
+    assert!(
+        barrier.state.lock().unwrap().1,
+        "early unwind must wake native entry"
+    );
+    assert!(
+        finish_result.is_ok(),
+        "finish must be released, not disconnected"
+    );
+    assert!(
+        decision_result.is_ok(),
+        "decision must be released, not disconnected"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+async fn actual_native_early_unwind_releases_entry_and_reclaims_after_callback_return() {
+    use super::super::super::transport::tests::native_fixture;
+    let (transport, host, init, barrier) = native_fixture();
+    let weak = Arc::downgrade(&barrier);
+    let mut cleanup = ControlledRelease::new(barrier.clone());
+    cleanup.transport = Some(transport.clone());
+    let (finish, receive) = std::sync::mpsc::channel();
+    cleanup.finish = Some(finish);
+    *barrier.finish_gate.lock().unwrap() = Some(receive);
+    transport.defer_initialize(init, host);
+    let initializing = tokio::spawn({
+        let transport = transport.clone();
+        async move { transport.ensure_initialized().await }
+    });
+    let entered = tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified()).await;
+    // Deliberate ordinary Rust unwind exercises the guard while actual C entry
+    // is blocked on its condition variable. No panic crosses a C boundary.
+    let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _cleanup = cleanup;
+        panic!("early controlled fixture failure");
+    }));
+    let initialized = initializing.await;
+    let stopped = transport.clone().stop(Duration::from_secs(2)).await;
+    let callback_entered_after_worker_join = barrier.state.lock().unwrap().2;
+    drop(barrier);
+    drop(transport);
+    let reclaimed = tokio::time::timeout(Duration::from_secs(2), async {
+        while weak.strong_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    // Stop completion, rather than callback entry or abort, proves actual return.
+    assert!(entered.is_ok());
+    assert!(unwind.is_err());
+    assert!(initialized.is_ok());
+    assert!(matches!(
+        stopped,
+        Ok(_)
+            | Err(super::super::super::transport::StopError::NotStarted(
+                Error::ConnectionClosed
+            ))
+    ));
+    assert!(callback_entered_after_worker_join);
+    assert!(reclaimed.is_ok());
+}
+
+#[test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+fn actual_native_release_owner_survives_canceled_waiter_and_runtime_drop() {
+    use super::super::super::transport::tests::native_fixture;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let (transport, host, init, barrier) = native_fixture();
+    barrier.state.lock().unwrap().1 = true;
+    transport.defer_initialize(init, host);
+    let initialized = runtime.block_on(transport.ensure_initialized());
+    let weak = Arc::downgrade(&barrier);
+    let (finish, receive) = std::sync::mpsc::channel();
+    *barrier.finish_gate.lock().unwrap() = Some(receive);
+    let mut cleanup = ControlledRelease::new(barrier.clone());
+    cleanup.transport = Some(transport.clone());
+    // This test's external finish control stays held to inspect physical owner
+    // retention. It is released before any assertions, including failure paths.
+    drop(cleanup);
+    let waiter = runtime.spawn({
+        let transport = transport.clone();
+        async move { transport.stop(Duration::from_secs(2)).await }
+    });
+    waiter.abort(); // intentionally cancel without relying on a first poll
+    let canceled = runtime.block_on(waiter);
+    let joined_worker = runtime.block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified()).await
+    });
+    drop(runtime);
+    drop(barrier);
+    drop(transport);
+    let retained_during_callback = weak.strong_count() != 0;
+    let released = finish.send(());
+    // The physical thread is independent of the dropped Tokio runtime.
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while weak.strong_count() != 0 && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    let reclaimed_after_return = weak.strong_count() == 0;
+    assert!(initialized.is_ok());
+    assert!(canceled.unwrap_err().is_cancelled());
+    assert!(joined_worker.is_ok());
+    assert!(retained_during_callback);
+    assert!(released.is_ok());
+    assert!(reclaimed_after_return);
+}
+
 // Manually polling the public future lets ordinary shutdown commit while the
 // loader is suspended; no scheduler race decides which cancellation is tested.
 async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: bool) {
@@ -661,46 +843,49 @@ async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: 
         )
         .await
         .unwrap();
+    let mut cleanup = ControlledRelease::new(barrier.clone());
     let mut load = Some(Box::pin(
         host.load_file_with_host_callbacks(&artifact, config, &binding),
     ));
-    std::future::poll_fn(|cx| {
-        assert!(
-            load.as_mut().unwrap().as_mut().poll(cx).is_pending(),
-            "loader awaits real C init"
-        );
-        std::task::Poll::Ready(())
-    })
-    .await;
-    tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified())
-        .await
-        .unwrap();
+    let first =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(load.as_mut().unwrap().as_mut().poll(cx)))
+            .await;
+    if let std::task::Poll::Ready(completion) = first {
+        cleanup.release();
+        drop(completion);
+        drop(load.take()); // already completed, no pending owner is discarded
+        panic!("native fixture completed before C entry");
+    }
+    let entered = tokio::time::timeout(Duration::from_secs(2), barrier.entered.notified()).await;
+    if entered.is_err() {
+        cleanup.release();
+        let completion = load.take().unwrap().await;
+        drop(completion);
+        panic!("native fixture entry watchdog expired; loader completion consumed");
+    }
     let transport = host.inner.loaded.lock().unwrap()[0].transport.clone();
+    cleanup.transport = Some(transport.clone());
     let view = barrier.state.lock().unwrap().0.unwrap();
     barrier.state.lock().unwrap().1 = true;
     barrier.changed.notify_all();
-    transport.ensure_initialized().await.unwrap();
+    let initialized = transport.ensure_initialized().await;
     // Advance the public future to its real withheld-Ready observation.
-    std::future::poll_fn(|cx| {
-        assert!(
-            load.as_mut().unwrap().as_mut().poll(cx).is_pending(),
-            "fixture withholds Ready"
-        );
-        std::task::Poll::Ready(())
-    })
-    .await;
+    let withheld =
+        std::future::poll_fn(|cx| std::task::Poll::Ready(load.as_mut().unwrap().as_mut().poll(cx)))
+            .await;
+    let was_withheld = withheld.is_pending();
     let (finish, receive) = std::sync::mpsc::channel();
     *barrier.finish_gate.lock().unwrap() = Some(receive);
+    cleanup.finish = Some(finish);
     let stopping = transport.clone();
     let stop = tokio::spawn(async move { stopping.stop(Duration::from_secs(2)).await });
     tokio::time::timeout(Duration::from_secs(2), barrier.joined.notified())
         .await
         .unwrap();
-    assert_eq!(
-        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
-        2
-    );
-    let load_result = if reject_gate {
+    let stopped_flags = unsafe { view.native_terminal_state.unwrap()(view.host_ctx) };
+    let load_result = if let std::task::Poll::Ready(result) = withheld {
+        Some(result)
+    } else if reject_gate {
         transport.release_initialization(false);
         drop(load.take());
         None
@@ -717,14 +902,24 @@ async fn native_callback_load_after_ordinary_stop(drop_load: bool, reject_gate: 
     };
     let held_flags = unsafe { view.native_terminal_state.unwrap()(view.host_ctx) };
     let held_fault = transport.is_faulted();
-    finish.send(()).unwrap(); // Always release opaque C before RED assertions.
-    assert!(stop.await.unwrap().is_ok());
-    if let Some(result) = load_result {
-        assert!(result.is_err());
+    cleanup.release();
+    let stopped = stop.await;
+    let loaded = if let Some(result) = load_result {
         drop(load.take());
+        Some(result)
     } else if let Some(load) = load {
-        assert!(load.await.is_err());
+        Some(load.await)
+    } else {
+        None
+    };
+    cleanup.transport = None;
+    assert!(initialized.is_ok());
+    assert!(was_withheld, "fixture withholds Ready");
+    assert!(stopped.unwrap().is_ok());
+    if let Some(result) = loaded {
+        assert!(result.is_err());
     }
+    assert_eq!(stopped_flags, 2);
     assert_eq!(held_flags, 2, "ordinary cancellation cannot invent Fault");
     assert!(!held_fault);
     assert_eq!(
@@ -782,8 +977,12 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
     let binding = Arc::new(served_native_binding(&host).await);
     *binding.fixture_controller.lock().unwrap() = Some(barrier.clone());
     let decision = Arc::new(Notify::new());
+    let termination = Arc::new(Notify::new());
+    *binding.after_load_termination.lock().unwrap() = Some(termination.clone());
     let (resume, release) = tokio::sync::oneshot::channel();
     *binding.before_load_decision.lock().unwrap() = Some((decision.clone(), release));
+    let mut cleanup = ControlledRelease::new(barrier.clone());
+    cleanup.resume = Some(resume);
     let loading_host = host.clone();
     let loading_binding = binding.clone();
     let load = tokio::spawn(async move {
@@ -797,6 +996,7 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
         tokio::task::yield_now().await;
     }
     let transport = host.inner.loaded.lock().unwrap()[0].transport.clone();
+    cleanup.transport = Some(transport.clone());
     let view = barrier.state.lock().unwrap().0.unwrap();
     barrier.state.lock().unwrap().1 = true;
     barrier.changed.notify_all();
@@ -808,17 +1008,17 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
     // init_started precedes actual publication; the observer result is the proof.
     let initialized = transport.ensure_initialized();
     tokio::pin!(initialized);
-    std::future::poll_fn(
-        |cx| match std::future::Future::poll(initialized.as_mut(), cx) {
-            std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
-            std::task::Poll::Pending => {
-                cx.waker().wake_by_ref();
-                std::task::Poll::Pending
-            }
-        },
-    )
-    .await
-    .unwrap();
+    let initialization =
+        std::future::poll_fn(
+            |cx| match std::future::Future::poll(initialized.as_mut(), cx) {
+                std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
+                std::task::Poll::Pending => {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            },
+        )
+        .await;
     if !ready {
         // Real wait_ready deadline, not a fake readiness flag. Let the public
         // future install its timer before advancing past the actual bound.
@@ -826,41 +1026,50 @@ async fn native_callback_decision_race(ready: bool, native_fault: bool) {
         tokio::time::advance(Duration::from_secs(6)).await;
     }
     decision.notified().await;
-    assert_eq!(transport.is_ready(), ready);
+    let observed_ready = transport.is_ready();
     let (finish, receive) = std::sync::mpsc::channel();
     *barrier.finish_gate.lock().unwrap() = Some(receive);
+    cleanup.finish = Some(finish);
     let stopping = transport.clone();
     let stop = tokio::spawn(async move { stopping.stop(Duration::from_secs(2)).await });
     while !barrier.state.lock().unwrap().2 {
         tokio::task::yield_now().await;
     }
-    assert_eq!(
-        unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
-        2
-    );
+    let stopped_flags = unsafe { view.native_terminal_state.unwrap()(view.host_ctx) };
+    let mut fault_flags = None;
     if native_fault {
         unsafe {
             (view.fault)(view.host_ctx, std::ptr::null(), 0);
         }
-        assert_eq!(
-            unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
-            6
-        );
+        fault_flags = Some(unsafe { view.native_terminal_state.unwrap()(view.host_ctx) });
     }
-    resume.send(()).unwrap();
-    // Rollback revokes before awaiting physical close or returning failure.
-    while !binding.state.lifetime.lock().unwrap().revoked && !load.is_finished() {
-        tokio::task::yield_now().await;
-    }
+    let resumed = cleanup.resume.take().unwrap().send(());
+    // The physical worker can revoke the account independently. Observe the
+    // loader's actual failure commit instead of treating revocation as proof.
+    let terminated = if !ready {
+        Some(tokio::time::timeout(Duration::from_secs(2), termination.notified()).await)
+    } else {
+        None
+    };
     let held = unsafe { view.native_terminal_state.unwrap()(view.host_ctx) };
-    finish.send(()).unwrap();
+    cleanup.release();
     // Keep virtual time runnable through the actual opaque return.
     while !stop.is_finished() {
         tokio::task::yield_now().await;
     }
-    let stopped = stop.await.unwrap();
-    assert!(stopped.is_ok(), "actual stop: {stopped:?}");
-    assert!(load.await.unwrap().is_err());
+    let stopped = stop.await;
+    let loaded = load.await;
+    cleanup.transport = None;
+    assert!(initialization.is_ok());
+    assert!(resumed.is_ok());
+    assert!(terminated.is_none_or(|result| result.is_ok()));
+    assert!(stopped.unwrap().is_ok());
+    assert!(loaded.unwrap().is_err());
+    assert_eq!(observed_ready, ready);
+    assert_eq!(stopped_flags, 2);
+    if let Some(flags) = fault_flags {
+        assert_eq!(flags, 6);
+    }
     assert_eq!(held, if ready && !native_fault { 2 } else { 6 });
     assert_eq!(
         unsafe { view.native_terminal_state.unwrap()(view.host_ctx) },
@@ -885,6 +1094,140 @@ async fn actual_native_fault_at_ready_commit_dominates_ordinary_stop() {
     native_callback_decision_race(true, true).await;
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AttachOutcome {
+    Attached,
+    LoadSucceeded,
+    LoadRefused,
+    LoadConnectionClosed,
+    LoadFailed,
+    LoadPanicked,
+    LoadCanceled,
+    WatchdogExpired,
+}
+
+async fn await_native_attach<T>(
+    attached: &Notify,
+    load: &mut tokio::task::JoinHandle<Result<T>>,
+    completed: &mut Option<std::result::Result<Result<T>, tokio::task::JoinError>>,
+) -> AttachOutcome {
+    // A fixture precondition watchdog, not a product security/readiness TTL.
+    // Abort requests cooperative cancellation; it cannot interrupt synchronous
+    // admission or prove physical native quiescence. The caller owns cleanup.
+    tokio::select! {
+        biased;
+        _ = attached.notified() => AttachOutcome::Attached,
+        result = &mut *load => {
+            let category = match &result {
+                Ok(Ok(_)) => AttachOutcome::LoadSucceeded,
+                Ok(Err(Error::ModuleRefused { .. })) => AttachOutcome::LoadRefused,
+                Ok(Err(Error::ConnectionClosed)) => AttachOutcome::LoadConnectionClosed,
+                Ok(Err(_)) => AttachOutcome::LoadFailed,
+                Err(error) if error.is_cancelled() => AttachOutcome::LoadCanceled,
+                Err(_) => AttachOutcome::LoadPanicked,
+            };
+            *completed = Some(result);
+            category
+        },
+        _ = tokio::time::sleep(Duration::from_secs(60)) => {
+            load.abort();
+            AttachOutcome::WatchdogExpired
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn setup_attachment_wait_allows_preload_to_outlive_product_deadlines() {
+    let attached = Arc::new(Notify::new());
+    let observed = attached.clone();
+    let (release, preload) = tokio::sync::oneshot::channel::<()>();
+    let mut load = tokio::spawn(async move {
+        let _ = preload.await;
+        std::future::pending::<Result<()>>().await
+    });
+    let wait = tokio::spawn(async move {
+        let mut completed = None;
+        let outcome = await_native_attach(&observed, &mut load, &mut completed).await;
+        load.abort();
+        let result = match completed {
+            Some(result) => result,
+            None => load.await,
+        };
+        (outcome, result)
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(3)).await;
+    tokio::task::yield_now().await;
+    let waiting = !wait.is_finished();
+    let released = release.send(());
+    attached.notify_one();
+    let joined = wait.await;
+    assert!(waiting, "valid preload was mistaken for setup failure");
+    assert!(released.is_ok());
+    let (outcome, result) = joined.unwrap();
+    assert_eq!(outcome, AttachOutcome::Attached);
+    assert!(result.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn setup_attachment_wait_reports_an_early_load_failure() {
+    let attached = Notify::new();
+    let mut load = tokio::spawn(async { Err::<(), _>(Error::ConnectionClosed) });
+    let mut completed = None;
+    let outcome = await_native_attach(&attached, &mut load, &mut completed).await;
+    let result = completed.unwrap();
+    assert_eq!(outcome, AttachOutcome::LoadConnectionClosed);
+    assert!(matches!(result, Ok(Err(Error::ConnectionClosed))));
+}
+
+#[tokio::test]
+async fn setup_attachment_wait_preserves_actual_admission_refusal_before_c_entry() {
+    let host = Arc::new(ModuleHost::new(Broker::new()));
+    let binding = Arc::new(served_native_binding(&host).await);
+    let attached = Notify::new();
+    let directory = tempfile::tempdir().unwrap();
+    let missing = directory.path().join("absent-module.so");
+    let mut load = tokio::spawn({
+        let host = host.clone();
+        let binding = binding.clone();
+        async move {
+            host.load_file_with_host_callbacks(missing, serde_json::json!({}), &binding)
+                .await
+        }
+    });
+    let mut completed = None;
+    let outcome = await_native_attach(&attached, &mut load, &mut completed).await;
+    let completion = completed.unwrap();
+    assert_eq!(outcome, AttachOutcome::LoadRefused);
+    assert!(matches!(completion, Ok(Err(Error::ModuleRefused { .. }))));
+    assert!(
+        host.list().is_empty(),
+        "refusal cannot attach or publish Ready"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn setup_attachment_watchdog_cancels_a_stuck_preload() {
+    let attached = Notify::new();
+    let mut load = tokio::spawn(std::future::pending::<Result<()>>());
+    let wait = tokio::spawn(async move {
+        let mut completed = None;
+        let outcome = await_native_attach(&attached, &mut load, &mut completed).await;
+        // Actual task completion is consumed. This synthetic task is cooperative;
+        // this is not evidence of synchronous/native cancellation or C return.
+        let result = match completed {
+            Some(result) => result,
+            None => load.await,
+        };
+        (outcome, result)
+    });
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(61)).await;
+    let (outcome, result) = wait.await.unwrap();
+    assert_eq!(outcome, AttachOutcome::WatchdogExpired);
+    assert!(result.unwrap_err().is_cancelled());
+}
+
 async fn native_callback_setup_failure_race(panic_setup: bool) {
     use super::super::super::transport::tests::{native_fixture, native_fixture_json};
     let (unused, _, _, barrier) = native_fixture();
@@ -900,9 +1243,11 @@ async fn native_callback_setup_failure_race(panic_setup: bool) {
     let attached = Arc::new(Notify::new());
     let seen = attached.clone();
     let (resume, release) = std::sync::mpsc::channel();
+    let mut cleanup = ControlledRelease::new(barrier.clone());
+    cleanup.finish = Some(resume);
     *binding.after_attach.lock().unwrap() = Some(Box::new(move || {
         seen.notify_one();
-        release.recv().unwrap();
+        let _ = release.recv();
         assert!(
             !panic_setup,
             "actual Rust unwind during host callback setup"
@@ -910,28 +1255,50 @@ async fn native_callback_setup_failure_race(panic_setup: bool) {
     }));
     let loading_host = host.clone();
     let loading_binding = binding.clone();
-    let load = tokio::spawn(async move {
+    let mut load = tokio::spawn(async move {
         loading_host
             .load_file_with_host_callbacks(artifact, config, &loading_binding)
             .await
     });
-    // Admission hashes the real artifact twice before this hook; instrumented
-    // CI builds can spend several seconds there. This is a fixture setup bound,
-    // independent of the lifecycle deadline and the race assertions below.
-    tokio::time::timeout(Duration::from_secs(30), attached.notified())
-        .await
-        .unwrap();
+    let mut completed = None;
+    let attachment = await_native_attach(&attached, &mut load, &mut completed).await;
+    if attachment != AttachOutcome::Attached {
+        cleanup.release();
+        // Report the original finite cause before cleanup: synchronous admission
+        // cannot be interrupted by abort. Do not turn it into a readiness failure.
+        eprintln!("native fixture attachment: {attachment:?}");
+        if let Some(completion) = completed {
+            drop(completion);
+        } else if tokio::time::timeout(Duration::from_secs(2), &mut load)
+            .await
+            .is_err()
+        {
+            // Pending ownership is explicit, not a quiescence claim. The task
+            // consumes eventual completion and keeps the real staging, binding,
+            // host and controller alive; transport's physical anchor also remains.
+            tokio::spawn(async move {
+                let _owners = (_dir, host, binding, barrier);
+                let _ = load.await;
+            });
+            panic!("native fixture attachment: {attachment:?}; cleanup pending");
+        }
+        panic!("native fixture attachment: {attachment:?}; loader completion consumed");
+    }
     let transport = host.inner.loaded.lock().unwrap()[0].transport.clone();
+    cleanup.transport = Some(transport.clone());
     // Actual ordinary lifecycle ownership, before the callback initialization
     // gate opens. This instance proves C never entered, rather than any join.
-    let _ = transport.clone().stop(Duration::from_secs(2)).await;
-    assert!(!transport.is_faulted());
+    let stopped = transport.clone().stop(Duration::from_secs(2)).await;
+    let held_fault = transport.is_faulted();
     if !panic_setup {
         // Public revocation makes real setup return its concurrently-used error.
         binding.revoke();
     }
-    resume.send(()).unwrap();
+    cleanup.release();
     let result = load.await;
+    cleanup.transport = None;
+    assert!(stopped.is_ok());
+    assert!(!held_fault);
     if panic_setup {
         assert!(result.unwrap_err().is_panic());
     } else {
@@ -956,4 +1323,180 @@ async fn actual_callback_setup_error_still_faults_after_ordinary_stop() {
 #[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
 async fn actual_callback_setup_unwind_still_faults_after_ordinary_stop() {
     native_callback_setup_failure_race(true).await;
+}
+
+#[test]
+fn a_transport_rejects_replacement_of_its_exact_callback_account() {
+    let first = state(":1.1".parse().unwrap(), ":1.2".parse().unwrap());
+    let second = state(":1.3".parse().unwrap(), ":1.4".parse().unwrap());
+    let original = Arc::downgrade(&first);
+    let replacement = Arc::downgrade(&second);
+    let (transport, _) = ModuleTransport::new("one-account".into(), vec![]);
+    transport.bind_host_callbacks(first.clone()).unwrap();
+    let rejected = transport.bind_host_callbacks(second.clone());
+    drop(first);
+    drop(second);
+    assert!(rejected.is_err());
+    assert!(original.upgrade().is_some());
+    assert!(replacement.upgrade().is_none());
+}
+
+struct DestructionObserved {
+    guard: HostCallbackGuard,
+    observed: Arc<AtomicUsize>,
+}
+impl Drop for DestructionObserved {
+    fn drop(&mut self) {
+        self.observed.store(self.guard.running(), Ordering::Release);
+    }
+}
+struct PendingUntilDestroyed {
+    complete: bool,
+    entered: Arc<Notify>,
+    guard: HostCallbackGuard,
+    observed: Arc<AtomicUsize>,
+}
+#[async_trait]
+impl Interface for PendingUntilDestroyed {
+    fn name(&self) -> InterfaceName {
+        endpoint().interface
+    }
+    fn members(&self) -> Vec<MemberName> {
+        endpoint().members
+    }
+    async fn call(&self, _: &MemberName, _: serde_json::Value) -> Result<serde_json::Value> {
+        Err(Error::failed("context required"))
+    }
+    async fn call_with_context(
+        &self,
+        _: &MemberName,
+        _: serde_json::Value,
+        _: &CallContext,
+    ) -> Result<serde_json::Value> {
+        let _destruction = DestructionObserved {
+            guard: self.guard.clone(),
+            observed: self.observed.clone(),
+        };
+        self.entered.notify_one();
+        if self.complete {
+            Ok(serde_json::Value::Null)
+        } else {
+            std::future::pending().await
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires TINYBUS_TEST_CONTROLLED_INIT_MODULE built cdylib"]
+fn runtime_drop_destroys_provider_future_before_offruntime_native_cleanup() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let account = state(":1.1".parse().unwrap(), ":1.2".parse().unwrap());
+    let observed = Arc::new(AtomicUsize::new(0));
+    let entered = Arc::new(Notify::new());
+    let (transport, view, barrier, user_entered, wait_entered, replacement_rejected) = runtime
+        .block_on(async {
+            let (transport, view, init, barrier) =
+                crate::module::transport::tests::native_fixture();
+            barrier.state.lock().unwrap().1 = true;
+            transport.bind_host_callbacks(account.clone()).unwrap();
+            transport.defer_initialize(init, view);
+            transport.ensure_initialized().await.unwrap();
+            barrier.entered.notified().await;
+            let guarded = GuardedInterface {
+                interface: PendingUntilDestroyed {
+                    complete: false,
+                    entered: entered.clone(),
+                    guard: HostCallbackGuard(account.clone()),
+                    observed: observed.clone(),
+                },
+                endpoint: endpoint(),
+                state: account.clone(),
+            };
+            let context = CallContext::brokered(account.module_peer().as_ref(), true);
+            tokio::spawn(async move {
+                guarded
+                    .call_with_context(&endpoint().members[0], serde_json::json!([]), &context)
+                    .await
+            });
+            let user_entered = tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .is_ok();
+            let replacement = state(":1.3".parse().unwrap(), ":1.4".parse().unwrap());
+            let replacement_rejected = transport.bind_host_callbacks(replacement).is_err();
+            transport.request_terminal(false);
+            let wait_entered = tokio::time::timeout(
+                Duration::from_secs(2),
+                account.physical_wait_started.notified(),
+            )
+            .await
+            .is_ok();
+            (
+                transport,
+                view,
+                barrier,
+                user_entered,
+                wait_entered,
+                replacement_rejected,
+            )
+        });
+    let count_before_drop = HostCallbackGuard(account.clone()).running();
+    let terminal_before_drop = unsafe { view.native_terminal_state.unwrap()(view.host_ctx) };
+    let lifecycle_free = !transport.lifecycle_is_owned_for_test();
+    // This drops the actual GuardedInterface/user future, not a caller observer.
+    drop(runtime);
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let completed = loop {
+        if unsafe { view.native_terminal_state.unwrap()(view.host_ctx) }
+            & crate::module::abi::TB_NATIVE_TERMINAL_PHYSICALLY_STOPPED
+            != 0
+        {
+            break true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::yield_now();
+    };
+    assert!(completed, "actual native callback return remains pending");
+    assert!(user_entered && wait_entered && replacement_rejected);
+    assert_eq!(count_before_drop, 1);
+    assert_eq!(
+        terminal_before_drop,
+        crate::module::abi::TB_NATIVE_TERMINAL_STOP_INTENT
+    );
+    assert!(lifecycle_free);
+    assert_eq!(
+        observed.load(Ordering::Acquire),
+        1,
+        "user future destruction precedes counter release"
+    );
+    assert_eq!(HostCallbackGuard(account).running(), 0);
+    assert!(barrier.state.lock().unwrap().2);
+    assert!(!transport.is_faulted());
+}
+
+#[tokio::test]
+async fn completing_provider_future_is_destroyed_before_its_running_account() {
+    let account = state(":1.1".parse().unwrap(), ":1.2".parse().unwrap());
+    let observed = Arc::new(AtomicUsize::new(0));
+    let guarded = GuardedInterface {
+        interface: PendingUntilDestroyed {
+            complete: true,
+            entered: Arc::new(Notify::new()),
+            guard: HostCallbackGuard(account.clone()),
+            observed: observed.clone(),
+        },
+        endpoint: endpoint(),
+        state: account.clone(),
+    };
+    let context = CallContext::brokered(account.module_peer().as_ref(), true);
+    let result = guarded
+        .call_with_context(&endpoint().members[0], serde_json::json!([]), &context)
+        .await;
+    assert!(result.is_ok());
+    assert_eq!(observed.load(Ordering::Acquire), 1);
+    assert_eq!(HostCallbackGuard(account).running(), 0);
 }

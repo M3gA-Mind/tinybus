@@ -1501,6 +1501,9 @@ impl ModuleControl for ModuleHostInner {
                 .lock()
                 .expect("router lock")
                 .revoke_callbacks_for_peer(&module.unique_name);
+            // Revoke native admission immediately; provider drain owns the
+            // later shutdown handoff, so this must not submit a physical job.
+            module.transport.commit_terminal(false);
             module.transition_from.get_or_insert(old);
             module.lifecycle_busy = true;
             (module.transport.clone(), module.callback_state.clone())

@@ -746,6 +746,7 @@ fn a_sidecar_without_lazy_init_refuses_the_artifact_instead_of_loading_it_eagerl
 
 #[tokio::test]
 async fn a_module_whose_init_fails_is_terminal_and_is_never_initialized_again() {
+    let _test_guard = FAKE_MODULE_TEST_LOCK.lock().await;
     FAILED_INIT_COUNT.store(0, Ordering::Release);
     let bus = MemoryBus::new();
     let broker = Broker::new();
@@ -1869,11 +1870,11 @@ fn module_host_helpers_preserve_safe_names_states_and_allowlist_decisions() {
     );
     let _ = ModuleHost::new(Broker::new()).load_search_paths();
 
-    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
-    // Files inherit the private DACL, so these assertions exercise content gates.
-    #[cfg(windows)]
-    crate::module::cache::secure_release_cache(directory.path(), directory.path());
-    let module = directory.path().join(if cfg!(windows) {
+    let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let directory = root.path().join("private");
+    // Protect the artifact parent before files inherit the checkout's DACL.
+    super::super::windows_acl::create_private_dir_all(&directory).unwrap();
+    let module = directory.join(if cfg!(windows) {
         "clock.dll"
     } else if cfg!(target_os = "macos") {
         "clock.dylib"
@@ -1883,7 +1884,7 @@ fn module_host_helpers_preserve_safe_names_states_and_allowlist_decisions() {
     std::fs::write(&module, b"module bytes").unwrap();
     let digest = crate::module::hash::file_hex(std::fs::File::open(&module).unwrap()).unwrap();
     std::fs::write(
-        directory.path().join("modules.toml"),
+        directory.join("modules.toml"),
         format!(
             "clock.{} = \"{digest}\"\n",
             if cfg!(windows) {
@@ -1897,7 +1898,7 @@ fn module_host_helpers_preserve_safe_names_states_and_allowlist_decisions() {
     )
     .unwrap();
     assert!(check_file(&module).is_ok());
-    let text = directory.path().join("clock.txt");
+    let text = directory.join("clock.txt");
     std::fs::write(&text, b"module bytes").unwrap();
     assert!(
         check_file(&text)
@@ -1905,18 +1906,14 @@ fn module_host_helpers_preserve_safe_names_states_and_allowlist_decisions() {
             .to_string()
             .contains("extension is not loadable")
     );
-    std::fs::write(directory.path().join("modules.toml"), "other = \"00\"\n").unwrap();
+    std::fs::write(directory.join("modules.toml"), "other = \"00\"\n").unwrap();
     assert!(
         check_file(&module)
             .unwrap_err()
             .to_string()
             .contains("absent")
     );
-    std::fs::write(
-        directory.path().join("modules.toml"),
-        "clock = \"not-a-hash\"\n",
-    )
-    .unwrap();
+    std::fs::write(directory.join("modules.toml"), "clock = \"not-a-hash\"\n").unwrap();
     assert!(
         check_file(&module)
             .unwrap_err()
@@ -1931,10 +1928,10 @@ fn module_host_helpers_preserve_safe_names_states_and_allowlist_decisions() {
 
 #[test]
 fn an_allowlist_with_a_mismatched_hash_refuses_the_file() {
-    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
-    // Files inherit the private DACL, so these assertions exercise content gates.
-    #[cfg(windows)]
-    crate::module::cache::secure_release_cache(directory.path(), directory.path());
+    let root = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let directory = root.path().join("private");
+    // Protect the artifact parent before files inherit the checkout's DACL.
+    super::super::windows_acl::create_private_dir_all(&directory).unwrap();
     let extension = if cfg!(windows) {
         "dll"
     } else if cfg!(target_os = "macos") {
@@ -1942,10 +1939,10 @@ fn an_allowlist_with_a_mismatched_hash_refuses_the_file() {
     } else {
         "so"
     };
-    let path = directory.path().join(format!("clock.{extension}"));
+    let path = directory.join(format!("clock.{extension}"));
     std::fs::write(&path, b"not a module").unwrap();
     std::fs::write(
-        directory.path().join("modules.toml"),
+        directory.join("modules.toml"),
         format!("clock.{extension} = \"{}\"\n", "0".repeat(64)),
     )
     .unwrap();

@@ -196,6 +196,9 @@ struct Inner {
     /// tree because a chunk has to be checked against the header's stamped
     /// `sender`; interfaces receive only the verified subset in CallContext.
     streams: StreamRegistry,
+    // Last: opted-in observers retain whole-Connection teardown ownership,
+    // including ObjectTree, streams and cloned method observers.
+    catch_observer: std::sync::RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 /// Closes the transport when the last [`Connection`] handle goes away.
@@ -389,6 +392,7 @@ impl Connection {
             signal_deliveries,
             local_publisher: crate::LocalPublisherIdentity::new(),
             panic_handler: std::sync::RwLock::new(None),
+            catch_observer: std::sync::RwLock::new(None),
             streams: StreamRegistry::new(),
         });
         tokio::spawn(writer_loop(inner.transport.clone(), outbound));
@@ -1039,6 +1043,19 @@ impl Connection {
             .expect("panic handler lock") = Some(handler);
     }
 
+    /// Install SDK-local catch-time notification before a method panic payload drops.
+    /// Requires `__set_panic_handler`: without a handler no catch fence is constructed.
+    /// The observer must be bounded, must not unwind, and must never join workers.
+    /// This plumbing does not grant native authority or replace the panic policy.
+    #[doc(hidden)]
+    pub fn __set_catch_observer(&self, observer: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .inner
+            .catch_observer
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(observer);
+    }
+
     /// What this connection will accept from peers sending it bulk streams.
     pub fn stream_limits(&self) -> StreamLimits {
         self.inner.streams.limits()
@@ -1476,12 +1493,22 @@ async fn handle_call(inner: Arc<Inner>, message: Message, brokered: bool) {
         .read()
         .expect("panic handler lock")
         .clone();
+    let catch_observer = inner
+        .catch_observer
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let result = if header.stream_reply && header.confidential {
         Err(Error::protocol(
             "a confidential call cannot request a streamed reply",
         ))
     } else if let Some(panic_handler) = panic_handler {
-        match CatchUnwind::new(dispatch(&inner, &header, message.body, brokered)).await {
+        match CatchUnwind::new(
+            dispatch(&inner, &header, message.body, brokered),
+            catch_observer,
+        )
+        .await
+        {
             Ok(result) => result,
             Err(()) => Err(panic_handler()),
         }
@@ -1569,12 +1596,14 @@ async fn send_reply(inner: &Inner, mut reply: Message) -> bool {
 
 struct CatchUnwind<F> {
     future: Pin<Box<F>>,
+    observer: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<F> CatchUnwind<F> {
-    fn new(future: F) -> Self {
+    fn new(future: F, observer: Option<Arc<dyn Fn() + Send + Sync>>) -> Self {
         Self {
             future: Box::pin(future),
+            observer,
         }
     }
 }
@@ -1583,11 +1612,20 @@ impl<F: Future> Future for CatchUnwind<F> {
     type Output = std::result::Result<F::Output, ()>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let future = self.get_mut().future.as_mut();
+        let this = self.get_mut();
+        let future = this.future.as_mut();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.poll(context))) {
             Ok(Poll::Ready(value)) => Poll::Ready(Ok(value)),
             Ok(Poll::Pending) => Poll::Pending,
-            Err(_) => Poll::Ready(Err(())),
+            Err(payload) => {
+                // No registry or handler lock is held here. Opted-in modules
+                // close actual native authority before foreign payload Drop.
+                if let Some(observer) = &this.observer {
+                    observer();
+                }
+                drop(payload);
+                Poll::Ready(Err(()))
+            }
         }
     }
 }

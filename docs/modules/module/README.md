@@ -44,6 +44,78 @@ last initialized instance. Linked modules keep the embedding host's tracing and
 panic hook. The existing instance-wide last panic location is diagnostic state,
 not a proof of exact attribution among concurrently panicking methods.
 
+## Opted-in terminal factories
+
+Configured modules can opt in with `module_export!(terminal_setup_factory =
+factory, config = Config, ...)`; the static export macro accepts the same
+arguments. The factory receives one `NativeInstanceLiveness` and returns its
+setup callback plus `RuntimeHooks`. An unsupported or non-live native query
+rejects initialization before the factory runs. Linked modules require the
+same explicit host query and retain the embedding process's panic hook. The
+factory owns cleanup of partial construction until it returns its hooks. It
+must defer independent worker launch until setup, after hook registration;
+reinitialization reuses the same controller and never replaces the hooks.
+
+A retained liveness view refers to that exact instance. Only a fresh, exactly
+Live native query admits work; any observed terminal intent permanently closes
+the view. `request_fault()` first reports genuine native fault. The view grants
+no publication lease and does not turn local cancellation into native success.
+Under its physical phase gate, the trusted controller must check immutable
+instance/receiver binding and local terminal flags, sample the view, then
+recheck local flags. A cached Live result cannot authorize a later phase;
+subsequent intent cannot undo an operation already admitted.
+
+The request hook runs at most once and must only close controller admission and
+perform bounded cancel/wake. It must not join, do I/O, wait for a gate, or reenter
+the SDK. Finish runs independently at most once on the physical cleanup thread,
+after startup ownership is published, request has returned, the sole initial
+setup task has settled, and any admitted reinitializer has returned. Finish must
+fence and join the controller's actual workers. `PhysicallyStopped` asserts that
+work; a timeout or host shutdown return does not prove it.
+
+The SDK retains setup futures across cancellation, destroys them on the
+physical cleanup thread, and drops callback captures outside resource locks.
+Reinitialization polls its result before terminal cancellation when both are
+ready. Repeated successful reinitialization retires its previous future through
+one bounded cell on that same physical worker; the next setup starts only after
+the worker confirms disposal. Callback admission uses bookkeeping exclusion,
+with foreign invocation, request and destruction outside every resource lock.
+The runtime is destroyed on the physical thread. Surviving SDK resources,
+spawn failure, a hook panic, or unproved cleanup keep the owner uncertain and
+anchored. Seven separate primary panic cells retain request, finish, initial
+setup, reinitialize, factory, startup, and cleanup payloads. Native fault and
+request completion precede any payload disposal. After the first cleanup
+destructor panic, later resource owners remain attached rather than being
+destroyed during cleanup unwinding. Once actual setup execution has settled,
+the controller finish still runs once; retained or panicking SDK teardown keeps
+the result uncertain even if that controller finish succeeds. A counted observer
+retains the entire Connection through its last field and all cloned method
+observers. A destructor unwind explicitly reports native Fault even after
+diagnostic callbacks have been suppressed; a transport count or runtime timeout
+cannot certify whole-Connection destruction.
+
+Each SDK image has 256 instance slots. The existing opaque `module_ctx` contains
+a slot/generation address token, never a dereferenced pointer or extra ABI
+allocation. Callback lookup acquires the exact State before releasing registry
+exclusion. Successful teardown retires its registry anchor; only actual State
+last-Drop releases the slot, so old views and surviving SDK resources count
+against the limit. Generations never wrap: exhaustion permanently denies that
+slot. Null, stale or unknown context tokens return `TB_CLOSED` for otherwise
+valid terminal callbacks and cannot select a replacement. Legacy shutdown's
+null-context behavior remains unchanged.
+Tokens are private bookkeeping, not native authentication.
+
+The SDK's `__native-fixture-support` feature is private and disabled by default.
+It exposes only compiled-fixture instrumentation, not production authority.
+
+This metadata bound does not bound existing host-context or mapped-library
+retention. Libraries remain mapped until process exit, including a rejected
+initialization whose independent SDK finish job is still running. A rejected
+initialization without an accepted vtable cannot earn host PhysicalStopped
+evidence. The native query remains authoritative after local Stop and before
+any successful shutdown return or context retirement. Legacy exports retain
+their existing lifecycle behavior.
+
 ## Loading sequence
 
 1. Check every directory component's ownership/mode, require a regular

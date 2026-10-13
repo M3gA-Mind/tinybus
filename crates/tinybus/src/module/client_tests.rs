@@ -171,3 +171,93 @@ async fn a_fixture_proxy_is_classified_and_reported_when_the_call_fails() {
     assert!(result.is_err());
     assert_eq!(sink.0.lock().unwrap().len(), 1);
 }
+
+struct JsonFixture;
+#[async_trait::async_trait]
+impl crate::Interface for JsonFixture {
+    fn name(&self) -> crate::InterfaceName {
+        crate::InterfaceName::new(RECORD.bus_name).unwrap()
+    }
+    fn members(&self) -> Vec<crate::MemberName> {
+        vec![crate::MemberName::new("Json").unwrap()]
+    }
+    async fn call(
+        &self,
+        _: &crate::MemberName,
+        _: serde_json::Value,
+    ) -> crate::Result<serde_json::Value> {
+        Ok(serde_json::json!("{\"answer\":42}"))
+    }
+}
+
+#[tokio::test]
+async fn fixture_json_and_object_calls_preserve_deadlines_and_confidential_refusals() {
+    let (sink, resolver) = resolver(true);
+    let bus = crate::transport::memory::MemoryBus::new();
+    crate::broker::Broker::new().spawn(bus.clone());
+    let service = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    service.request_name(RECORD.bus_name).await.unwrap();
+    for path in [RECORD.object_path, "/child"] {
+        service
+            .serve_at(crate::ObjectPath::new(path).unwrap(), JsonFixture)
+            .await
+            .unwrap();
+    }
+    let caller = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let proxy = caller
+        .proxy(RECORD.bus_name, RECORD.object_path, RECORD.bus_name)
+        .unwrap();
+    let client = ModuleClient::new(resolver)
+        .with_fixture(proxy)
+        .with_timeout(Duration::from_secs(1));
+    let reply: serde_json::Value = client.call_json(RECORD.id, "Json", ()).await.unwrap();
+    assert_eq!(reply, serde_json::json!({"answer":42}));
+    let object = client.object_client(RECORD.id, "/child").await.unwrap();
+    let reply: String = object.call("Json", ()).await.unwrap();
+    assert_eq!(reply, "{\"answer\":42}");
+    assert!(
+        client
+            .object_client(RECORD.id, "invalid path")
+            .await
+            .is_err()
+    );
+    let reply: Result<String, _> = object.call_confidential("Json", ()).await;
+    assert_eq!(reply, Err(ModuleCallError::TransportFailed));
+    let reply: Result<String, _> = client.call_confidential(RECORD.id, "Json", ()).await;
+    assert_eq!(reply, Err(ModuleCallError::TransportFailed));
+    let reply: Result<serde_json::Value, _> =
+        client.call_confidential_json(RECORD.id, "Json", ()).await;
+    assert_eq!(reply, Err(ModuleCallError::TransportFailed));
+    assert!(
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(_, reason)| *reason == Reason::TransportFailed)
+    );
+}
+
+#[tokio::test]
+async fn unavailable_loads_and_explicit_reports_use_only_registered_identity() {
+    let (sink, resolver) = resolver(true);
+    let client = ModuleClient::new(resolver);
+    let reply: Result<String, _> = client.call(RECORD.id, "Json", ()).await;
+    assert_eq!(reply, Err(ModuleCallError::Unavailable));
+    assert!(client.object_client(RECORD.id, "/child").await.is_err());
+    client.report_incompatible_contract(RECORD.id);
+    client.report_unavailable(RECORD.id);
+    client.report_malformed_reply("unknown");
+    client.report_incompatible_contract("unknown");
+    client.report_unavailable("unknown");
+    assert!(
+        sink.0
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(module, _)| module == RECORD.id)
+    );
+}

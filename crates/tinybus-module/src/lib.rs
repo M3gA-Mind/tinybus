@@ -26,6 +26,9 @@ use tinybus::module::abi::{
 use tinybus::{Connection, Error, Result, Transport};
 use tokio::sync::{Mutex, mpsc};
 
+mod terminal;
+pub use terminal::{NativeInstanceLiveness, RuntimeHooks, TerminalCompletion, TerminalReason};
+
 mod execution_context;
 use execution_context::ExecutionOwner;
 
@@ -490,6 +493,12 @@ where
     F: FnOnce(Connection) -> Fut + Send + 'static,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
+    let Some((_, compatible_host)) =
+        (unsafe { validate_start_arguments(host, out, worker_threads) })
+    else {
+        return TB_BAD_ARGUMENT;
+    };
+    let owner = Some(ExecutionOwner::new(HostCalls(compatible_host)));
     unsafe {
         start_module_runtime(
             host,
@@ -498,7 +507,7 @@ where
             detach_on_panic,
             setup,
             None,
-            false,
+            owner,
         )
     }
 }
@@ -528,7 +537,7 @@ where
             detach_on_panic,
             setup,
             None,
-            true,
+            None,
         )
     }
 }
@@ -551,6 +560,8 @@ unsafe fn validate_start_arguments(
     Some((out_capacity, host))
 }
 
+// Carry the validated entry caller's exact diagnostic owner into the runtime.
+// Captured factory/config dispatch and shutdown must share the same live bit.
 unsafe fn start_module_runtime<F, Fut>(
     host: *const TbHostVtable,
     out: *mut TbModuleVtable,
@@ -558,7 +569,7 @@ unsafe fn start_module_runtime<F, Fut>(
     detach_on_panic: bool,
     setup: F,
     reinitialize_factory: Option<ReinitializeFactory>,
-    linked: bool,
+    owner: Option<ExecutionOwner>,
 ) -> i32
 where
     F: FnOnce(Connection) -> Fut + Send + 'static,
@@ -572,7 +583,6 @@ where
         };
         let host = HostCalls(host);
 
-        let owner = (!linked).then(|| ExecutionOwner::new(host));
         if owner.is_some() {
             ExecutionOwner::install_panic_hook();
         }
@@ -739,12 +749,14 @@ where
         Err(_) => return TB_PANICKED,
     };
     unsafe {
-        start_module(
+        start_module_runtime(
             host,
             out,
             worker_threads,
             detach_on_panic,
             move |connection| setup(connection, config),
+            None,
+            caller_owner,
         )
     }
 }
@@ -970,7 +982,7 @@ where
             detach_on_panic,
             move |connection| initial_setup(connection, config),
             Some(reinitialize_factory),
-            linked,
+            caller_owner,
         )
     }
 }
@@ -990,7 +1002,15 @@ where
 /// state is reused for that instance's reinitializations, allowing admission to
 /// remain bound without process-global state. Separate instances receive fresh
 /// state. A factory panic returns `TB_PANICKED` without unwinding into the host.
-/// Existing `setup = function` callbacks retain their behavior.
+/// Configured modules may instead use `terminal_setup_factory = factory`. Its
+/// factory receives [`NativeInstanceLiveness`] and returns `Result<(F,
+/// RuntimeHooks)>`, with the same setup callback bounds. A supported, exactly
+/// live native query and an available instance slot are required before factory
+/// evaluation; otherwise initialization returns `TB_CLOSED`. The factory owns
+/// partial-failure cleanup until it returns and must launch independent workers
+/// only from setup after hook registration. See [`RuntimeHooks`] for controller
+/// obligations. Hooks are registered once and never replaced by reinitialization.
+/// Existing `setup = function` and `setup_factory` callbacks retain their behavior.
 #[macro_export]
 macro_rules! module_export {
     (@linked) => {
@@ -1129,6 +1149,17 @@ macro_rules! module_export {
         }
     };
     (
+        terminal_setup_factory = $factory:path,
+        config = $config:ty,
+        $($rest:tt)*
+    ) => {
+        $crate::module_export! {
+            @configured export = {#[unsafe(no_mangle)]},
+            start = $crate::start_terminal_reconfigurable_module_with_factory,
+            setup = $factory, config = $config, $($rest)*
+        }
+    };
+    (
         setup_factory = $factory:path,
         config = $config:ty,
         $($rest:tt)*
@@ -1166,9 +1197,19 @@ macro_rules! module_export {
 
 /// Generate Rust-addressable entry points for linking several modules into a
 /// single executable. The entry points have no shared C linker symbol names.
-/// Both configured `setup` and per-instance `setup_factory` forms are supported.
+/// Configured `setup`, per-instance `setup_factory`, and opted-in
+/// `terminal_setup_factory` forms are supported; see [`module_export`].
+/// Terminal factories require the supplied host's native query even when linked.
 #[macro_export]
 macro_rules! module_export_static {
+    (terminal_setup_factory = $factory:path, config = $config:ty, $($rest:tt)*) => {
+        $crate::module_export! {
+            @configured export = {},
+            start = $crate::start_linked_terminal_reconfigurable_module_with_factory,
+            setup = $factory, config = $config, $($rest)*
+        }
+        $crate::module_export! { @linked }
+    };
     (setup_factory = $factory:path, config = $config:ty, $($rest:tt)*) => {
         $crate::module_export! {
             @configured export = {},
@@ -1230,3 +1271,637 @@ mod setup_factory_test;
 #[cfg(test)]
 #[path = "lib_lifecycle_tests.rs"]
 mod lifecycle_test;
+
+/// Initialize an opted-in instance with native admission and physical hooks.
+///
+/// The factory returns one shared setup callback and one controller hook pair.
+/// It owns partial-failure disposal until return and must defer worker launch
+/// until setup, after hook registration. Reinitialization reuses this controller.
+/// Admission exhaustion or an unsupported/non-live query returns `TB_CLOSED`
+/// before factory evaluation. [`RuntimeHooks`] defines physical finish obligations.
+///
+/// # Safety
+/// Uphold [`start_module`]'s ABI and output contracts. The compatible native
+/// query and copied host context must remain valid for every retained view,
+/// including after host destruction. Only the actual native query grants
+/// authority; unsupported hosts reject the factory before invoking it.
+#[doc(hidden)]
+pub unsafe fn start_terminal_reconfigurable_module_with_factory<C, F, Fut>(
+    host: *const TbHostVtable,
+    out: *mut TbModuleVtable,
+    worker_threads: usize,
+    _detach_on_panic: bool,
+    factory: impl FnOnce(NativeInstanceLiveness) -> Result<(F, RuntimeHooks)>,
+) -> i32
+where
+    C: serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(Connection, C) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    unsafe { start_terminal_factory_mode(host, out, worker_threads, factory, false) }
+}
+
+/// Linked counterpart with explicit native authority from the supplied host.
+/// It retains the embedding process's tracing subscriber and panic hook.
+///
+/// # Safety
+/// Uphold [`start_terminal_reconfigurable_module_with_factory`]'s contracts.
+#[doc(hidden)]
+pub unsafe fn start_linked_terminal_reconfigurable_module_with_factory<C, F, Fut>(
+    host: *const TbHostVtable,
+    out: *mut TbModuleVtable,
+    worker_threads: usize,
+    _detach_on_panic: bool,
+    factory: impl FnOnce(NativeInstanceLiveness) -> Result<(F, RuntimeHooks)>,
+) -> i32
+where
+    C: serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(Connection, C) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    unsafe { start_terminal_factory_mode(host, out, worker_threads, factory, true) }
+}
+
+// Legacy transport remains unchanged; only opted-in Connections retain State.
+struct TerminalTransport {
+    inner: ModuleTransport,
+    _owner: terminal::SdkOwner,
+}
+#[cfg(any(test, feature = "__native-fixture-support"))]
+impl Drop for TerminalTransport {
+    fn drop(&mut self) {
+        self._owner.record_transport_drop_for_test();
+    }
+}
+#[async_trait]
+impl Transport for TerminalTransport {
+    async fn send(&self, message: Message) -> Result<()> {
+        self.inner.send(message).await
+    }
+    async fn recv(&self) -> Result<Option<Message>> {
+        self.inner.recv().await
+    }
+    async fn close(&self) -> Result<()> {
+        self.inner.close().await
+    }
+    fn describe(&self) -> String {
+        self.inner.describe()
+    }
+}
+
+// The existing opaque module_ctx field is a bounded slot/generation token,
+// never a dereferenced pointer. Retirement denies old callbacks permanently.
+unsafe extern "C" fn terminal_deliver(ctx: *mut c_void, ptr: *const u8, len: usize) -> i32 {
+    if ptr.is_null() || len > MAX_FRAME_LEN {
+        return TB_BAD_ARGUMENT;
+    }
+    let Some(state) = terminal::TerminalState::lookup(ctx) else {
+        return TB_CLOSED;
+    };
+    let _scope = state.owner.as_ref().map(ExecutionOwner::enter);
+    if !state.is_live() {
+        return TB_CLOSED;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec();
+    let brokered = state.host.is_broker_routed();
+    let sender = state
+        .resources
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .inbound
+        .clone();
+    match sender.map(|sender| sender.try_send((bytes, brokered))) {
+        Some(Ok(())) => TB_OK,
+        Some(Err(mpsc::error::TrySendError::Full(_))) => TB_BACKPRESSURE,
+        _ => TB_CLOSED,
+    }
+}
+unsafe extern "C" fn terminal_shutdown(ctx: *mut c_void, deadline_ms: u64) -> i32 {
+    let Some(state) = terminal::TerminalState::lookup(ctx) else {
+        return TB_CLOSED;
+    };
+    let _scope = state.owner.as_ref().map(ExecutionOwner::enter);
+    state.observe_host(); // sample actual host Fault before selecting ordinary Stop
+    state.signal(TerminalReason::Stop);
+    let completion = state.wait(Duration::from_millis(deadline_ms));
+    // Genuine source/native Fault cannot earn accepted-vtable physical success.
+    state.observe_host();
+    if completion != TerminalCompletion::PhysicallyStopped || state.has_fault() {
+        state.retain_uncertain_anchor();
+        return TB_PANICKED;
+    }
+    TB_OK
+}
+unsafe extern "C" fn terminal_reinitialize(ctx: *mut c_void, ptr: *const u8, len: usize) -> i32 {
+    if len > 1024 * 1024 || (ptr.is_null() && len != 0) {
+        return TB_BAD_ARGUMENT;
+    }
+    let Some(state) = terminal::TerminalState::lookup(ctx) else {
+        return TB_CLOSED;
+    };
+    if !state.is_live() {
+        return TB_CLOSED;
+    }
+    let _scope = state.owner.as_ref().map(ExecutionOwner::enter);
+    if !state.begin_reinit() {
+        return TB_CLOSED;
+    }
+    let callback_slot = state
+        .resources
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .reinitialize
+        .clone();
+    // The authoritative Arc remains State-owned until active_reinit settles.
+    // No callback exclusion is held across foreign invocation or source faults.
+    let callback = callback_slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        callback
+            .as_ref()
+            .map_or(TB_CLOSED, |callback| callback(ptr, len))
+    }));
+    drop(callback); // non-last: cleanup still waits active_reinit
+    let code = match outcome {
+        Ok(code) => code,
+        Err(payload) => {
+            state.source_panic(terminal::PayloadKind::Reinit, payload);
+            TB_PANICKED
+        }
+    };
+    state.end_reinit();
+    code
+}
+
+// The task never owns the foreign future across a yield or on cancellation.
+// Each poll takes/polls/reattaches without holding a resource mutex over user
+// code. Physical cleanup joins the sole task, then destroys this retained future.
+struct TerminalSetupPoll {
+    slot: terminal::SetupFutureSlot,
+    state: Arc<terminal::TerminalState>,
+    kind: terminal::PayloadKind,
+}
+impl Future for TerminalSetupPoll {
+    type Output = Result<()>;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut future = self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            future.as_mut().map_or(
+                std::task::Poll::Ready(Err(Error::ConnectionClosed)),
+                |future| future.as_mut().poll(cx),
+            )
+        }));
+        *self
+            .slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = future;
+        match outcome {
+            Ok(std::task::Poll::Ready(Err(error))) => {
+                self.state.signal(TerminalReason::SetupFailed);
+                std::task::Poll::Ready(Err(error))
+            }
+            Ok(poll) => poll,
+            Err(payload) => {
+                self.state.source_panic(self.kind, payload);
+                std::task::Poll::Ready(Err(Error::failed("module setup panicked")))
+            }
+        }
+    }
+}
+async fn terminal_notification(state: &terminal::TerminalState) {
+    loop {
+        let notification = state.terminal_notify.notified();
+        tokio::pin!(notification);
+        notification.as_mut().enable();
+        if state.is_terminal() {
+            return;
+        }
+        notification.await;
+    }
+}
+
+unsafe fn start_terminal_factory_mode<C, F, Fut>(
+    host: *const TbHostVtable,
+    out: *mut TbModuleVtable,
+    worker_threads: usize,
+    factory: impl FnOnce(NativeInstanceLiveness) -> Result<(F, RuntimeHooks)>,
+    linked: bool,
+) -> i32
+where
+    C: serde::de::DeserializeOwned + Send + 'static,
+    F: Fn(Connection, C) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let Some((capacity, compatible)) =
+        (unsafe { validate_start_arguments(host, out, worker_threads) })
+    else {
+        return TB_BAD_ARGUMENT;
+    };
+    // Reject unavailable, unknown and terminal authority before any factory.
+    let Some(query) = compatible.native_terminal_state else {
+        return TB_CLOSED;
+    };
+    if unsafe { query(compatible.host_ctx) } != tinybus::module::abi::TB_NATIVE_TERMINAL_LIVE {
+        return TB_CLOSED;
+    }
+    let owner = (!linked).then(|| ExecutionOwner::new(HostCalls(compatible)));
+    let Some(state) = terminal::TerminalState::admit(HostCalls(compatible), owner) else {
+        return TB_CLOSED;
+    };
+    if state.owner.is_some() {
+        ExecutionOwner::install_panic_hook();
+    }
+    let _scope = state.owner.as_ref().map(ExecutionOwner::enter);
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let config = match unsafe { parse_config::<C>(host) } {
+            Ok(config) => config,
+            Err(code) => return code,
+        };
+        state
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config = Some(Box::new(config));
+        let (setup, hooks) = match catch_unwind(AssertUnwindSafe(|| factory(state.view()))) {
+            Ok(Ok(returned)) => returned,
+            Ok(Err(_error)) => {
+                state.signal(TerminalReason::SetupFailed);
+                return TB_CLOSED;
+            }
+            Err(payload) => {
+                state.source_panic(terminal::PayloadKind::Factory, payload);
+                return TB_PANICKED;
+            }
+        };
+        let setup = Arc::new(setup);
+        state
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retained_factory = Some(Box::new(setup.clone()));
+        state.register(hooks);
+        #[cfg(any(test, feature = "__native-fixture-support"))]
+        state.startup_checkpoint_for_test(1);
+        if !state.is_live() {
+            return TB_CLOSED;
+        }
+        let config = state
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config
+            .take();
+        let config = *config
+            .expect("attached config")
+            .downcast::<C>()
+            .unwrap_or_else(|_| unreachable!("private config type"));
+        let initial_setup = setup.clone();
+        state
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .setup = Some(Box::new(move |connection| {
+            Box::pin(initial_setup(connection, config))
+        }));
+        #[cfg(any(test, feature = "__native-fixture-support"))]
+        state.startup_checkpoint_for_test(2);
+        let weak = Arc::downgrade(&state);
+        let reinitializer: ReinitializeFactory = Box::new(move |handle, connection_slot| {
+            Box::new(move |ptr, len| {
+                let Some(state) = weak.upgrade() else {
+                    return TB_CLOSED;
+                };
+                if !state.is_live() {
+                    return TB_CLOSED;
+                }
+                let connection = connection_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let Some(connection) = connection else {
+                    return TB_CLOSED;
+                };
+                let slot = state
+                    .resources
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .reinit_future
+                    .clone();
+                let previous = slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if !state.retire_reinit(previous) {
+                    return TB_CLOSED;
+                }
+                if !state.is_live() {
+                    return TB_CLOSED;
+                }
+                // Copy ABI input before transferring the single construction operation.
+                // Only the existing physical worker parses/owns C and calls setup.
+                let bytes = if len == 0 {
+                    b"{}".to_vec()
+                } else {
+                    unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec()
+                };
+                let construct_state = Arc::downgrade(&state);
+                let construct_setup = setup.clone();
+                let construct_slot = slot.clone();
+                let construct_handle = handle.clone();
+                let code = state.construct_reinit(Box::new(move || {
+                    let Some(state) = construct_state.upgrade() else {
+                        return TB_CLOSED;
+                    };
+                    if !state.is_live() {
+                        return TB_CLOSED;
+                    }
+                    // active_reinit keeps the actual State-owned Runtime alive until
+                    // this worker acknowledges construction and the ABI caller settles.
+                    // Enter its context locally, outside all locks, for synchronous C/F
+                    // construction; the guard never leaves this physical worker.
+                    let _runtime_scope = construct_handle.enter();
+                    let config = match serde_json::from_slice::<C>(&bytes) {
+                        Ok(config) => config,
+                        Err(_) => return TB_BAD_ARGUMENT,
+                    };
+                    // If Stop arrived during parsing, keep the received config attached
+                    // until this same worker's terminal resource disposal.
+                    state
+                        .resources
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .config = Some(Box::new(config));
+                    if !state.is_live() {
+                        return TB_CLOSED;
+                    }
+                    let config = state
+                        .resources
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .config
+                        .take()
+                        .expect("attached reinit config");
+                    let config = *config
+                        .downcast::<C>()
+                        .unwrap_or_else(|_| unreachable!("private config type"));
+                    let future = Box::pin(construct_setup(connection, config));
+                    *construct_slot
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(future);
+                    TB_OK
+                }));
+                if code != TB_OK {
+                    return code;
+                }
+                let result = handle.block_on(async {
+                    tokio::select! { biased;
+                        result = TerminalSetupPoll { slot, state: state.clone(), kind: terminal::PayloadKind::Reinit } => result,
+                        () = terminal_notification(&state) => Err(Error::ConnectionClosed),
+                    }
+                });
+                match result {
+                    Ok(()) if state.is_live() => TB_OK,
+                    Ok(()) | Err(_) => TB_CLOSED,
+                }
+            })
+        });
+        state
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reinitializer_factory = Some(reinitializer);
+        #[cfg(any(test, feature = "__native-fixture-support"))]
+        state.startup_checkpoint_for_test(3);
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        if let Some(owner) = &state.owner {
+            owner.configure(&mut builder);
+        }
+        #[cfg(any(test, feature = "__native-fixture-support"))]
+        let build_result = if state.reject_runtime_build_for_fixture() {
+            Err(std::io::Error::other(
+                "controlled terminal runtime build failure",
+            ))
+        } else {
+            builder.worker_threads(worker_threads).enable_all().build()
+        };
+        #[cfg(not(any(test, feature = "__native-fixture-support")))]
+        let build_result = builder.worker_threads(worker_threads).enable_all().build();
+        let runtime = match build_result {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                state.signal(TerminalReason::SetupFailed);
+                return TB_CLOSED;
+            }
+        };
+        // Immediate mechanical transfer: no later startup failure drops Runtime on ABI.
+        state
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .runtime = Some(runtime);
+        #[cfg(any(test, feature = "__native-fixture-support"))]
+        state.startup_checkpoint_for_test(4);
+        let (inbound_tx, inbound_rx) = mpsc::channel(MODULE_QUEUE_CAPACITY);
+        state
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .inbound = Some(inbound_tx);
+        let transport = Arc::new(TerminalTransport {
+            inner: ModuleTransport {
+                host: state.host,
+                inbound: Mutex::new(inbound_rx),
+                provenance: Arc::new(AtomicBool::new(false)),
+                detach_on_panic: false,
+            },
+            _owner: state.sdk_owner(),
+        });
+        // Attach before any later fallible startup boundary. The ABI/task local
+        // is never the sole owner of the received SDK transport.
+        state
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .transport = Some(transport.clone());
+        #[cfg(any(test, feature = "__native-fixture-support"))]
+        state.startup_checkpoint_for_test(5);
+        let (handle, connection_slot, factory) = {
+            let mut resources = state
+                .resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                resources
+                    .runtime
+                    .as_ref()
+                    .expect("attached runtime")
+                    .handle()
+                    .clone(),
+                resources.connection.clone(),
+                resources.reinitializer_factory.take(),
+            )
+        };
+        let callback = factory.map(|factory| {
+            terminal::TerminalReinitialize::from(factory(handle.clone(), connection_slot.clone()))
+        });
+        let callback_slot = state
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reinitialize
+            .clone();
+        *callback_slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = callback;
+        #[cfg(any(test, feature = "__native-fixture-support"))]
+        state.startup_checkpoint_for_test(6);
+        let task_state = state.clone();
+        let task = handle.spawn(async move {
+            #[cfg(any(test, feature = "__native-fixture-support"))]
+            if task_state.hold_initial_before_transfer_for_test() {
+                // Deterministic startup-failure fixture: retain SDK-owned C/F
+                // before trusted setup consumes them, with a real cancellable task.
+                terminal_notification(&task_state).await;
+                return Ok(());
+            }
+            let provenance = transport.inner.provenance.clone();
+            let brokered = transport.inner.host.0.broker_routing.is_some();
+            let connection = if brokered {
+                // SAFETY: same private per-frame provenance contract as module_connection.
+                unsafe { Connection::__attach_module_with_provenance(transport, provenance) }
+            } else {
+                Connection::attach(transport)
+            };
+            if let Err(error) = connection.handshake().await {
+                task_state.signal(TerminalReason::SetupFailed);
+                return Err(error);
+            }
+            connection.__set_panic_handler(Arc::new(|| Error::MethodFailed {
+                name: MODULE_PANIC_ERROR.to_owned(),
+                message: "a module method panicked".to_owned(),
+            }));
+            let observer_owner = task_state.sdk_owner();
+            connection.__set_catch_observer(Arc::new(move || {
+                observer_owner.caught_panic();
+            }));
+            // Connection is persisted independently of initial task lifetime.
+            *connection_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(connection.clone());
+            if !task_state.is_live() {
+                return Ok(());
+            }
+            let setup = task_state
+                .resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .setup
+                .take();
+            let future =
+                match catch_unwind(AssertUnwindSafe(|| setup.map(|setup| setup(connection)))) {
+                    Ok(Some(future)) => future,
+                    Ok(None) => return Err(Error::ConnectionClosed),
+                    Err(payload) => {
+                        task_state.source_panic(terminal::PayloadKind::Initial, payload);
+                        return Err(Error::failed("module setup construction panicked"));
+                    }
+                };
+            let slot = task_state
+                .resources
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .initial_future
+                .clone();
+            *slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(future);
+            let result = TerminalSetupPoll {
+                slot,
+                state: task_state.clone(),
+                kind: terminal::PayloadKind::Initial,
+            }
+            .await;
+            if result.is_ok() && task_state.is_live() {
+                task_state.host.ready();
+            }
+            result
+        });
+        state
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .initial = Some(task);
+        #[cfg(any(test, feature = "__native-fixture-support"))]
+        state.startup_checkpoint_for_test(7);
+        let context = state.context();
+        #[cfg(any(test, feature = "__native-fixture-support"))]
+        state.startup_checkpoint_for_test(8);
+        state.mark_vtable_published();
+        if capacity >= size_of::<TbModuleVtable>() as u32 {
+            unsafe {
+                out.write(TbModuleVtable {
+                    size: size_of::<TbModuleVtable>() as u32,
+                    _reserved: 0,
+                    module_ctx: context,
+                    deliver: terminal_deliver,
+                    shutdown: terminal_shutdown,
+                    reinitialize: Some(terminal_reinitialize),
+                });
+            }
+        } else {
+            unsafe {
+                out.cast::<TbModuleVtableV1Prefix>()
+                    .write(TbModuleVtableV1Prefix {
+                        size: TB_MODULE_VTABLE_BASE_SIZE,
+                        _reserved: 0,
+                        module_ctx: context,
+                        deliver: terminal_deliver,
+                        shutdown: terminal_shutdown,
+                    });
+            }
+        }
+        TB_OK
+    }));
+    let code = match result {
+        Ok(code) => code,
+        Err(payload) => {
+            state.source_panic(terminal::PayloadKind::Startup, payload);
+            TB_PANICKED
+        }
+    };
+    if code == TB_BAD_ARGUMENT
+        && state
+            .resources
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .config
+            .is_none()
+    {
+        // Parsing failed before any factory/hook/config owner transfer.
+        state.empty_factory_failure();
+        return code;
+    }
+    if code != TB_OK {
+        if let Some(owner) = &state.owner {
+            owner.stop();
+        }
+        if !state.is_terminal() {
+            state.signal(TerminalReason::SetupFailed);
+        }
+    }
+    state.publish();
+    code
+}
+
+#[cfg(test)]
+#[path = "lib_terminal_tests.rs"]
+mod terminal_runtime_tests;
