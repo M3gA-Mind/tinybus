@@ -52,14 +52,14 @@ pub use host::callbacks::{
     HostCallbackSignal,
 };
 #[cfg(feature = "modules")]
+pub use host::{ModuleHost, ModuleInfo, ModuleState};
+#[cfg(feature = "modules")]
 pub use resolve::{
     Availability, LoadError, ModuleConfigProvider, ModuleSource, ReleaseRecord, Resolver,
     ResolverInputs, RuntimeFuture, RuntimeProvider,
 };
 #[cfg(feature = "modules")]
 pub use runtime::{ModuleRuntime, RuntimeNames, RuntimeSetup};
-#[cfg(feature = "modules")]
-pub use host::{ModuleHost, ModuleInfo, ModuleState};
 
 /// Entry points compiled into the host instead of loaded from a shared library.
 ///
