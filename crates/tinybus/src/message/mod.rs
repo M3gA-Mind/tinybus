@@ -272,8 +272,9 @@ impl Message {
         }
     }
 
-    /// Build a signal. Signals carry no destination: the router fans them out
-    /// to every peer whose match rules accept them.
+    /// Build a broadcast signal. The router fans it out to every peer whose
+    /// match rules accept it. Use [`Message::signal_to`] to address one
+    /// unique-name peer.
     pub fn signal(
         path: ObjectPath,
         interface: InterfaceName,
