@@ -8,6 +8,10 @@ pub mod abi;
 #[cfg(feature = "modules")]
 mod cache;
 #[cfg(feature = "modules")]
+pub mod client;
+#[cfg(feature = "modules")]
+pub mod failure;
+#[cfg(feature = "modules")]
 mod first_admitted;
 #[cfg(feature = "modules")]
 mod github;
@@ -26,12 +30,18 @@ mod remembered_hash;
 #[cfg(feature = "modules")]
 mod resolve;
 #[cfg(feature = "modules")]
+pub mod runtime;
+#[cfg(feature = "modules")]
 pub(crate) mod transport;
 #[cfg(feature = "modules")]
 mod windows_acl;
 
 #[cfg(feature = "modules")]
 pub use cache::{artifact_dir, is_safe_path_component, prune_stale_versions};
+#[cfg(feature = "modules")]
+pub use client::{ModuleCallError, ModuleClient, ModuleObjectClient, classify};
+#[cfg(feature = "modules")]
+pub use failure::{FailureReport, FailureReporter, FailureSink, Reason};
 #[cfg(feature = "modules")]
 pub use first_admitted::{ReleaseAsset, ReleasePlan, load_first_admitted};
 #[cfg(feature = "modules")]
@@ -43,6 +53,13 @@ pub use host::callbacks::{
 };
 #[cfg(feature = "modules")]
 pub use host::{ModuleHost, ModuleInfo, ModuleState};
+#[cfg(feature = "modules")]
+pub use resolve::{
+    Availability, LoadError, ModuleConfigProvider, ModuleSource, ReleaseRecord, Resolver,
+    ResolverInputs, RuntimeFuture, RuntimeProvider,
+};
+#[cfg(feature = "modules")]
+pub use runtime::{ModuleRuntime, RuntimeNames, RuntimeSetup};
 
 /// Entry points compiled into the host instead of loaded from a shared library.
 ///
