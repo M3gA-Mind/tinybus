@@ -73,7 +73,9 @@ pub struct Header {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_responder: Option<BusName>,
     /// Who the message is for. Broadcast signals omit this; directed signals
-    /// carry the unique peer selected by their live callback binding.
+    /// carry the unique peer selected by their live callback binding. A
+    /// [`MessageKind::Signal`] may carry a unique name to be delivered to that
+    /// one peer only (still subject to its match rules).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub destination: Option<BusName>,
     /// The object being addressed.
@@ -300,6 +302,21 @@ impl Message {
         }
     }
 
+    /// Build a signal for one peer. The router delivers it only to the peer
+    /// that owns the unique name `destination`, and only if that peer has a
+    /// match rule accepting it; every other subscriber sees nothing.
+    pub fn signal_to(
+        destination: BusName,
+        path: ObjectPath,
+        interface: InterfaceName,
+        member: MemberName,
+        body: Value,
+    ) -> Self {
+        let mut message = Self::signal(path, interface, member, body);
+        message.header.destination = Some(destination);
+        message
+    }
+
     /// Build an exact-recipient signal for SDK-owned callback routing.
     ///
     /// The broker accepts this kind only for a currently live host callback
@@ -421,6 +438,16 @@ impl Message {
             MessageKind::Signal => {
                 if self.header.interface.is_none() || self.header.member.is_none() {
                     return Err(Error::protocol("signal needs an interface and a member"));
+                }
+                if self
+                    .header
+                    .destination
+                    .as_ref()
+                    .is_some_and(|name| !name.is_unique())
+                {
+                    return Err(Error::protocol(
+                        "a signal can only be addressed to a unique name",
+                    ));
                 }
             }
             MessageKind::DirectedSignal => {

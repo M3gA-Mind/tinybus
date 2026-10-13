@@ -638,6 +638,14 @@ impl Router {
         self.peers
             .iter()
             .filter(|(id, _)| **id != from)
+            // A signal addressed to one peer reaches that peer alone.
+            .filter(|(_, peer)| {
+                signal
+                    .header
+                    .destination
+                    .as_ref()
+                    .is_none_or(|destination| *destination == peer.unique)
+            })
             .filter(|(_, peer)| peer.matches.iter().any(|rule| rule.matches(signal)))
             .map(|(_, peer)| peer.outbox.clone())
             .collect()

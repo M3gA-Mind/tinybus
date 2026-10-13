@@ -768,6 +768,24 @@ impl Connection {
         self.send(message).await
     }
 
+    /// Send a signal to one peer instead of every subscriber.
+    ///
+    /// `destination` must be a unique bus name. The broker delivers the signal
+    /// only to that peer, and only if the peer has a match rule accepting it;
+    /// a third party that subscribed to the same path or interface never sees
+    /// it. Like [`Connection::emit`] there is no delivery confirmation.
+    pub async fn emit_to(
+        &self,
+        destination: BusName,
+        path: ObjectPath,
+        interface: InterfaceName,
+        member: MemberName,
+        body: impl Serialize,
+    ) -> Result<()> {
+        let message = Message::signal_to(destination, path, interface, member, to_body(&body)?);
+        self.send(message).await
+    }
+
     /// A typed handle to one interface on one remote object.
     pub fn proxy(
         &self,
@@ -1235,8 +1253,28 @@ impl Connection {
     ///
     /// Once only: a stream has one consumer, because two consumers would each
     /// get an arbitrary half of the payload.
+    ///
+    /// This does not check which peer opened the stream; a handler that knows
+    /// its caller should use [`Connection::accept_stream_from`].
     pub fn accept_stream(&self, stream: &StreamRef) -> Result<StreamReader> {
         self.inner.streams.take_reader(&stream.id)
+    }
+
+    /// Take the reader for a stream, only if `opener` is the peer that opened
+    /// it.
+    ///
+    /// `opener` is the broker-stamped sender of the call that carried the
+    /// handle (the unique name). A stream opened by anyone else, or an id that
+    /// does not exist, fails with the same [`Error::UnknownStream`], and the
+    /// stream stays available to its real owner.
+    pub fn accept_stream_from(
+        &self,
+        stream: &StreamRef,
+        opener: &BusName,
+    ) -> Result<StreamReader> {
+        self.inner
+            .streams
+            .take_reader_opened_by(&stream.id, opener)
     }
 
     /// Read a whole stream into memory, refusing to exceed
