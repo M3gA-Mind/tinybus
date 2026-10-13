@@ -56,6 +56,6 @@ cargo llvm-cov --workspace --all-features --ignore-filename-regex 'crates/tinybu
 terminal_tests=$(cargo test --locked -p tinybus-module --all-features --features tinybus/macros -- --list --ignored | sed -n 's/^\(terminal_runtime_tests::compiled_native_.*\): test$/\1/p')
 [ -n "$terminal_tests" ] || { echo "no compiled terminal scenarios found" >&2; exit 1; }
 while IFS= read -r test; do
-  cargo llvm-cov test --no-clean --no-report -p tinybus-module --all-features --features tinybus/macros "$test" -- --ignored --exact
+  cargo llvm-cov test --no-report -p tinybus-module --all-features --features tinybus/macros "$test" -- --ignored --exact
 done <<< "$terminal_tests"
 cargo llvm-cov report --ignore-filename-regex 'crates/tinybus/src/ports/(listener|transport)\.rs$|crates/tinybus/src/module/github\.rs$|crates/tinybus/src/module/(host|mod)\.rs$|crates/tinybus/src/bin/(tinybus\.rs|tinybus/unix\.rs)$|crates/tinybus/src/connection\.rs$|crates/tinybus/src/test_support\.rs$' --fail-under-file-lines 90
