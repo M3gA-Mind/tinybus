@@ -29,6 +29,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 use crate::module::failure::{FailureReporter, Reason};
+use crate::module::LinkedModule;
 use crate::module::manifest::ModuleManifest;
 use crate::module::platform::host_candidates;
 use crate::module::resolution::{self, Claim, Resolution, ResolutionState, Waited};
@@ -191,6 +192,12 @@ pub enum ModuleSource {
         /// Absolute path to the platform library.
         path: String,
     },
+    /// A module compiled into the host executable, from a factory registered in
+    /// [`ResolverInputs::linked`]. Admitted through the same descriptor,
+    /// manifest, dependency and init checks as a loaded library; the host
+    /// executable's digest is the attestation. A missing factory is a terminal
+    /// failure, never a silent fall back to the release.
+    Linked,
 }
 
 /// A module's state as a host reports it.
@@ -218,6 +225,9 @@ pub enum Availability {
 pub enum LoadError {
     /// Terminal for the process; a message fit for a user or a model.
     Failed(String),
+    /// Switched off by the host's [`ModuleGate`]. Nothing was downloaded,
+    /// mapped or registered. Carries the label the gate returned.
+    Disabled(&'static str),
     /// Still being downloaded, verified or initialised when the bound passed.
     /// Asking again later can succeed.
     StillLoading,
@@ -230,6 +240,7 @@ impl LoadError {
         match self {
             Self::Failed(message) => message,
             Self::StillLoading => "the module is still loading; try again shortly".to_string(),
+            Self::Disabled(label) => format!("the module is switched off by host policy ({label})"),
         }
     }
 }
@@ -245,6 +256,20 @@ pub type RuntimeProvider = Arc<dyn Fn() -> RuntimeFuture + Send + Sync>;
 /// Builds the configuration blob handed to a module when it is initialised.
 pub type ModuleConfigProvider = Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>;
 
+/// Decides, per module id, whether host policy switches the module off. Returns
+/// a short label (e.g. the setting that did it) when it is off, which the
+/// resolver returns as [`LoadError::Disabled`] before it resolves, reports or
+/// starts anything.
+pub type ModuleGate = Arc<dyn Fn(&str) -> Option<&'static str> + Send + Sync>;
+
+/// Called with a module id after its resolution finished, successfully or not,
+/// and before any caller waiting on it is released.
+pub type ResolvedHook = Arc<dyn Fn(&str) + Send + Sync>;
+
+/// Builds the [`LinkedModule`] compiled into the host for one module id. A plain
+/// `fn` so a registration carries no state.
+pub type LinkedFactory = fn() -> crate::Result<LinkedModule>;
+
 /// Plain inputs a host builds a [`Resolver`] from.
 pub struct ResolverInputs {
     /// Whether modules are enabled at all.
@@ -258,6 +283,16 @@ pub struct ResolverInputs {
     /// Per-module artifact sources. A module absent here, or `Pinned`, loads the
     /// pinned release.
     pub sources: HashMap<String, ModuleSource>,
+    /// Factories for modules linked into the host, consulted for a
+    /// [`ModuleSource::Linked`] source.
+    pub linked: HashMap<String, LinkedFactory>,
+    /// Library file stems the search-path rung must not open, e.g. the
+    /// libraries of modules the host has switched off.
+    pub search_skip: Vec<String>,
+    /// Host policy that switches modules off by id. `None` switches nothing off.
+    pub gate: Option<ModuleGate>,
+    /// Called when a resolution finishes, before waiting callers are released.
+    pub on_resolved: Option<ResolvedHook>,
     /// The compiled registry.
     pub records: Vec<&'static ReleaseRecord>,
     /// Sentence appended to every terminal loader error, e.g. "This is terminal
@@ -367,6 +402,14 @@ impl Resolver {
         let record = self
             .find(id)
             .ok_or_else(|| LoadError::Failed(format!("unknown module '{id}'")))?;
+        if let Some(label) = self.inner.gate.as_ref().and_then(|gate| gate(id)) {
+            tracing::debug!(
+                module = id,
+                label,
+                "[tinybus::module] refused: switched off by host policy"
+            );
+            return Err(LoadError::Disabled(label));
+        }
 
         let receiver = match resolution::global().claim(id) {
             Claim::Done(Resolution::Ready) => return Ok(()),
@@ -460,6 +503,9 @@ impl Resolver {
                     Resolution::Failed(reason)
                 }
             };
+            if let Some(hook) = &this.inner.on_resolved {
+                hook(id);
+            }
             resolution::global().complete(id, resolution, sender);
         };
         match self.runtime().await {
@@ -493,24 +539,38 @@ impl Resolver {
             return Ok(());
         }
 
-        // An override points at a developer's own build, checked before the
-        // pinned release so a module can be iterated on against a live host.
-        if let Some(ModuleSource::LocalFile { path }) = self.inner.sources.get(record.id) {
-            let path = PathBuf::from(path);
-            let module_config = (self.inner.module_config)(record.id);
-            return self
-                .blocking(move || Self::load_local(runtime, &path, record.id, module_config))
-                .await;
+        // An override points at a developer's own build, or at a module linked
+        // into the host. It is checked before the pinned release so a module can
+        // be iterated on against a live host.
+        match self.inner.sources.get(record.id) {
+            Some(ModuleSource::LocalFile { path }) => {
+                let path = PathBuf::from(path);
+                let module_config = (self.inner.module_config)(record.id);
+                return self
+                    .blocking(move || Self::load_local(runtime, &path, record.id, module_config))
+                    .await;
+            }
+            Some(ModuleSource::Linked) => {
+                let factory = self.inner.linked.get(record.id).copied();
+                let module_config = (self.inner.module_config)(record.id);
+                return self
+                    .blocking(move || {
+                        Self::load_linked(runtime, record.id, factory, module_config)
+                    })
+                    .await;
+            }
+            Some(ModuleSource::Pinned) | None => {}
         }
 
         // The search path tinybus itself honours. A refused search-path artifact
         // is ordinary (most directories hold nothing), so errors are dropped and
         // only a match on the bus name counts.
         let bus_name = record.bus_name;
+        let skip = self.inner.search_skip.clone();
         let found_on_search_path = tokio::task::spawn_blocking(move || {
             runtime
                 .host()
-                .load_search_paths()
+                .load_search_paths_except(&skip)
                 .into_iter()
                 .flatten()
                 .any(|info| info.manifest.bus_name.as_str() == bus_name)
@@ -608,6 +668,48 @@ impl Resolver {
             allow_download,
         };
         load_first_admitted(runtime.host(), &plan, module_config).map(|_| ())
+    }
+
+    /// Attach the module linked into this executable for `id`.
+    ///
+    /// Runs the same descriptor, manifest, dependency and init checks as a
+    /// released module, with the same private configuration. Errors carry static
+    /// text only.
+    ///
+    /// # Errors
+    ///
+    /// A terminal message when no factory is registered, the factory fails, or
+    /// admission refuses the module.
+    pub fn load_linked(
+        runtime: &ModuleRuntime,
+        id: &str,
+        factory: Option<LinkedFactory>,
+        module_config: serde_json::Value,
+    ) -> Result<(), String> {
+        let Some(factory) = factory else {
+            return Err(format!(
+                "module '{id}' is unavailable: no linked factory is registered in this binary"
+            ));
+        };
+        let module = factory().map_err(|error| {
+            tracing::warn!(module = id, %error, "[tinybus::module] linked factory failed");
+            format!("module '{id}' is unavailable: its linked factory could not be started")
+        })?;
+        match runtime
+            .host()
+            .attach_linked_with_config(module, module_config)
+        {
+            Ok(_) => {
+                tracing::info!(
+                    module = id,
+                    "[tinybus::module] loaded from the linked executable"
+                );
+                Ok(())
+            }
+            Err(error) => Err(format!(
+                "module '{id}' could not be attached from the linked executable: {error}"
+            )),
+        }
     }
 
     /// Load a platform library from `path`.

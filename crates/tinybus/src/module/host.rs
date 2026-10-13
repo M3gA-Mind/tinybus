@@ -921,6 +921,55 @@ impl ModuleHost {
         outcomes
     }
 
+    /// [`Self::load_search_paths`], minus artifacts whose file stem is in `skip`.
+    ///
+    /// A skipped artifact is never opened, so a library the host has switched
+    /// off is not mapped (and never unloaded) just by sitting on the path. A
+    /// directory with nothing to skip goes through [`Self::load_dir`] unchanged,
+    /// which keeps dependency ordering; only a directory holding a skipped
+    /// artifact is loaded file by file.
+    pub fn load_search_paths_except(&self, skip: &[String]) -> Vec<Result<ModuleInfo>> {
+        if skip.is_empty() {
+            return self.load_search_paths();
+        }
+        let is_skipped = |path: &Path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .is_some_and(|stem| skip.iter().any(|s| s == stem))
+        };
+        let mut outcomes = Vec::new();
+        for directory in Self::search_paths()
+            .into_iter()
+            .filter(|path| path.is_dir())
+        {
+            let mut files: Vec<PathBuf> = std::fs::read_dir(&directory)
+                .map(|entries| {
+                    entries
+                        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            files.sort();
+            if !files.iter().any(|file| is_skipped(file)) {
+                match self.load_dir(&directory) {
+                    Ok(results) => outcomes.extend(results),
+                    Err(error) => outcomes.push(Err(error)),
+                }
+                continue;
+            }
+            for file in files {
+                if is_skipped(&file) {
+                    tracing::debug!("[tinybus::module] search-path artifact skipped by host");
+                    continue;
+                }
+                if has_library_extension(&file) {
+                    outcomes.push(self.load_file(&file));
+                }
+            }
+        }
+        outcomes
+    }
+
     /// Inspect a directory without initializing or attaching any module.
     pub fn scan_dir(&self, directory: impl AsRef<Path>) -> Result<Vec<ModuleInfo>> {
         let directory = directory.as_ref();

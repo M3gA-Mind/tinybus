@@ -55,8 +55,8 @@ pub use host::callbacks::{
 pub use host::{ModuleHost, ModuleInfo, ModuleState};
 #[cfg(feature = "modules")]
 pub use resolve::{
-    Availability, LoadError, ModuleConfigProvider, ModuleSource, ReleaseRecord, Resolver,
-    ResolverInputs, RuntimeFuture, RuntimeProvider,
+    Availability, LinkedFactory, LoadError, ModuleConfigProvider, ModuleGate, ModuleSource,
+    ReleaseRecord, ResolvedHook, Resolver, ResolverInputs, RuntimeFuture, RuntimeProvider,
 };
 #[cfg(feature = "modules")]
 pub use runtime::{ModuleRuntime, RuntimeNames, RuntimeSetup};
