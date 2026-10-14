@@ -395,7 +395,11 @@ impl Connection {
             catch_observer: std::sync::RwLock::new(None),
             streams: StreamRegistry::new(),
         });
-        tokio::spawn(writer_loop(inner.transport.clone(), outbound));
+        tokio::spawn(writer_loop(
+            inner.transport.clone(),
+            outbound,
+            Arc::downgrade(&inner),
+        ));
         tokio::spawn(dispatch_loop(inner.clone()));
         Self {
             _close: Arc::new(CloseOnDrop(Some(inner.clone()))),
@@ -1407,13 +1411,62 @@ fn rule_to_wire(rule: &MatchRule) -> String {
 /// One task rather than "everyone writes concurrently" for two reasons: a
 /// synchronous publisher needs somewhere to hand a message to, and two
 /// concurrent writers on one transport risk interleaving frames.
-async fn writer_loop(transport: Arc<dyn Transport>, mut outbound: mpsc::Receiver<Message>) {
+///
+/// A transport that refuses one message with [`Error::Protocol`] (a frame over
+/// the size cap is the case in practice) has refused *that message*: nothing
+/// was written, so the link is still sound. The writer drops it and carries
+/// on; ending the task instead would silence the connection for good, so that
+/// every later send, including the replies to calls already in flight, would
+/// queue behind a writer that no longer exists. If the dropped message was a
+/// call, its caller is answered with the refusal now instead of waiting out its
+/// own timeout. Any other error means the transport itself failed and ends the
+/// writer.
+async fn writer_loop(
+    transport: Arc<dyn Transport>,
+    mut outbound: mpsc::Receiver<Message>,
+    inner: std::sync::Weak<Inner>,
+) {
     while let Some(message) = outbound.recv().await {
-        if let Err(e) = transport.send(message).await {
-            tracing::debug!(error = %e, "connection write failed; closing");
-            break;
+        let call =
+            (message.header.kind == MessageKind::MethodCall).then_some(message.header.serial);
+        match transport.send(message).await {
+            Ok(()) => {}
+            Err(refusal @ Error::Protocol(_)) => {
+                tracing::warn!(error = %refusal, "transport refused a message; dropping it");
+                if let (Some(serial), Some(inner)) = (call, inner.upgrade()) {
+                    refuse_call(&inner, serial, &refusal).await;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "connection write failed; closing");
+                break;
+            }
         }
     }
+}
+
+/// Answers the pending call `serial` with `refusal`, if it is still waiting.
+async fn refuse_call(inner: &Inner, serial: u64, refusal: &Error) {
+    let Some(pending) = inner.pending.lock().await.remove(&serial) else {
+        return;
+    };
+    let call = Header {
+        kind: MessageKind::MethodCall,
+        serial,
+        reply_serial: None,
+        sender: None,
+        expected_responder: None,
+        destination: None,
+        path: None,
+        interface: None,
+        member: None,
+        error_name: None,
+        confidential: false,
+        sensitive: false,
+        stream_reply: false,
+    };
+    // The caller may have given up already; nothing to do then.
+    let _ = pending.sender.send(Message::error_reply(&call, refusal));
 }
 
 /// The single reader task. Owns `recv`; never awaits user code inline.
@@ -1678,3 +1731,7 @@ mod reply_tests;
 #[cfg(test)]
 #[path = "connection_signal_tests.rs"]
 mod signal_tests;
+
+#[cfg(test)]
+#[path = "connection_writer_tests.rs"]
+mod writer_tests;
