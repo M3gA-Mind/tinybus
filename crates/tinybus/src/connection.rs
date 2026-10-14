@@ -1427,7 +1427,8 @@ async fn writer_loop(
     inner: std::sync::Weak<Inner>,
 ) {
     while let Some(message) = outbound.recv().await {
-        let call = (message.header.kind == MessageKind::MethodCall).then_some(message.header.serial);
+        let call =
+            (message.header.kind == MessageKind::MethodCall).then_some(message.header.serial);
         match transport.send(message).await {
             Ok(()) => {}
             Err(refusal @ Error::Protocol(_)) => {
