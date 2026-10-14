@@ -2,8 +2,29 @@
 
 use super::*;
 use crate::broker::Broker;
-use crate::message::codec::MAX_FRAME_LEN;
-use crate::transport::unix::{UnixListenerAdapter, UnixTransport};
+use crate::transport::memory::MemoryBus;
+
+/// Refuses any message addressed to `TooBig`, as a socket transport refuses a
+/// frame over the cap: with a protocol error, before anything is written.
+struct Refusing(Box<dyn Transport>);
+
+#[async_trait::async_trait]
+impl Transport for Refusing {
+    async fn send(&self, message: Message) -> Result<()> {
+        if message.header.member.as_ref().map(MemberName::as_str) == Some("TooBig") {
+            return Err(Error::protocol("frame exceeds the size cap"));
+        }
+        self.0.send(message).await
+    }
+
+    async fn recv(&self) -> Result<Option<Message>> {
+        self.0.recv().await
+    }
+
+    async fn close(&self) -> Result<()> {
+        self.0.close().await
+    }
+}
 
 struct Echo;
 
@@ -14,7 +35,9 @@ impl Interface for Echo {
     }
 
     fn members(&self) -> Vec<MemberName> {
-        vec![MemberName::new("Echo").unwrap()]
+        ["Echo", "TooBig"]
+            .map(|member| MemberName::new(member).unwrap())
+            .to_vec()
     }
 
     async fn call(&self, _member: &MemberName, args: Value) -> Result<Value> {
@@ -22,16 +45,17 @@ impl Interface for Echo {
     }
 }
 
-/// Two peers on a real socket bus, where the frame cap is enforced on write.
-async fn peers() -> (tempfile::TempDir, Connection, Connection) {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("bus");
-    let listener = UnixListenerAdapter::bind(&path).await.unwrap();
-    Broker::new().spawn(listener);
-    let client = Connection::connect(Box::new(UnixTransport::connect(&path).await.unwrap()))
-        .await
-        .unwrap();
-    let service = Connection::connect(Box::new(UnixTransport::connect(&path).await.unwrap()))
+async fn peers(refuse_on_client: bool) -> (Connection, Connection) {
+    let bus = MemoryBus::new();
+    Broker::new().spawn(bus.clone());
+    let link = bus.connect().await.unwrap();
+    let link: Box<dyn Transport> = if refuse_on_client {
+        Box::new(Refusing(link))
+    } else {
+        link
+    };
+    let client = Connection::connect(link).await.unwrap();
+    let service = Connection::connect(bus.connect().await.unwrap())
         .await
         .unwrap();
     service
@@ -39,7 +63,7 @@ async fn peers() -> (tempfile::TempDir, Connection, Connection) {
         .await
         .unwrap();
     service.request_name("test.Echo").await.unwrap();
-    (dir, client, service)
+    (client, service)
 }
 
 fn echo(client: &Connection) -> Proxy {
@@ -50,13 +74,12 @@ fn echo(client: &Connection) -> Proxy {
 }
 
 #[tokio::test]
-async fn a_call_over_the_frame_cap_fails_at_once_and_the_connection_keeps_working() {
-    let (_dir, client, _service) = peers().await;
+async fn a_call_the_transport_refuses_fails_at_once_and_the_connection_keeps_working() {
+    let (client, _service) = peers(true).await;
     let proxy = echo(&client);
 
-    let huge = "x".repeat(MAX_FRAME_LEN + 1);
     let started = std::time::Instant::now();
-    let refused = proxy.call::<Value>("Echo", (huge,)).await.unwrap_err();
+    let refused = proxy.call::<Value>("TooBig", (1,)).await.unwrap_err();
     // Answered with the refusal, not left to run into the call's own timeout.
     assert!(
         started.elapsed() < Duration::from_secs(5),
@@ -66,7 +89,7 @@ async fn a_call_over_the_frame_cap_fails_at_once_and_the_connection_keeps_workin
     match refused {
         Error::MethodFailed { name, message } => {
             assert_eq!(name, "ai.tinyhumans.tinybus.Error.Protocol");
-            assert!(message.contains("exceeds"), "{message}");
+            assert!(message.contains("size cap"), "{message}");
         }
         other => panic!("expected the refusal, got {other:?}"),
     }
@@ -79,17 +102,19 @@ async fn a_call_over_the_frame_cap_fails_at_once_and_the_connection_keeps_workin
 }
 
 #[tokio::test]
-async fn a_service_keeps_replying_after_one_of_its_messages_was_refused() {
-    let (_dir, client, service) = peers().await;
-    // The service's own writer takes the refusal: a signal over the cap.
-    let _ = service
+async fn a_refused_signal_does_not_stop_later_calls() {
+    let (client, _service) = peers(true).await;
+    // A refused message that is not a call has no caller to answer; the writer
+    // must still carry on.
+    client
         .emit(
             ObjectPath::new("/test/echo").unwrap(),
             InterfaceName::new("test.Echo").unwrap(),
-            MemberName::new("Big").unwrap(),
-            "x".repeat(MAX_FRAME_LEN + 1),
+            MemberName::new("TooBig").unwrap(),
+            1,
         )
-        .await;
+        .await
+        .unwrap();
     let echoed: Value = echo(&client).call("Echo", (7,)).await.unwrap();
     assert_eq!(echoed, serde_json::json!([7]));
 }

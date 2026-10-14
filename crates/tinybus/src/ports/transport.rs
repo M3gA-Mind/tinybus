@@ -27,6 +27,14 @@ use crate::message::Message;
 #[async_trait]
 pub trait Transport: std::any::Any + Send + Sync + 'static {
     /// Write one message. Must be safe to call from many tasks at once.
+    ///
+    /// [`Error::Protocol`](crate::Error::Protocol) means this one message was
+    /// refused *before any part of it reached the peer* (a frame over the size
+    /// cap is the case in practice), so the link is still sound and the
+    /// connection keeps writing the messages after it. A transport must return
+    /// any failure that may have left a partial or delivered frame (an I/O
+    /// error mid-write, a closed peer) as a different error, which ends the
+    /// connection's writer.
     async fn send(&self, message: Message) -> Result<()>;
 
     /// Read the next message, or `Ok(None)` once the peer has hung up cleanly.

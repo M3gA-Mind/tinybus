@@ -1732,7 +1732,6 @@ mod reply_tests;
 #[path = "connection_signal_tests.rs"]
 mod signal_tests;
 
-// The frame cap is enforced by the socket transport on write.
-#[cfg(all(test, feature = "uds", unix))]
+#[cfg(test)]
 #[path = "connection_writer_tests.rs"]
 mod writer_tests;
