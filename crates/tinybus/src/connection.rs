@@ -1730,3 +1730,7 @@ mod reply_tests;
 #[cfg(test)]
 #[path = "connection_signal_tests.rs"]
 mod signal_tests;
+
+#[cfg(test)]
+#[path = "connection_writer_tests.rs"]
+mod writer_tests;
