@@ -63,7 +63,6 @@ async fn a_call_over_the_frame_cap_fails_at_once_and_the_connection_keeps_workin
         "took {:?}",
         started.elapsed()
     );
-    eprintln!("REFUSED: {refused:?}");
     match refused {
         Error::MethodFailed { name, message } => {
             assert_eq!(name, "ai.tinyhumans.tinybus.Error.Protocol");
