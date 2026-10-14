@@ -812,9 +812,19 @@ async fn writer_task(transport: Arc<dyn Transport>, mut inbox: mpsc::Receiver<Me
         } else {
             transport.send(message).await
         };
-        if let Err(e) = result {
-            tracing::debug!(error = %e, "peer write failed; dropping the peer");
-            break;
+        match result {
+            Ok(()) => {}
+            // The transport refused this one message before writing any of it
+            // (the broker's own stamping can push a frame just under the cap
+            // over it). The peer is still reachable, so drop the message and
+            // keep delivering the ones behind it.
+            Err(e @ Error::Protocol(_)) => {
+                tracing::warn!(error = %e, "transport refused a message for a peer; dropping it");
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "peer write failed; dropping the peer");
+                break;
+            }
         }
     }
 }
@@ -887,3 +897,7 @@ mod tests;
 #[cfg(all(test, feature = "modules"))]
 #[path = "broker_module_control_tests.rs"]
 mod module_control_tests;
+
+#[cfg(test)]
+#[path = "broker_writer_tests.rs"]
+mod writer_tests;
