@@ -331,10 +331,10 @@ pub struct ResolverInputs {
     pub reporter: Arc<FailureReporter>,
 }
 
-/// Resolves registry records into serving modules. Cheap to clone.
 #[cfg(test)]
 type InitialAdmissionHook = Arc<dyn Fn(&'static ModuleRuntime, &ReleaseRecord) + Send + Sync>;
 
+/// Resolves registry records into serving modules. Cheap to clone.
 #[derive(Clone)]
 pub struct Resolver {
     inner: Arc<ResolverInputs>,
@@ -623,8 +623,7 @@ impl Resolver {
         // The search path tinybus itself honours. A refused search-path artifact
         // is ordinary (most directories hold nothing), so errors are dropped and
         // only an enabled, nonterminal match on the registry identity counts.
-        let bus_name = record.bus_name;
-        let object_path = record.object_path;
+        let requested_record = record;
         let skip = self.inner.search_skip.clone();
         let found_on_search_path = tokio::task::spawn_blocking(move || {
             runtime
@@ -632,18 +631,7 @@ impl Resolver {
                 .load_search_paths_except(&skip)
                 .into_iter()
                 .flatten()
-                .any(|info| {
-                    info.enabled
-                        && info.manifest.bus_name.as_str() == bus_name
-                        && info.manifest.object_path.as_str() == object_path
-                        && matches!(
-                            info.state,
-                            ModuleState::Resolved
-                                | ModuleState::Initializing
-                                | ModuleState::Ready
-                                | ModuleState::Serving
-                        )
-                })
+                .any(|info| is_live_match(&info, requested_record))
         })
         .await
         .unwrap_or(false);
