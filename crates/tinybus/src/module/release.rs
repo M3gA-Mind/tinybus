@@ -54,3 +54,7 @@ impl ReleaseRecord {
             .any(|key| self.asset_for(key).is_some())
     }
 }
+
+#[cfg(test)]
+#[path = "release_tests.rs"]
+mod tests;
