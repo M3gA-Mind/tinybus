@@ -336,7 +336,8 @@ pub struct ResolverInputs {
 pub struct Resolver {
     inner: Arc<ResolverInputs>,
     #[cfg(test)]
-    after_initial_host_check: Option<Arc<dyn Fn(&'static ModuleRuntime, &ReleaseRecord) + Send + Sync>>,
+    after_initial_host_check:
+        Option<Arc<dyn Fn(&'static ModuleRuntime, &ReleaseRecord) + Send + Sync>>,
 }
 
 impl Resolver {
@@ -672,17 +673,18 @@ impl Resolver {
         let module_config = (self.inner.module_config)(record.id);
         let cache_root = root.clone();
         let bundled = self.inner.bundled_dir.clone();
-        let result = self.blocking(move || {
-            Self::load_cached(
-                runtime,
-                record,
-                &cache_root,
-                &module_config,
-                allow_download,
-                bundled.as_deref(),
-            )
-        })
-        .await;
+        let result = self
+            .blocking(move || {
+                Self::load_cached(
+                    runtime,
+                    record,
+                    &cache_root,
+                    &module_config,
+                    allow_download,
+                    bundled.as_deref(),
+                )
+            })
+            .await;
         recover_admission(result, &runtime.host().list(), record)?;
         prune_stale_versions(&root, record.id, record.version);
         Ok(())

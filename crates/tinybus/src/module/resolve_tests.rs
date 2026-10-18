@@ -236,8 +236,7 @@ mod resolver {
 
     fn raced_search_module() -> crate::Result<LinkedModule> {
         let mut manifest = super::module("resolver_search_raced_module", &[], &[]);
-        manifest.bus_name =
-            crate::BusName::new("ai.tinyhumans.test.resolver_search_raced_module")?;
+        manifest.bus_name = crate::BusName::new("ai.tinyhumans.test.resolver_search_raced_module")?;
         manifest.object_path = crate::ObjectPath::new("/ai/tinyhumans/test/Module")?;
         Ok(LinkedModule {
             descriptor: crate::module::abi::TbAbiDescriptor::current(
@@ -304,12 +303,7 @@ mod resolver {
     async fn ensure_loaded_rechecks_host_after_search_before_touching_the_release_cache() {
         let record = record("resolver_search_raced_module");
         let dir = tempfile::tempdir().unwrap();
-        let mut f = fixture(
-            record,
-            true,
-            HashMap::new(),
-            Some(dir.path().to_path_buf()),
-        );
+        let mut f = fixture(record, true, HashMap::new(), Some(dir.path().to_path_buf()));
         let runtime = shared_runtime();
         f.resolver.after_initial_host_check = Some(Arc::new(|runtime, _| {
             runtime
@@ -353,12 +347,18 @@ mod resolver {
             wrong_path,
             wrong_bus,
             disabled,
-            admitted_info(record, ModuleState::Failed {
-                reason: "init failed".into(),
-            }),
-            admitted_info(record, ModuleState::Faulted {
-                reason: "faulted".into(),
-            }),
+            admitted_info(
+                record,
+                ModuleState::Failed {
+                    reason: "init failed".into(),
+                },
+            ),
+            admitted_info(
+                record,
+                ModuleState::Faulted {
+                    reason: "faulted".into(),
+                },
+            ),
             admitted_info(record, ModuleState::Stopped),
             admitted_info(record, ModuleState::Disabled),
         ] {
