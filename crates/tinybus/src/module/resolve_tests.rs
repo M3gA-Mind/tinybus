@@ -188,11 +188,32 @@ mod resolver {
         }
     }
 
+    unsafe extern "C" fn accept_raced_message(
+        _: *mut std::ffi::c_void,
+        _: *const u8,
+        _: usize,
+    ) -> i32 {
+        crate::module::abi::TB_OK
+    }
+
+    unsafe extern "C" fn stop_raced_module(_: *mut std::ffi::c_void, _: u64) -> i32 {
+        crate::module::abi::TB_OK
+    }
+
     unsafe extern "C" fn initialize_raced_module(
         _: *const crate::module::abi::TbHostVtable,
         module: *mut crate::module::abi::TbModuleVtable,
     ) -> i32 {
-        unsafe { *module = crate::module::abi::TbModuleVtable::default() };
+        unsafe {
+            *module = crate::module::abi::TbModuleVtable {
+                size: std::mem::size_of::<crate::module::abi::TbModuleVtable>() as u32,
+                _reserved: 0,
+                module_ctx: std::ptr::null_mut(),
+                deliver: accept_raced_message,
+                shutdown: stop_raced_module,
+                reinitialize: None,
+            }
+        };
         crate::module::abi::TB_OK
     }
 
@@ -200,7 +221,6 @@ mod resolver {
         let mut manifest = super::module("resolver_raced_module", &[], &[]);
         manifest.bus_name = crate::BusName::new("ai.tinyhumans.test.resolver_raced_module")?;
         manifest.object_path = crate::ObjectPath::new("/ai/tinyhumans/test/Module")?;
-        manifest.lazy_init = true;
         Ok(LinkedModule {
             descriptor: crate::module::abi::TbAbiDescriptor::current(
                 "resolver_raced_module",
@@ -216,7 +236,6 @@ mod resolver {
         manifest.bus_name =
             crate::BusName::new("ai.tinyhumans.test.resolver_search_raced_module")?;
         manifest.object_path = crate::ObjectPath::new("/ai/tinyhumans/test/Module")?;
-        manifest.lazy_init = true;
         Ok(LinkedModule {
             descriptor: crate::module::abi::TbAbiDescriptor::current(
                 "resolver_search_raced_module",

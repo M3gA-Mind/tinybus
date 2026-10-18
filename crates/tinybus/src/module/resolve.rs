@@ -43,10 +43,14 @@ use crate::module::{
 
 fn recover_admission(
     result: Result<(), String>,
-    _modules: &[ModuleInfo],
-    _record: &ReleaseRecord,
+    modules: &[ModuleInfo],
+    record: &ReleaseRecord,
 ) -> Result<(), String> {
-    result
+    if result.is_err() && modules.iter().any(|info| is_live_match(info, record)) {
+        Ok(())
+    } else {
+        result
+    }
 }
 
 fn is_live_match(info: &ModuleInfo, record: &ReleaseRecord) -> bool {
@@ -641,6 +645,11 @@ impl Resolver {
         .await
         .unwrap_or(false);
         if found_on_search_path {
+            return Ok(());
+        }
+        // A direct host load can win admission while the search-path rung is
+        // running. Observe it before beginning a download or cache load.
+        if is_live_match(&runtime.host().list(), record) {
             return Ok(());
         }
 
