@@ -332,12 +332,14 @@ pub struct ResolverInputs {
 }
 
 /// Resolves registry records into serving modules. Cheap to clone.
+#[cfg(test)]
+type InitialAdmissionHook = Arc<dyn Fn(&'static ModuleRuntime, &ReleaseRecord) + Send + Sync>;
+
 #[derive(Clone)]
 pub struct Resolver {
     inner: Arc<ResolverInputs>,
     #[cfg(test)]
-    after_initial_host_check:
-        Option<Arc<dyn Fn(&'static ModuleRuntime, &ReleaseRecord) + Send + Sync>>,
+    after_initial_host_check: Option<InitialAdmissionHook>,
 }
 
 impl Resolver {
