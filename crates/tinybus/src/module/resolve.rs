@@ -622,7 +622,7 @@ impl Resolver {
 
         // The search path tinybus itself honours. A refused search-path artifact
         // is ordinary (most directories hold nothing), so errors are dropped and
-        // only a match on the bus name counts.
+        // only an enabled, nonterminal match on the registry identity counts.
         let bus_name = record.bus_name;
         let object_path = record.object_path;
         let skip = self.inner.search_skip.clone();
