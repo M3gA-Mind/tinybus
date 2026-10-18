@@ -675,7 +675,9 @@ impl Resolver {
                 )
             })
             .await;
-        recover_admission(result, &runtime.host().list(), record)?;
+        if let Err(error) = result {
+            return recover_admission(Err(error), &runtime.host().list(), record);
+        }
         prune_stale_versions(&root, record.id, record.version);
         Ok(())
     }
