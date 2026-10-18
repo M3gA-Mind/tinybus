@@ -1,4 +1,5 @@
 use super::*;
+use std::io::Write;
 
 #[test]
 fn github_tag_urls_parse_without_accepting_other_hosts_or_paths() {
@@ -105,4 +106,133 @@ fn a_verified_cache_answers_without_the_network() {
     .unwrap();
     assert_eq!(found, std::fs::canonicalize(module).unwrap());
     assert_eq!(sha256, digest);
+}
+
+#[test]
+/// Extracts a valid archive while preserving its directory structure and bytes.
+fn zip_archives_extract_only_enclosed_regular_files_and_directories() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive_path = directory.path().join("release.zip");
+    let destination = directory.path().join("extracted");
+    std::fs::create_dir(&destination).unwrap();
+
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut archive = zip::ZipWriter::new(file);
+    archive
+        .add_directory("nested/", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    archive
+        .start_file("nested/module.so", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    archive.write_all(b"module bytes").unwrap();
+    archive.finish().unwrap();
+
+    extract("release.zip", &archive_path, &destination).unwrap();
+
+    assert!(destination.join("nested").is_dir());
+    assert_eq!(
+        std::fs::read(destination.join("nested/module.so")).unwrap(),
+        b"module bytes"
+    );
+}
+
+#[test]
+/// Rejects traversal entries without writing outside the extraction directory.
+fn zip_archives_refuse_paths_outside_the_destination() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive_path = directory.path().join("release.zip");
+    let destination = directory.path().join("extracted");
+    std::fs::create_dir(&destination).unwrap();
+
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut archive = zip::ZipWriter::new(file);
+    archive
+        .start_file("../outside", zip::write::SimpleFileOptions::default())
+        .unwrap();
+    archive.write_all(b"outside").unwrap();
+    archive.finish().unwrap();
+
+    assert!(extract("release.zip", &archive_path, &destination).is_err());
+    assert!(!directory.path().join("outside").exists());
+}
+
+#[cfg(unix)]
+#[test]
+/// Rejects symlink entries without creating a link or following its target.
+fn zip_archives_refuse_symlink_entries() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive_path = directory.path().join("release.zip");
+    let destination = directory.path().join("extracted");
+    std::fs::create_dir(&destination).unwrap();
+
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut archive = zip::ZipWriter::new(file);
+    archive
+        .add_symlink(
+            "module.so",
+            "../../outside",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+    archive.finish().unwrap();
+
+    assert!(extract("release.zip", &archive_path, &destination).is_err());
+    assert!(!directory.path().join("outside").exists());
+    assert!(!destination.join("module.so").exists());
+}
+
+#[cfg(unix)]
+#[test]
+/// Rejects Unix special-file entries instead of materializing them.
+fn zip_archives_refuse_special_file_entries() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive_path = directory.path().join("release.zip");
+    let destination = directory.path().join("extracted");
+    std::fs::create_dir(&destination).unwrap();
+
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut archive = zip::ZipWriter::new(file);
+    archive
+        .start_file(
+            "module.so",
+            zip::write::SimpleFileOptions::default().external_attributes((0o010644_u32) << 16),
+        )
+        .unwrap();
+    archive.write_all(b"not a regular file").unwrap();
+    archive.finish().unwrap();
+
+    assert!(extract("release.zip", &archive_path, &destination).is_err());
+    assert!(!destination.join("module.so").exists());
+}
+
+#[cfg(unix)]
+#[test]
+/// Extracts regular files without applying archived executable or setuid bits.
+fn zip_archives_do_not_apply_setuid_or_executable_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let archive_path = directory.path().join("release.zip");
+    let destination = directory.path().join("extracted");
+    std::fs::create_dir(&destination).unwrap();
+
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut archive = zip::ZipWriter::new(file);
+    archive
+        .start_file(
+            "module.so",
+            zip::write::SimpleFileOptions::default().unix_permissions(0o4755),
+        )
+        .unwrap();
+    archive.write_all(b"module bytes").unwrap();
+    archive.finish().unwrap();
+
+    extract("release.zip", &archive_path, &destination).unwrap();
+
+    let mode = std::fs::metadata(destination.join("module.so"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o7000, 0, "special permission bits are not applied");
+    assert_eq!(mode & 0o111, 0, "executable permission is not applied");
 }

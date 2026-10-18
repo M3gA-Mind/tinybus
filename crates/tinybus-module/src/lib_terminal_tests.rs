@@ -667,6 +667,15 @@ async fn actual_linked_factory_failure_disposes_received_config_on_physical_work
         );
         assert!(!view.is_live());
         if mode == 1 {
+            // Completion is published before the worker retires the registry
+            // anchor; wait for that separate cleanup before asserting absence.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while terminal::TerminalState::lookup(view.inner.context()).is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("physical completion must retire its terminal anchor");
             assert!(terminal::TerminalState::lookup(view.inner.context()).is_none());
         } else {
             assert!(terminal::TerminalState::lookup(view.inner.context()).is_some());
@@ -878,6 +887,12 @@ unsafe extern "C" fn native_event(ctx: *mut c_void, event: u32, value: u32) {
     let sender = unsafe { &*ctx.cast::<std::sync::mpsc::Sender<(u32, u32)>>() };
     let _ = sender.send((event, value));
 }
+
+/// Invokes a stale-context ABI probe through a non-inlined test helper.
+fn call_probe(token: usize, probe: extern "C" fn(usize) -> i32) -> i32 {
+    probe(token)
+}
+
 // Only fixture symbols are looked up; TinyBus itself verifies/adopts the pinned
 // private artifact through the actual ModuleHost loader first. It remains mapped.
 #[cfg(unix)]
@@ -1025,7 +1040,7 @@ async fn compiled_native_terminal_owns_initial_cancellation_panics_join_and_stal
                 break;
             }
         }
-        let stale_result = old_context.map(|token| old_probe(token));
+        let stale_result = old_context.map(|token| call_probe(token, old_probe));
         host.shutdown(Duration::from_secs(5)).await;
         while !seen.iter().any(|(event, _)| *event == 6) {
             seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
@@ -2276,7 +2291,7 @@ async fn compiled_native_retained_views_bound_256_and_release_only_at_actual_las
     let replacement_result =
         replacement.load_file_with_config(&path, native_controls_config(0, &controls));
     let new_token = context();
-    let stale = first_token.map(|token| probe(token));
+    let stale = first_token.map(|token| call_probe(token, probe));
     let before = drops();
     replacement.shutdown(Duration::from_secs(5)).await;
     let mut replacement_settled = false;

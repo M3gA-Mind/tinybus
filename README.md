@@ -3,6 +3,11 @@
 A zbus-style message bus that keeps external integrations out of the OpenHuman
 kernel's dependency graph.
 
+The `tinybus` and `tinybus-module` crates require Rust 1.88. The optional
+`modules` feature uses `zip` 9, which has that minimum, and `tinybus-module`
+depends on `tinybus`. `tinybus-macros` retains the workspace's Rust 1.85
+minimum.
+
 ## The problem
 
 OpenHuman's dependency graph grew by absorption. Its `Cargo.toml` currently

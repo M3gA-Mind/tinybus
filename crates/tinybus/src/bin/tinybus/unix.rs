@@ -500,14 +500,16 @@ async fn connect(address: &Path) -> Result<Connection> {
 /// `$XDG_RUNTIME_DIR` before `/tmp` on purpose — the socket is a capability
 /// handle to every integration, and the runtime dir is the only one of the two
 /// that is private to the user by default.
+/// Without a non-empty runtime directory, the per-user fallback is
+/// `/tmp/tinybus-<uid>/bus`.
 fn resolve_address(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);
     }
-    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR") {
-        if !dir.is_empty() {
-            return Ok(PathBuf::from(dir).join("tinybus").join("bus"));
-        }
+    if let Ok(dir) = std::env::var("XDG_RUNTIME_DIR")
+        && !dir.is_empty()
+    {
+        return Ok(PathBuf::from(dir).join("tinybus").join("bus"));
     }
     let uid = unsafe { libc_getuid() };
     Ok(PathBuf::from(format!("/tmp/tinybus-{uid}/bus")))

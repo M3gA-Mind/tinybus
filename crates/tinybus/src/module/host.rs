@@ -1473,6 +1473,7 @@ impl ModuleControl for ModuleHostInner {
         Ok((info, transition))
     }
 
+    /// Stops the loaded module named `name`, bounding shutdown by `deadline`.
     async fn stop(&self, name: &str, deadline: Duration) -> Result<ModuleInfo> {
         self.stop_inner(name, deadline).await
     }
@@ -1540,17 +1541,16 @@ impl ModuleControl for ModuleHostInner {
             (module.transport.clone(), module.callback_state.clone())
         };
         let _lifecycle_busy = LifecycleBusyGuard::for_stop(self, name, transport.clone());
-        if let Some(callbacks) = callbacks {
-            if let Err(error) = callbacks
+        if let Some(callbacks) = callbacks
+            && let Err(error) = callbacks
                 .drain(deadline.saturating_sub(started.elapsed()))
                 .await
-            {
-                let mut loaded = self.loaded.lock().expect("module list lock");
-                if let Some(module) = loaded.iter_mut().find(|module| module.info.name == name) {
-                    module.transition_from = None;
-                }
-                return Err(error);
+        {
+            let mut loaded = self.loaded.lock().expect("module list lock");
+            if let Some(module) = loaded.iter_mut().find(|module| module.info.name == name) {
+                module.transition_from = None;
             }
+            return Err(error);
         }
         let stopped = transport
             .stop(deadline.saturating_sub(started.elapsed()))
@@ -1727,16 +1727,17 @@ impl ModuleControl for ModuleHostInner {
         Ok((loaded, transitions))
     }
 
+    /// Updates module state after `unique_name` disconnects and returns any transition to publish.
     fn peer_detached(&self, unique_name: &BusName) -> Option<(String, ModuleState, ModuleState)> {
         let mut loaded = self.loaded.lock().expect("module list lock");
         let module = loaded
             .iter_mut()
             .find(|module| &module.unique_name == unique_name)?;
-        if !module.transport.is_faulted() {
-            if let Some(old) = module.transition_from.take() {
-                module.info.state = ModuleState::Stopped;
-                return Some((module.info.name.clone(), old, ModuleState::Stopped));
-            }
+        if !module.transport.is_faulted()
+            && let Some(old) = module.transition_from.take()
+        {
+            module.info.state = ModuleState::Stopped;
+            return Some((module.info.name.clone(), old, ModuleState::Stopped));
         }
         if !module.transport.is_faulted()
             || matches!(
