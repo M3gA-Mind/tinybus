@@ -878,6 +878,11 @@ unsafe extern "C" fn native_event(ctx: *mut c_void, event: u32, value: u32) {
     let sender = unsafe { &*ctx.cast::<std::sync::mpsc::Sender<(u32, u32)>>() };
     let _ = sender.send((event, value));
 }
+
+fn call_probe(token: usize, probe: extern "C" fn(usize) -> i32) -> i32 {
+    probe(token)
+}
+
 // Only fixture symbols are looked up; TinyBus itself verifies/adopts the pinned
 // private artifact through the actual ModuleHost loader first. It remains mapped.
 #[cfg(unix)]
