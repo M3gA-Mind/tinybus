@@ -667,6 +667,8 @@ async fn actual_linked_factory_failure_disposes_received_config_on_physical_work
         );
         assert!(!view.is_live());
         if mode == 1 {
+            // Completion is published before the worker retires the registry
+            // anchor; wait for that separate cleanup before asserting absence.
             tokio::time::timeout(Duration::from_secs(5), async {
                 while terminal::TerminalState::lookup(view.inner.context()).is_some() {
                     tokio::task::yield_now().await;
