@@ -32,6 +32,7 @@ use crate::Proxy;
 use crate::module::LinkedModule;
 use crate::module::client::{AccessFuture, ModuleAccess, ProxyFailure};
 use crate::module::failure::{FailureReporter, Reason};
+use crate::module::host::{ModuleInfo, ModuleState};
 use crate::module::manifest::ModuleManifest;
 use crate::module::platform::host_candidates;
 use crate::module::resolution::{self, Claim, Resolution, ResolutionState, Waited};
@@ -39,6 +40,31 @@ use crate::module::runtime::ModuleRuntime;
 use crate::module::{
     ReleaseAsset, ReleasePlan, ReleaseRecord, load_first_admitted, prune_stale_versions,
 };
+
+fn recover_admission(
+    result: Result<(), String>,
+    modules: &[ModuleInfo],
+    record: &ReleaseRecord,
+) -> Result<(), String> {
+    if result.is_err() && modules.iter().any(|info| is_live_match(info, record)) {
+        Ok(())
+    } else {
+        result
+    }
+}
+
+fn is_live_match(info: &ModuleInfo, record: &ReleaseRecord) -> bool {
+    info.enabled
+        && info.manifest.bus_name.as_str() == record.bus_name
+        && info.manifest.object_path.as_str() == record.object_path
+        && matches!(
+            info.state,
+            ModuleState::Resolved
+                | ModuleState::Initializing
+                | ModuleState::Ready
+                | ModuleState::Serving
+        )
+}
 
 /// Result indexes refer to the input manifest slice.
 pub(crate) struct LoadOrder {
@@ -305,10 +331,15 @@ pub struct ResolverInputs {
     pub reporter: Arc<FailureReporter>,
 }
 
+#[cfg(test)]
+type InitialAdmissionHook = Arc<dyn Fn(&'static ModuleRuntime, &ReleaseRecord) + Send + Sync>;
+
 /// Resolves registry records into serving modules. Cheap to clone.
 #[derive(Clone)]
 pub struct Resolver {
     inner: Arc<ResolverInputs>,
+    #[cfg(test)]
+    after_initial_host_check: Option<InitialAdmissionHook>,
 }
 
 impl Resolver {
@@ -317,6 +348,8 @@ impl Resolver {
     pub fn new(inputs: ResolverInputs) -> Self {
         Self {
             inner: Arc::new(inputs),
+            #[cfg(test)]
+            after_initial_host_check: None,
         }
     }
 
@@ -559,6 +592,11 @@ impl Resolver {
             return Ok(());
         }
 
+        #[cfg(test)]
+        if let Some(hook) = &self.after_initial_host_check {
+            hook(runtime, record);
+        }
+
         // An override points at a developer's own build, or at a module linked
         // into the host. It is checked before the pinned release so a module can
         // be iterated on against a live host.
@@ -566,24 +604,26 @@ impl Resolver {
             Some(ModuleSource::LocalFile { path }) => {
                 let path = PathBuf::from(path);
                 let module_config = (self.inner.module_config)(record.id);
-                return self
+                let result = self
                     .blocking(move || Self::load_local(runtime, &path, record.id, module_config))
                     .await;
+                return recover_admission(result, &runtime.host().list(), record);
             }
             Some(ModuleSource::Linked) => {
                 let factory = self.inner.linked.get(record.id).copied();
                 let module_config = (self.inner.module_config)(record.id);
-                return self
+                let result = self
                     .blocking(move || Self::load_linked(runtime, record, factory, module_config))
                     .await;
+                return recover_admission(result, &runtime.host().list(), record);
             }
             Some(ModuleSource::Pinned) | None => {}
         }
 
         // The search path tinybus itself honours. A refused search-path artifact
         // is ordinary (most directories hold nothing), so errors are dropped and
-        // only a match on the bus name counts.
-        let bus_name = record.bus_name;
+        // only an enabled, nonterminal match on the registry identity counts.
+        let requested_record = record;
         let skip = self.inner.search_skip.clone();
         let found_on_search_path = tokio::task::spawn_blocking(move || {
             runtime
@@ -591,11 +631,21 @@ impl Resolver {
                 .load_search_paths_except(&skip)
                 .into_iter()
                 .flatten()
-                .any(|info| info.manifest.bus_name.as_str() == bus_name)
+                .any(|info| is_live_match(&info, requested_record))
         })
         .await
         .unwrap_or(false);
         if found_on_search_path {
+            return Ok(());
+        }
+        // A direct host load can win admission while the search-path rung is
+        // running. Observe it before beginning a download or cache load.
+        if runtime
+            .host()
+            .list()
+            .iter()
+            .any(|info| is_live_match(info, record))
+        {
             return Ok(());
         }
 
@@ -603,26 +653,31 @@ impl Resolver {
         // download into the same place. Off the runtime worker, because the cold
         // path fetches, hashes, extracts and `dlopen`s synchronously.
         let Some(root) = self.inner.install_dir.clone() else {
-            return Err(format!(
+            let error = Err(format!(
                 "module '{}' is unavailable: no directory is available to install modules into",
                 record.id
             ));
+            return recover_admission(error, &runtime.host().list(), record);
         };
         let allow_download = self.inner.allow_download;
         let module_config = (self.inner.module_config)(record.id);
         let cache_root = root.clone();
         let bundled = self.inner.bundled_dir.clone();
-        self.blocking(move || {
-            Self::load_cached(
-                runtime,
-                record,
-                &cache_root,
-                &module_config,
-                allow_download,
-                bundled.as_deref(),
-            )
-        })
-        .await?;
+        let result = self
+            .blocking(move || {
+                Self::load_cached(
+                    runtime,
+                    record,
+                    &cache_root,
+                    &module_config,
+                    allow_download,
+                    bundled.as_deref(),
+                )
+            })
+            .await;
+        if let Err(error) = result {
+            return recover_admission(Err(error), &runtime.host().list(), record);
+        }
         prune_stale_versions(&root, record.id, record.version);
         Ok(())
     }

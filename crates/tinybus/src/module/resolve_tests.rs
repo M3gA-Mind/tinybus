@@ -172,6 +172,263 @@ mod resolver {
         }))
     }
 
+    fn admitted_info(record: &ReleaseRecord, state: ModuleState) -> ModuleInfo {
+        let mut manifest = super::module(record.id, &[], &[]);
+        manifest.bus_name = crate::BusName::new(record.bus_name).unwrap();
+        manifest.object_path = crate::ObjectPath::new(record.object_path).unwrap();
+        ModuleInfo {
+            name: manifest.module.name.clone(),
+            version: manifest.module.version.to_string(),
+            file: "module.dylib".into(),
+            state,
+            manifest,
+            rustc_version: String::new(),
+            rustc_mismatch: false,
+            enabled: true,
+        }
+    }
+
+    unsafe extern "C" fn accept_raced_message(
+        _: *mut std::ffi::c_void,
+        _: *const u8,
+        _: usize,
+    ) -> i32 {
+        crate::module::abi::TB_OK
+    }
+
+    unsafe extern "C" fn stop_raced_module(ctx: *mut std::ffi::c_void, _: u64) -> i32 {
+        if !ctx.is_null() {
+            drop(unsafe { Box::from_raw(ctx.cast::<()>()) });
+        }
+        crate::module::abi::TB_OK
+    }
+
+    unsafe extern "C" fn initialize_raced_module(
+        host: *const crate::module::abi::TbHostVtable,
+        module: *mut crate::module::abi::TbModuleVtable,
+    ) -> i32 {
+        let host = unsafe { *host };
+        unsafe {
+            *module = crate::module::abi::TbModuleVtable {
+                size: crate::module::abi::TB_MODULE_VTABLE_BASE_SIZE,
+                _reserved: 0,
+                module_ctx: Box::into_raw(Box::new(())).cast(),
+                deliver: accept_raced_message,
+                shutdown: stop_raced_module,
+                reinitialize: None,
+            }
+        };
+        unsafe { (host.ready)(host.host_ctx) };
+        crate::module::abi::TB_OK
+    }
+
+    fn raced_module() -> crate::Result<LinkedModule> {
+        let mut manifest = super::module("resolver_raced_module", &[], &[]);
+        manifest.bus_name = crate::BusName::new("ai.tinyhumans.test.resolver_raced_module")?;
+        manifest.object_path = crate::ObjectPath::new("/ai/tinyhumans/test/Module")?;
+        Ok(LinkedModule {
+            descriptor: crate::module::abi::TbAbiDescriptor::current(
+                "resolver_raced_module",
+                "1.0.0",
+            ),
+            manifest,
+            init: initialize_raced_module,
+        })
+    }
+
+    fn raced_search_module() -> crate::Result<LinkedModule> {
+        let mut manifest = super::module("resolver_search_raced_module", &[], &[]);
+        manifest.bus_name = crate::BusName::new("ai.tinyhumans.test.resolver_search_raced_module")?;
+        manifest.object_path = crate::ObjectPath::new("/ai/tinyhumans/test/Module")?;
+        Ok(LinkedModule {
+            descriptor: crate::module::abi::TbAbiDescriptor::current(
+                "resolver_search_raced_module",
+                "1.0.0",
+            ),
+            manifest,
+            init: initialize_raced_module,
+        })
+    }
+
+    fn raced_cache_module() -> crate::Result<LinkedModule> {
+        let mut manifest = super::module("resolver_cache_raced_module", &[], &[]);
+        manifest.bus_name = crate::BusName::new("ai.tinyhumans.test.resolver_cache_raced_module")?;
+        manifest.object_path = crate::ObjectPath::new("/ai/tinyhumans/test/Module")?;
+        Ok(LinkedModule {
+            descriptor: crate::module::abi::TbAbiDescriptor::current(
+                "resolver_cache_raced_module",
+                "1.0.0",
+            ),
+            manifest,
+            init: initialize_raced_module,
+        })
+    }
+
+    #[test]
+    fn a_duplicate_admission_error_recovers_when_the_requested_module_is_initializing() {
+        let record = record("resolver_raced_admission");
+        // This snapshot is taken after a competing host path won admission but
+        // before this resolver's load attempt returned its duplicate-name error.
+        let modules = [admitted_info(record, ModuleState::Initializing)];
+        let result = recover_admission(
+            Err("module name is already loaded".into()),
+            &modules,
+            record,
+        );
+        assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_recovers_when_direct_host_admission_wins_after_its_initial_check() {
+        let record = record("resolver_raced_module");
+        let sources = HashMap::from([(record.id.to_string(), ModuleSource::Linked)]);
+        let mut f = fixture(record, true, sources.clone(), None);
+        let runtime = shared_runtime();
+        f.resolver = Resolver::new(ResolverInputs {
+            enabled: true,
+            install_dir: None,
+            allow_download: false,
+            bundled_dir: None,
+            sources,
+            linked: HashMap::from([(record.id.to_string(), raced_module as LinkedFactory)]),
+            search_skip: Vec::new(),
+            gate: None,
+            on_resolved: None,
+            records: vec![record],
+            terminal_marker: "This is terminal for the running process".into(),
+            runtime: Arc::new(|| Box::pin(async { Ok(shared_runtime()) })),
+            module_config: Arc::new(|_| serde_json::json!({})),
+            reporter: Arc::new(FailureReporter::new(f.sink.clone())),
+        });
+        f.resolver.after_initial_host_check = Some(Arc::new(|runtime, _| {
+            runtime
+                .host()
+                .attach_linked_with_config(raced_module().unwrap(), serde_json::json!({}))
+                .unwrap();
+        }));
+
+        assert_eq!(f.resolver.ensure_loaded(record.id).await, Ok(()));
+        assert!(runtime.host().list().iter().any(|info| {
+            info.manifest.bus_name.as_str() == record.bus_name
+                && info.manifest.object_path.as_str() == record.object_path
+        }));
+        assert_eq!(f.resolver.state_of(record.id), Availability::Ready);
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_rechecks_host_after_search_before_touching_the_release_cache() {
+        let record = record("resolver_search_raced_module");
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = fixture(record, true, HashMap::new(), Some(dir.path().to_path_buf()));
+        let runtime = shared_runtime();
+        f.resolver.after_initial_host_check = Some(Arc::new(|runtime, _| {
+            runtime
+                .host()
+                .attach_linked_with_config(raced_search_module().unwrap(), serde_json::json!({}))
+                .unwrap();
+        }));
+
+        assert_eq!(f.resolver.ensure_loaded(record.id).await, Ok(()));
+        assert!(runtime.host().list().iter().any(|info| {
+            info.manifest.bus_name.as_str() == record.bus_name
+                && info.manifest.object_path.as_str() == record.object_path
+        }));
+        assert_eq!(
+            f.config_calls.load(Ordering::SeqCst),
+            0,
+            "the release-cache rung ran after the module was admitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovering_after_a_cache_error_does_not_prune_other_cached_versions() {
+        let record = record("resolver_cache_raced_module");
+        let install_dir = tempfile::tempdir().unwrap();
+        let stale = install_dir.path().join(record.id).join("old-version");
+        std::fs::create_dir_all(&stale).unwrap();
+        let marker = stale.join("preserve-me");
+        std::fs::write(&marker, "cached by the other host load").unwrap();
+        let sink = Arc::new(Recording::default());
+        let runtime = shared_runtime();
+        let resolver = Resolver::new(ResolverInputs {
+            enabled: true,
+            install_dir: Some(install_dir.path().to_path_buf()),
+            allow_download: false,
+            bundled_dir: None,
+            sources: HashMap::new(),
+            linked: HashMap::new(),
+            search_skip: Vec::new(),
+            gate: None,
+            on_resolved: None,
+            records: vec![record],
+            terminal_marker: "This is terminal for the running process".into(),
+            runtime: Arc::new(|| Box::pin(async { Ok(shared_runtime()) })),
+            module_config: Arc::new(move |_| {
+                runtime
+                    .host()
+                    .attach_linked_with_config(raced_cache_module().unwrap(), serde_json::json!({}))
+                    .unwrap();
+                serde_json::json!({})
+            }),
+            reporter: Arc::new(FailureReporter::new(sink)),
+        });
+
+        assert_eq!(resolver.ensure_loaded(record.id).await, Ok(()));
+        assert!(runtime.host().list().iter().any(|info| {
+            info.manifest.bus_name.as_str() == record.bus_name
+                && info.manifest.object_path.as_str() == record.object_path
+        }));
+        assert!(
+            marker.exists(),
+            "a recovered cache failure pruned its sibling cache"
+        );
+    }
+
+    #[test]
+    fn admission_recovery_requires_the_exact_enabled_nonterminal_module() {
+        let record = record("resolver_raced_admission_guards");
+        let error = "module name is already loaded".to_string();
+        let wrong_path = {
+            let mut info = admitted_info(record, ModuleState::Ready);
+            info.manifest.object_path = crate::ObjectPath::new("/other/module").unwrap();
+            info
+        };
+        let wrong_bus = {
+            let mut info = admitted_info(record, ModuleState::Ready);
+            info.manifest.bus_name = crate::BusName::new("ai.tinyhumans.module.Other").unwrap();
+            info
+        };
+        let disabled = {
+            let mut info = admitted_info(record, ModuleState::Ready);
+            info.enabled = false;
+            info
+        };
+        for info in [
+            wrong_path,
+            wrong_bus,
+            disabled,
+            admitted_info(
+                record,
+                ModuleState::Failed {
+                    reason: "init failed".into(),
+                },
+            ),
+            admitted_info(
+                record,
+                ModuleState::Faulted {
+                    reason: "faulted".into(),
+                },
+            ),
+            admitted_info(record, ModuleState::Stopped),
+            admitted_info(record, ModuleState::Disabled),
+        ] {
+            assert_eq!(
+                recover_admission(Err(error.clone()), &[info], record),
+                Err(error.clone())
+            );
+        }
+    }
+
     struct Fixture {
         sink: Arc<Recording>,
         config_calls: Arc<AtomicUsize>,
