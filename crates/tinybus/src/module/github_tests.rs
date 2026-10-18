@@ -191,8 +191,7 @@ fn zip_archives_refuse_special_file_entries() {
     archive
         .start_file(
             "module.so",
-            zip::write::SimpleFileOptions::default()
-                .external_attributes((0o010644_u32) << 16),
+            zip::write::SimpleFileOptions::default().external_attributes((0o010644_u32) << 16),
         )
         .unwrap();
     archive.write_all(b"not a regular file").unwrap();

@@ -426,7 +426,9 @@ fn extract(name: &str, archive: &Path, destination: &Path) -> Result<()> {
             let unix_file_type = entry.unix_mode().unwrap_or_default() & 0o170000;
             let allowed_file_type = if entry.is_dir() { 0o040000 } else { 0o100000 };
             if unix_file_type != 0 && unix_file_type != allowed_file_type {
-                return Err(refused("release archive contains an unsupported entry type"));
+                return Err(refused(
+                    "release archive contains an unsupported entry type",
+                ));
             }
             let target = destination.join(relative);
             if entry.is_dir() {
