@@ -204,9 +204,10 @@ mod resolver {
     }
 
     unsafe extern "C" fn initialize_raced_module(
-        _: *const crate::module::abi::TbHostVtable,
+        host: *const crate::module::abi::TbHostVtable,
         module: *mut crate::module::abi::TbModuleVtable,
     ) -> i32 {
+        let host = unsafe { *host };
         unsafe {
             *module = crate::module::abi::TbModuleVtable {
                 size: crate::module::abi::TB_MODULE_VTABLE_BASE_SIZE,
@@ -217,6 +218,7 @@ mod resolver {
                 reinitialize: None,
             }
         };
+        unsafe { (host.ready)(host.host_ctx) };
         crate::module::abi::TB_OK
     }
 
@@ -241,6 +243,20 @@ mod resolver {
         Ok(LinkedModule {
             descriptor: crate::module::abi::TbAbiDescriptor::current(
                 "resolver_search_raced_module",
+                "1.0.0",
+            ),
+            manifest,
+            init: initialize_raced_module,
+        })
+    }
+
+    fn raced_cache_module() -> crate::Result<LinkedModule> {
+        let mut manifest = super::module("resolver_cache_raced_module", &[], &[]);
+        manifest.bus_name = crate::BusName::new("ai.tinyhumans.test.resolver_cache_raced_module")?;
+        manifest.object_path = crate::ObjectPath::new("/ai/tinyhumans/test/Module")?;
+        Ok(LinkedModule {
+            descriptor: crate::module::abi::TbAbiDescriptor::current(
+                "resolver_cache_raced_module",
                 "1.0.0",
             ),
             manifest,
@@ -322,6 +338,50 @@ mod resolver {
             0,
             "the release-cache rung ran after the module was admitted"
         );
+    }
+
+    #[tokio::test]
+    async fn recovering_after_a_cache_error_does_not_prune_other_cached_versions() {
+        let record = record("resolver_cache_raced_module");
+        let install_dir = tempfile::tempdir().unwrap();
+        let stale = install_dir
+            .path()
+            .join(record.id)
+            .join("old-version");
+        std::fs::create_dir_all(&stale).unwrap();
+        let marker = stale.join("preserve-me");
+        std::fs::write(&marker, "cached by the other host load").unwrap();
+        let sink = Arc::new(Recording::default());
+        let runtime = shared_runtime();
+        let resolver = Resolver::new(ResolverInputs {
+            enabled: true,
+            install_dir: Some(install_dir.path().to_path_buf()),
+            allow_download: false,
+            bundled_dir: None,
+            sources: HashMap::new(),
+            linked: HashMap::new(),
+            search_skip: Vec::new(),
+            gate: None,
+            on_resolved: None,
+            records: vec![record],
+            terminal_marker: "This is terminal for the running process".into(),
+            runtime: Arc::new(|| Box::pin(async { Ok(shared_runtime()) })),
+            module_config: Arc::new(move |_| {
+                runtime
+                    .host()
+                    .attach_linked_with_config(raced_cache_module().unwrap(), serde_json::json!({}))
+                    .unwrap();
+                serde_json::json!({})
+            }),
+            reporter: Arc::new(FailureReporter::new(sink)),
+        });
+
+        assert_eq!(resolver.ensure_loaded(record.id).await, Ok(()));
+        assert!(runtime.host().list().iter().any(|info| {
+            info.manifest.bus_name.as_str() == record.bus_name
+                && info.manifest.object_path.as_str() == record.object_path
+        }));
+        assert!(marker.exists(), "a recovered cache failure pruned its sibling cache");
     }
 
     #[test]
