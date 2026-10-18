@@ -258,6 +258,7 @@ impl ModuleClient {
             access: Arc::clone(&self.access),
             record,
             proxy: self.with_deadline(proxy),
+            timeout: self.timeout,
         }
     }
 
@@ -341,9 +342,51 @@ pub struct ModuleObjectClient {
     access: Arc<dyn ModuleAccess>,
     record: &'static ReleaseRecord,
     proxy: Proxy,
+    timeout: Option<Duration>,
 }
 
 impl ModuleObjectClient {
+    /// Pin this admitted object to its current unique peer, so replacing a
+    /// well-known alias cannot redirect its lifecycle or derived children.
+    ///
+    /// # Errors
+    /// Returns a sanitised bus error, or `Unavailable` if the alias has no owner.
+    pub async fn pin_owner(&self) -> Result<Self, ModuleCallError> {
+        let owner = self
+            .proxy
+            .connection()
+            .name_owner(self.proxy.destination())
+            .await
+            .map_err(|error| report_proxy_failure(self.access.reporter(), self.record, &error))?
+            .ok_or(ModuleCallError::Unavailable)?;
+        self.derive(owner.as_str(), self.proxy.path().as_str())
+    }
+
+    /// Derive another object on this object's destination, preserving its
+    /// admission, reporter, confidentiality policy and configured deadline.
+    ///
+    /// # Errors
+    /// Returns a sanitised bus error if the object path is invalid.
+    pub fn object_at(&self, path: &str) -> Result<Self, ModuleCallError> {
+        self.derive(self.proxy.destination().as_str(), path)
+    }
+
+    fn derive(&self, destination: &str, path: &str) -> Result<Self, ModuleCallError> {
+        let proxy = self
+            .proxy
+            .connection()
+            .proxy(destination, path, self.proxy.interface().as_str())
+            .map_err(|error| report_proxy_failure(self.access.reporter(), self.record, &error))?;
+        Ok(Self {
+            access: Arc::clone(&self.access),
+            record: self.record,
+            proxy: self
+                .timeout
+                .map_or(proxy.clone(), |timeout| proxy.with_timeout(timeout)),
+            timeout: self.timeout,
+        })
+    }
+
     /// Call a member of the object.
     ///
     /// # Errors

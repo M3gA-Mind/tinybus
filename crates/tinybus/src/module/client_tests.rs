@@ -285,3 +285,130 @@ async fn unavailable_loads_and_explicit_reports_use_only_registered_identity() {
             .all(|(module, _)| module == RECORD.id)
     );
 }
+
+struct OwnerFixture(&'static str);
+#[async_trait::async_trait]
+impl crate::Interface for OwnerFixture {
+    fn name(&self) -> crate::InterfaceName {
+        crate::InterfaceName::new(RECORD.bus_name).unwrap()
+    }
+    fn members(&self) -> Vec<crate::MemberName> {
+        ["Who", "Block"]
+            .map(|name| crate::MemberName::new(name).unwrap())
+            .to_vec()
+    }
+    async fn call(
+        &self,
+        member: &crate::MemberName,
+        _: serde_json::Value,
+    ) -> crate::Result<serde_json::Value> {
+        if member.as_str() == "Block" {
+            std::future::pending::<()>().await;
+        }
+        Ok(serde_json::json!(self.0))
+    }
+}
+
+#[tokio::test]
+async fn pinned_objects_and_derived_children_keep_the_original_peer() {
+    let (_, access) = resolver(true);
+    let bus = crate::transport::memory::MemoryBus::new();
+    crate::broker::Broker::new().spawn(bus.clone());
+    let original = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let replacement = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    for (service, label) in [(&original, "original"), (&replacement, "replacement")] {
+        for path in [RECORD.object_path, "/child"] {
+            service
+                .serve_at(crate::ObjectPath::new(path).unwrap(), OwnerFixture(label))
+                .await
+                .unwrap();
+        }
+    }
+    original.request_name(RECORD.bus_name).await.unwrap();
+    let caller = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let client = ModuleClient::new(access).with_fixture(
+        caller
+            .proxy(RECORD.bus_name, RECORD.object_path, RECORD.bus_name)
+            .unwrap(),
+    );
+    let root = client
+        .object_client(RECORD.id, RECORD.object_path)
+        .await
+        .unwrap()
+        .pin_owner()
+        .await
+        .unwrap();
+    original.release_name(RECORD.bus_name).await.unwrap();
+    replacement.request_name(RECORD.bus_name).await.unwrap();
+    assert_eq!(root.call::<String>("Who", ()).await.unwrap(), "original");
+    let child = root.object_at("/child").unwrap();
+    assert_eq!(child.call::<String>("Who", ()).await.unwrap(), "original");
+    assert_eq!(
+        child.call_confidential::<String>("Who", ()).await,
+        Err(ModuleCallError::TransportFailed)
+    );
+    assert!(root.object_at("invalid path").is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn derived_objects_keep_the_configured_deadline_and_report_failures() {
+    let (sink, access) = resolver(true);
+    let bus = crate::transport::memory::MemoryBus::new();
+    crate::broker::Broker::new().spawn(bus.clone());
+    let service = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    service.request_name(RECORD.bus_name).await.unwrap();
+    service
+        .serve_at(
+            crate::ObjectPath::new("/child").unwrap(),
+            OwnerFixture("original"),
+        )
+        .await
+        .unwrap();
+    let caller = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let client = ModuleClient::new(access)
+        .with_fixture(
+            caller
+                .proxy(RECORD.bus_name, RECORD.object_path, RECORD.bus_name)
+                .unwrap(),
+        )
+        .with_timeout(Duration::from_millis(50));
+    let root = client
+        .object_client(RECORD.id, RECORD.object_path)
+        .await
+        .unwrap()
+        .pin_owner()
+        .await
+        .unwrap();
+    let start = tokio::time::Instant::now();
+    assert_eq!(
+        root.object_at("/child")
+            .unwrap()
+            .call::<String>("Block", ())
+            .await,
+        Err(ModuleCallError::TransportFailed)
+    );
+    assert!(start.elapsed() < Duration::from_secs(1));
+    assert_eq!(
+        sink.0.lock().unwrap().last().unwrap().1,
+        Reason::TransportFailed
+    );
+    let missing = client
+        .object_client(RECORD.id, RECORD.object_path)
+        .await
+        .unwrap();
+    service.release_name(RECORD.bus_name).await.unwrap();
+    assert!(matches!(
+        missing.pin_owner().await,
+        Err(ModuleCallError::Unavailable)
+    ));
+}
