@@ -196,7 +196,10 @@ mod resolver {
         crate::module::abi::TB_OK
     }
 
-    unsafe extern "C" fn stop_raced_module(_: *mut std::ffi::c_void, _: u64) -> i32 {
+    unsafe extern "C" fn stop_raced_module(ctx: *mut std::ffi::c_void, _: u64) -> i32 {
+        if !ctx.is_null() {
+            drop(unsafe { Box::from_raw(ctx.cast::<()>()) });
+        }
         crate::module::abi::TB_OK
     }
 
@@ -206,9 +209,9 @@ mod resolver {
     ) -> i32 {
         unsafe {
             *module = crate::module::abi::TbModuleVtable {
-                size: std::mem::size_of::<crate::module::abi::TbModuleVtable>() as u32,
+                size: crate::module::abi::TB_MODULE_VTABLE_BASE_SIZE,
                 _reserved: 0,
-                module_ctx: std::ptr::null_mut(),
+                module_ctx: Box::into_raw(Box::new(())).cast(),
                 deliver: accept_raced_message,
                 shutdown: stop_raced_module,
                 reinitialize: None,
