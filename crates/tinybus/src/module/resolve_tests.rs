@@ -344,10 +344,7 @@ mod resolver {
     async fn recovering_after_a_cache_error_does_not_prune_other_cached_versions() {
         let record = record("resolver_cache_raced_module");
         let install_dir = tempfile::tempdir().unwrap();
-        let stale = install_dir
-            .path()
-            .join(record.id)
-            .join("old-version");
+        let stale = install_dir.path().join(record.id).join("old-version");
         std::fs::create_dir_all(&stale).unwrap();
         let marker = stale.join("preserve-me");
         std::fs::write(&marker, "cached by the other host load").unwrap();
@@ -381,7 +378,10 @@ mod resolver {
             info.manifest.bus_name.as_str() == record.bus_name
                 && info.manifest.object_path.as_str() == record.object_path
         }));
-        assert!(marker.exists(), "a recovered cache failure pruned its sibling cache");
+        assert!(
+            marker.exists(),
+            "a recovered cache failure pruned its sibling cache"
+        );
     }
 
     #[test]
