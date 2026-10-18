@@ -385,20 +385,19 @@ pub unsafe extern "C" fn tinybus_module_init_v1(
         // Product authority still comes exclusively from the untouched host query.
         if !host.config.ptr.is_null() {
             let bytes = unsafe { std::slice::from_raw_parts(host.config.ptr, host.config.len) };
-            if let Ok(config) = serde_json::from_slice::<serde_json::Value>(bytes) {
-                if let Some(encoded) = config
+            if let Ok(config) = serde_json::from_slice::<serde_json::Value>(bytes)
+                && let Some(encoded) = config
                     .get("test_controls")
                     .and_then(|value| serde_json::from_value::<Vec<u8>>(value.clone()).ok())
                     .filter(|bytes| bytes.len() == size_of::<Controls>())
-                {
-                    let controls = unsafe { encoded.as_ptr().cast::<Controls>().read_unaligned() };
-                    let mut early = EARLY
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if early.is_none() {
-                        *early = Some(controls);
-                        NEXT_FACTORY_MODE.store(99, Ordering::Release);
-                    }
+            {
+                let controls = unsafe { encoded.as_ptr().cast::<Controls>().read_unaligned() };
+                let mut early = EARLY
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if early.is_none() {
+                    *early = Some(controls);
+                    NEXT_FACTORY_MODE.store(99, Ordering::Release);
                 }
             }
         }
