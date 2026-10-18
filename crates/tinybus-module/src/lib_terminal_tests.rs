@@ -1025,7 +1025,7 @@ async fn compiled_native_terminal_owns_initial_cancellation_panics_join_and_stal
                 break;
             }
         }
-        let stale_result = old_context.map(|token| old_probe(token));
+        let stale_result = old_context.map(old_probe);
         host.shutdown(Duration::from_secs(5)).await;
         while !seen.iter().any(|(event, _)| *event == 6) {
             seen.push(receiver.recv_timeout(Duration::from_secs(5)).unwrap());
@@ -2276,7 +2276,7 @@ async fn compiled_native_retained_views_bound_256_and_release_only_at_actual_las
     let replacement_result =
         replacement.load_file_with_config(&path, native_controls_config(0, &controls));
     let new_token = context();
-    let stale = first_token.map(|token| probe(token));
+    let stale = first_token.map(probe);
     let before = drops();
     replacement.shutdown(Duration::from_secs(5)).await;
     let mut replacement_settled = false;
