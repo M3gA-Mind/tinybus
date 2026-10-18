@@ -667,6 +667,13 @@ async fn actual_linked_factory_failure_disposes_received_config_on_physical_work
         );
         assert!(!view.is_live());
         if mode == 1 {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while terminal::TerminalState::lookup(view.inner.context()).is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("physical completion must retire its terminal anchor");
             assert!(terminal::TerminalState::lookup(view.inner.context()).is_none());
         } else {
             assert!(terminal::TerminalState::lookup(view.inner.context()).is_some());
