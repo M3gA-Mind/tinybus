@@ -188,7 +188,7 @@ mod resolver {
 
     #[test]
     fn a_duplicate_admission_error_recovers_when_the_requested_module_is_initializing() {
-        let record = record("resolver-raced-admission");
+        let record = record("resolver_raced_admission");
         // This snapshot is taken after a competing host path won admission but
         // before this resolver's load attempt returned its duplicate-name error.
         let modules = [admitted_info(record, ModuleState::Initializing)];
@@ -198,6 +198,45 @@ mod resolver {
             record,
         );
         assert_eq!(result, Ok(()));
+    }
+
+    #[test]
+    fn admission_recovery_requires_the_exact_enabled_nonterminal_module() {
+        let record = record("resolver_raced_admission_guards");
+        let error = "module name is already loaded".to_string();
+        let wrong_path = {
+            let mut info = admitted_info(record, ModuleState::Ready);
+            info.manifest.object_path = crate::ObjectPath::new("/other/module").unwrap();
+            info
+        };
+        let wrong_bus = {
+            let mut info = admitted_info(record, ModuleState::Ready);
+            info.manifest.bus_name = crate::BusName::new("ai.tinyhumans.module.Other").unwrap();
+            info
+        };
+        let disabled = {
+            let mut info = admitted_info(record, ModuleState::Ready);
+            info.enabled = false;
+            info
+        };
+        for info in [
+            wrong_path,
+            wrong_bus,
+            disabled,
+            admitted_info(record, ModuleState::Failed {
+                reason: "init failed".into(),
+            }),
+            admitted_info(record, ModuleState::Faulted {
+                reason: "faulted".into(),
+            }),
+            admitted_info(record, ModuleState::Stopped),
+            admitted_info(record, ModuleState::Disabled),
+        ] {
+            assert_eq!(
+                recover_admission(Err(error.clone()), &[info], record),
+                Err(error.clone())
+            );
+        }
     }
 
     struct Fixture {
