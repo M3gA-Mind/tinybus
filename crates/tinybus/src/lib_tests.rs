@@ -3,7 +3,6 @@ use super::*;
 #[test]
 fn version_is_the_package_version() {
     assert_eq!(VERSION, env!("CARGO_PKG_VERSION"));
-    assert!(!VERSION.is_empty());
 }
 
 #[test]
