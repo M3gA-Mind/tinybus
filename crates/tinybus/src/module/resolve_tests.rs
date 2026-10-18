@@ -172,6 +172,34 @@ mod resolver {
         }))
     }
 
+    fn admitted_info(record: &ReleaseRecord, state: ModuleState) -> ModuleInfo {
+        let manifest = super::module(record.id, &[], &[]);
+        ModuleInfo {
+            name: manifest.module.name.clone(),
+            version: manifest.module.version.to_string(),
+            file: "module.dylib".into(),
+            state,
+            manifest,
+            rustc_version: String::new(),
+            rustc_mismatch: false,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn a_duplicate_admission_error_recovers_when_the_requested_module_is_initializing() {
+        let record = record("resolver-raced-admission");
+        // This snapshot is taken after a competing host path won admission but
+        // before this resolver's load attempt returned its duplicate-name error.
+        let modules = [admitted_info(record, ModuleState::Initializing)];
+        let result = recover_admission(
+            Err("module name is already loaded".into()),
+            &modules,
+            record,
+        );
+        assert_eq!(result, Ok(()));
+    }
+
     struct Fixture {
         sink: Arc<Recording>,
         config_calls: Arc<AtomicUsize>,

@@ -32,6 +32,7 @@ use crate::Proxy;
 use crate::module::LinkedModule;
 use crate::module::client::{AccessFuture, ModuleAccess, ProxyFailure};
 use crate::module::failure::{FailureReporter, Reason};
+use crate::module::host::{ModuleInfo, ModuleState};
 use crate::module::manifest::ModuleManifest;
 use crate::module::platform::host_candidates;
 use crate::module::resolution::{self, Claim, Resolution, ResolutionState, Waited};
@@ -39,6 +40,14 @@ use crate::module::runtime::ModuleRuntime;
 use crate::module::{
     ReleaseAsset, ReleasePlan, ReleaseRecord, load_first_admitted, prune_stale_versions,
 };
+
+fn recover_admission(
+    result: Result<(), String>,
+    _modules: &[ModuleInfo],
+    _record: &ReleaseRecord,
+) -> Result<(), String> {
+    result
+}
 
 /// Result indexes refer to the input manifest slice.
 pub(crate) struct LoadOrder {
