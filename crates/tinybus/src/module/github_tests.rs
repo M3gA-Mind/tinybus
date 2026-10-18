@@ -109,6 +109,7 @@ fn a_verified_cache_answers_without_the_network() {
 }
 
 #[test]
+/// Extracts a valid archive while preserving its directory structure and bytes.
 fn zip_archives_extract_only_enclosed_regular_files_and_directories() {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join("release.zip");
@@ -136,6 +137,7 @@ fn zip_archives_extract_only_enclosed_regular_files_and_directories() {
 }
 
 #[test]
+/// Rejects traversal entries without writing outside the extraction directory.
 fn zip_archives_refuse_paths_outside_the_destination() {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join("release.zip");
@@ -156,6 +158,7 @@ fn zip_archives_refuse_paths_outside_the_destination() {
 
 #[cfg(unix)]
 #[test]
+/// Rejects symlink entries without creating a link or following its target.
 fn zip_archives_refuse_symlink_entries() {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join("release.zip");
@@ -180,6 +183,7 @@ fn zip_archives_refuse_symlink_entries() {
 
 #[cfg(unix)]
 #[test]
+/// Rejects Unix special-file entries instead of materializing them.
 fn zip_archives_refuse_special_file_entries() {
     let directory = tempfile::tempdir().unwrap();
     let archive_path = directory.path().join("release.zip");
@@ -203,6 +207,7 @@ fn zip_archives_refuse_special_file_entries() {
 
 #[cfg(unix)]
 #[test]
+/// Extracts regular files without applying archived executable or setuid bits.
 fn zip_archives_do_not_apply_setuid_or_executable_permissions() {
     use std::os::unix::fs::PermissionsExt;
 

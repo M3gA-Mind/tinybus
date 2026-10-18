@@ -23,6 +23,7 @@ static RECORD: ReleaseRecord = ReleaseRecord {
 };
 
 #[test]
+/// Resolves assets only for an exact supported host key.
 fn asset_lookup_matches_the_exact_host_key_and_rejects_unknown_hosts() {
     assert_eq!(RECORD.asset_for(ASSETS[0].host_key), Some(&ASSETS[0]));
     assert_eq!(RECORD.asset_for("unknown-host"), None);

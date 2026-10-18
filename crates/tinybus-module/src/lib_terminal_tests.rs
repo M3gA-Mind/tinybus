@@ -888,6 +888,7 @@ unsafe extern "C" fn native_event(ctx: *mut c_void, event: u32, value: u32) {
     let _ = sender.send((event, value));
 }
 
+/// Invokes a stale-context ABI probe through a non-inlined test helper.
 fn call_probe(token: usize, probe: extern "C" fn(usize) -> i32) -> i32 {
     probe(token)
 }
