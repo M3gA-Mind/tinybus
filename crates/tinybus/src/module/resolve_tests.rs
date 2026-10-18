@@ -173,7 +173,9 @@ mod resolver {
     }
 
     fn admitted_info(record: &ReleaseRecord, state: ModuleState) -> ModuleInfo {
-        let manifest = super::module(record.id, &[], &[]);
+        let mut manifest = super::module(record.id, &[], &[]);
+        manifest.bus_name = crate::BusName::new(record.bus_name).unwrap();
+        manifest.object_path = crate::ObjectPath::new(record.object_path).unwrap();
         ModuleInfo {
             name: manifest.module.name.clone(),
             version: manifest.module.version.to_string(),
@@ -184,6 +186,45 @@ mod resolver {
             rustc_mismatch: false,
             enabled: true,
         }
+    }
+
+    unsafe extern "C" fn initialize_raced_module(
+        _: *const crate::module::abi::TbHostVtable,
+        module: *mut crate::module::abi::TbModuleVtable,
+    ) -> i32 {
+        unsafe { *module = crate::module::abi::TbModuleVtable::default() };
+        crate::module::abi::TB_OK
+    }
+
+    fn raced_module() -> crate::Result<LinkedModule> {
+        let mut manifest = super::module("resolver_raced_module", &[], &[]);
+        manifest.bus_name = crate::BusName::new("ai.tinyhumans.test.resolver_raced_module")?;
+        manifest.object_path = crate::ObjectPath::new("/ai/tinyhumans/test/Module")?;
+        manifest.lazy_init = true;
+        Ok(LinkedModule {
+            descriptor: crate::module::abi::TbAbiDescriptor::current(
+                "resolver_raced_module",
+                "1.0.0",
+            ),
+            manifest,
+            init: initialize_raced_module,
+        })
+    }
+
+    fn raced_search_module() -> crate::Result<LinkedModule> {
+        let mut manifest = super::module("resolver_search_raced_module", &[], &[]);
+        manifest.bus_name =
+            crate::BusName::new("ai.tinyhumans.test.resolver_search_raced_module")?;
+        manifest.object_path = crate::ObjectPath::new("/ai/tinyhumans/test/Module")?;
+        manifest.lazy_init = true;
+        Ok(LinkedModule {
+            descriptor: crate::module::abi::TbAbiDescriptor::current(
+                "resolver_search_raced_module",
+                "1.0.0",
+            ),
+            manifest,
+            init: initialize_raced_module,
+        })
     }
 
     #[test]
@@ -198,6 +239,73 @@ mod resolver {
             record,
         );
         assert_eq!(result, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_recovers_when_direct_host_admission_wins_after_its_initial_check() {
+        let record = record("resolver_raced_module");
+        let sources = HashMap::from([(record.id.to_string(), ModuleSource::Linked)]);
+        let mut f = fixture(record, true, sources.clone(), None);
+        let runtime = shared_runtime();
+        f.resolver = Resolver::new(ResolverInputs {
+            enabled: true,
+            install_dir: None,
+            allow_download: false,
+            bundled_dir: None,
+            sources,
+            linked: HashMap::from([(record.id.to_string(), raced_module as LinkedFactory)]),
+            search_skip: Vec::new(),
+            gate: None,
+            on_resolved: None,
+            records: vec![record],
+            terminal_marker: "This is terminal for the running process".into(),
+            runtime: Arc::new(|| Box::pin(async { Ok(shared_runtime()) })),
+            module_config: Arc::new(|_| serde_json::json!({})),
+            reporter: Arc::new(FailureReporter::new(f.sink.clone())),
+        });
+        f.resolver.after_initial_host_check = Some(Arc::new(|runtime, _| {
+            runtime
+                .host()
+                .attach_linked_with_config(raced_module().unwrap(), serde_json::json!({}))
+                .unwrap();
+        }));
+
+        assert_eq!(f.resolver.ensure_loaded(record.id).await, Ok(()));
+        assert!(runtime.host().list().iter().any(|info| {
+            info.manifest.bus_name.as_str() == record.bus_name
+                && info.manifest.object_path.as_str() == record.object_path
+        }));
+        assert_eq!(f.resolver.state_of(record.id), Availability::Ready);
+    }
+
+    #[tokio::test]
+    async fn ensure_loaded_rechecks_host_after_search_before_touching_the_release_cache() {
+        let record = record("resolver_search_raced_module");
+        let dir = tempfile::tempdir().unwrap();
+        let mut f = fixture(
+            record,
+            true,
+            HashMap::new(),
+            Some(dir.path().to_path_buf()),
+        );
+        let runtime = shared_runtime();
+        f.resolver.after_initial_host_check = Some(Arc::new(|runtime, _| {
+            runtime
+                .host()
+                .attach_linked_with_config(raced_search_module().unwrap(), serde_json::json!({}))
+                .unwrap();
+        }));
+
+        assert_eq!(f.resolver.ensure_loaded(record.id).await, Ok(()));
+        assert!(runtime.host().list().iter().any(|info| {
+            info.manifest.bus_name.as_str() == record.bus_name
+                && info.manifest.object_path.as_str() == record.object_path
+        }));
+        assert_eq!(
+            f.config_calls.load(Ordering::SeqCst),
+            0,
+            "the release-cache rung ran after the module was admitted"
+        );
     }
 
     #[test]

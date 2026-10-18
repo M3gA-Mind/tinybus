@@ -43,14 +43,10 @@ use crate::module::{
 
 fn recover_admission(
     result: Result<(), String>,
-    modules: &[ModuleInfo],
-    record: &ReleaseRecord,
+    _modules: &[ModuleInfo],
+    _record: &ReleaseRecord,
 ) -> Result<(), String> {
-    if result.is_err() && modules.iter().any(|info| is_live_match(info, record)) {
-        Ok(())
-    } else {
-        result
-    }
+    result
 }
 
 fn is_live_match(info: &ModuleInfo, record: &ReleaseRecord) -> bool {
@@ -335,6 +331,8 @@ pub struct ResolverInputs {
 #[derive(Clone)]
 pub struct Resolver {
     inner: Arc<ResolverInputs>,
+    #[cfg(test)]
+    after_initial_host_check: Option<Arc<dyn Fn(&'static ModuleRuntime, &ReleaseRecord) + Send + Sync>>,
 }
 
 impl Resolver {
@@ -343,6 +341,8 @@ impl Resolver {
     pub fn new(inputs: ResolverInputs) -> Self {
         Self {
             inner: Arc::new(inputs),
+            #[cfg(test)]
+            after_initial_host_check: None,
         }
     }
 
@@ -583,6 +583,11 @@ impl Resolver {
             .any(|info| info.manifest.bus_name.as_str() == record.bus_name)
         {
             return Ok(());
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = &self.after_initial_host_check {
+            hook(runtime, record);
         }
 
         // An override points at a developer's own build, or at a module linked
