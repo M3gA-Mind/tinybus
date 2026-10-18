@@ -649,7 +649,12 @@ impl Resolver {
         }
         // A direct host load can win admission while the search-path rung is
         // running. Observe it before beginning a download or cache load.
-        if is_live_match(&runtime.host().list(), record) {
+        if runtime
+            .host()
+            .list()
+            .iter()
+            .any(|info| is_live_match(info, record))
+        {
             return Ok(());
         }
 
