@@ -1473,6 +1473,7 @@ impl ModuleControl for ModuleHostInner {
         Ok((info, transition))
     }
 
+    /// Stops the loaded module named `name`, bounding shutdown by `deadline`.
     async fn stop(&self, name: &str, deadline: Duration) -> Result<ModuleInfo> {
         self.stop_inner(name, deadline).await
     }
@@ -1726,6 +1727,7 @@ impl ModuleControl for ModuleHostInner {
         Ok((loaded, transitions))
     }
 
+    /// Updates module state after `unique_name` disconnects and returns any transition to publish.
     fn peer_detached(&self, unique_name: &BusName) -> Option<(String, ModuleState, ModuleState)> {
         let mut loaded = self.loaded.lock().expect("module list lock");
         let module = loaded

@@ -397,6 +397,7 @@ fn validate_hash(hash: &str) -> Result<()> {
     Ok(())
 }
 
+/// Extracts a release archive into `destination`, refusing unsafe ZIP paths and entry types.
 fn extract(name: &str, archive: &Path, destination: &Path) -> Result<()> {
     if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         let file =
