@@ -877,7 +877,7 @@ impl Interface for ActualStreamCallback {
 }
 
 #[tokio::test]
-#[ignore = "requires TINYBUS_TEST_HOST_CALLBACK_MODULE built cdylib"]
+#[ignore = "requires TINYBUS_TEST_HOST_STREAM_CALLBACK_MODULE built cdylib"]
 async fn admitted_module_uses_only_declared_stream_callbacks_and_revoke_blocks_reentry() {
     let artifact = std::path::PathBuf::from(
         std::env::var_os("TINYBUS_TEST_HOST_STREAM_CALLBACK_MODULE").unwrap(),

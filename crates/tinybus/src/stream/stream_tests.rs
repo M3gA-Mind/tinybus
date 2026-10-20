@@ -415,6 +415,29 @@ async fn a_dropped_writer_aborts_the_stream_instead_of_leaving_it_open() {
 }
 
 #[tokio::test]
+async fn an_aborted_stream_remains_available_as_a_terminal_failure_until_accepted() {
+    let (client, service) = bus().await;
+    let destination = BusName::new(SINK).unwrap();
+    let mut writer = client
+        .open_stream(&destination, StreamDescriptor::with_len(4))
+        .await
+        .unwrap();
+    let stream = writer.stream_ref();
+    writer.write_chunk(b"a").await.unwrap();
+    writer.abort().await.unwrap();
+
+    // A stream can reach its terminal state before the method carrying its
+    // handle is dispatched. The late receiver must observe an aborted stream,
+    // rather than a missing handle that masks the sender's original failure.
+    let mut reader = service.accept_stream(&stream).unwrap();
+    assert_eq!(reader.next_chunk().await.unwrap().unwrap(), b"a");
+    assert!(matches!(
+        reader.next_chunk().await,
+        Err(Error::StreamAborted { .. })
+    ));
+}
+
+#[tokio::test]
 async fn writing_to_a_stream_nobody_will_read_fails_instead_of_hanging_forever() {
     let (client, service) = bus().await;
     service.set_stream_limits(StreamLimits {
@@ -743,6 +766,34 @@ async fn a_closed_stream_nobody_collects_is_evicted_oldest_first() {
     );
     let mut kept = service.accept_stream(&handles[2]).unwrap();
     assert_eq!(kept.next_chunk().await.unwrap().unwrap(), b"data");
+}
+
+#[tokio::test]
+async fn an_unclaimed_aborted_stream_uses_the_bounded_closed_unread_slot() {
+    let (client, service) = bus().await;
+    service.set_stream_limits(StreamLimits {
+        max_streams_per_peer: 1,
+        ..StreamLimits::default()
+    });
+    let destination = BusName::new(SINK).unwrap();
+    let mut abandoned = client
+        .open_stream(&destination, StreamDescriptor::with_len(4))
+        .await
+        .unwrap();
+    let abandoned_ref = abandoned.stream_ref();
+    abandoned.write_chunk(b"a").await.unwrap();
+    abandoned.abort().await.unwrap();
+
+    // The next Open evicts an unclaimed terminal stream by the same policy as
+    // an unclaimed completed stream; abort retention cannot grow without bound.
+    let _next = client
+        .open_stream(&destination, StreamDescriptor::default())
+        .await
+        .unwrap();
+    assert!(matches!(
+        service.accept_stream(&abandoned_ref),
+        Err(Error::UnknownStream { .. })
+    ));
 }
 
 #[tokio::test]
