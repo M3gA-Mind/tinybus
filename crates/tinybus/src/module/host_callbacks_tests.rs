@@ -3,11 +3,46 @@ use crate::message::Message;
 use crate::router::{MatchRule, Router};
 use std::sync::atomic::AtomicUsize;
 
+async fn active_stream_binding() -> (
+    Arc<ModuleHost>,
+    tokio::task::JoinHandle<Result<()>>,
+    HostCallbackBinding,
+    crate::Connection,
+    crate::transport::memory::MemoryBus,
+) {
+    let bus = crate::transport::memory::MemoryBus::new();
+    let broker = Broker::new();
+    let broker_task = broker.spawn(bus.clone());
+    let host = Arc::new(ModuleHost::new(broker));
+    let binding = host
+        .prepare_host_callbacks_with_stream_endpoints(vec![endpoint()], vec![stream_endpoint()])
+        .await
+        .unwrap();
+    let module = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let module_peer = module.unique_name().unwrap();
+    {
+        let mut lifetime = binding.state.lifetime.lock().unwrap();
+        lifetime.active = true;
+        lifetime.used = true;
+        lifetime.module = Some(module_peer);
+    }
+    (host, broker_task, binding, module, bus)
+}
+
 fn endpoint() -> HostCallbackEndpoint {
     HostCallbackEndpoint {
         path: "/callback".parse().unwrap(),
         interface: "org.example.Callback".parse().unwrap(),
         members: vec!["Observe".parse().unwrap()],
+    }
+}
+fn stream_endpoint() -> HostStreamCallbackEndpoint {
+    HostStreamCallbackEndpoint {
+        path: "/callback".parse().unwrap(),
+        interface: "org.example.Callback".parse().unwrap(),
+        members: vec!["Transfer".parse().unwrap()],
     }
 }
 fn signal_declaration() -> HostCallbackSignal {
@@ -21,6 +56,7 @@ fn state(source: BusName, destination: BusName) -> Arc<CallbackState> {
     Arc::new(CallbackState {
         destination,
         endpoints: vec![endpoint()],
+        stream_endpoints: vec![],
         signals: vec![signal_declaration()],
         module_transport: Mutex::new(None),
         lifetime: Mutex::new(Lifetime {
@@ -36,6 +72,85 @@ fn state(source: BusName, destination: BusName) -> Arc<CallbackState> {
         physical_drained: std::sync::Condvar::new(),
         physical_wait_started: Notify::new(),
     })
+}
+
+struct MixedCallback;
+#[async_trait]
+impl Interface for MixedCallback {
+    fn name(&self) -> InterfaceName {
+        endpoint().interface
+    }
+    fn members(&self) -> Vec<MemberName> {
+        vec![
+            endpoint().members[0].clone(),
+            stream_endpoint().members[0].clone(),
+        ]
+    }
+    async fn call(&self, member: &MemberName, _: serde_json::Value) -> Result<serde_json::Value> {
+        Ok(serde_json::Value::String(member.to_string()))
+    }
+}
+
+#[tokio::test]
+async fn mixed_callback_dispatch_keeps_confidential_and_stream_members_separate() {
+    let module_peer: BusName = ":1.8".parse().unwrap();
+    let callback_peer: BusName = ":1.9".parse().unwrap();
+    let mut state = state(module_peer.clone(), callback_peer);
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .stream_endpoints
+        .push(stream_endpoint());
+    let guarded = GuardedInterface {
+        interface: MixedCallback,
+        confidential_endpoint: Some(endpoint()),
+        stream_endpoint: Some(stream_endpoint()),
+        state: state.clone(),
+    };
+    let confidential = CallContext::brokered(Some(&module_peer), true);
+    let ordinary = CallContext::brokered(Some(&module_peer), false);
+    let wrong_sender: BusName = ":1.10".parse().unwrap();
+    let wrong_ordinary = CallContext::brokered(Some(&wrong_sender), false);
+    let secret_member = &endpoint().members[0];
+    let stream_member = &stream_endpoint().members[0];
+
+    assert!(
+        guarded
+            .call_with_context(secret_member, serde_json::json!([]), &confidential)
+            .await
+            .is_ok()
+    );
+    assert!(
+        guarded
+            .call_with_context(secret_member, serde_json::json!([]), &ordinary)
+            .await
+            .is_err()
+    );
+    assert!(
+        guarded
+            .call_with_context(stream_member, serde_json::json!([]), &ordinary)
+            .await
+            .is_ok()
+    );
+    assert!(
+        guarded
+            .call_with_context(stream_member, serde_json::json!([]), &confidential)
+            .await
+            .is_err()
+    );
+    assert!(
+        guarded
+            .call_with_context(stream_member, serde_json::json!([]), &wrong_ordinary)
+            .await
+            .is_err()
+    );
+
+    state.revoke();
+    assert!(
+        guarded
+            .call_with_context(stream_member, serde_json::json!([]), &ordinary)
+            .await
+            .is_err()
+    );
 }
 
 #[test]
@@ -284,7 +399,8 @@ async fn revoke_after_route_selection_blocks_dispatch_and_direct_unverified_disp
     assert!(resolves(&router, &message).is_ok());
     let (entered, mut receiver) = tokio::sync::mpsc::channel(1);
     let guarded = GuardedInterface {
-        endpoint: endpoint(),
+        confidential_endpoint: Some(endpoint()),
+        stream_endpoint: None,
         state: state.clone(),
         interface: BlockingCallback {
             entered,
@@ -341,7 +457,8 @@ async fn revoke_during_await_preserves_running_charge_until_actual_completion() 
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let published = Arc::new(AtomicUsize::new(0));
     let guarded = GuardedInterface {
-        endpoint: endpoint(),
+        confidential_endpoint: Some(endpoint()),
+        stream_endpoint: None,
         state: state.clone(),
         interface: BlockingCallback {
             entered,
@@ -384,6 +501,18 @@ async fn endpoint_declarations_registration_and_broker_ownership_are_checked() {
         host.prepare_host_callbacks(vec![endpoint(), endpoint()])
             .await
             .is_err()
+    );
+    assert!(
+        host.prepare_host_callbacks_with_stream_endpoints(
+            vec![endpoint()],
+            vec![HostStreamCallbackEndpoint {
+                path: endpoint().path,
+                interface: endpoint().interface,
+                members: endpoint().members,
+            }],
+        )
+        .await
+        .is_err()
     );
     let mut duplicate = endpoint();
     duplicate.members.push(duplicate.members[0].clone());
@@ -546,9 +675,293 @@ async fn restricted_outgoing_handle_preserves_typed_calls_and_metadata() {
 }
 
 #[tokio::test]
+async fn a_bound_callback_can_receive_and_send_streams_without_exposing_its_connection() {
+    let (_host, broker_task, binding, module, _) = active_stream_binding().await;
+    let module_peer = module.unique_name().unwrap();
+    let context = CallContext::brokered(Some(&module_peer), false);
+
+    let mut module_writer = module
+        .open_stream(binding.unique_name(), StreamDescriptor::with_len(5))
+        .await
+        .unwrap();
+    let mut host_reader = binding
+        .accept_stream_from_module(&context, &module_writer.stream_ref())
+        .unwrap();
+    let module_send = tokio::spawn(async move {
+        module_writer.write(b"hello").await.unwrap();
+        module_writer.finish().await.unwrap();
+    });
+    assert_eq!(host_reader.read_to_end_capped(5).await.unwrap(), b"hello");
+    module_send.await.unwrap();
+
+    let mut host_writer = binding
+        .open_stream_to_module(
+            &context,
+            StreamDescriptor::with_len(5),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+    let mut module_reader = module
+        .accept_stream_from(&host_writer.stream_ref(), binding.unique_name())
+        .unwrap();
+    host_writer.write(b"world").await.unwrap();
+    host_writer.finish().await.unwrap();
+    assert_eq!(module_reader.read_to_end_capped(5).await.unwrap(), b"world");
+
+    binding.close().await.unwrap();
+    broker_task.abort();
+}
+
+#[tokio::test]
+async fn callback_streams_reject_other_peers_nonconfidential_calls_and_revoked_bindings() {
+    let (_host, broker_task, binding, module, bus) = active_stream_binding().await;
+    let module_peer = module.unique_name().unwrap();
+    let context = CallContext::brokered(Some(&module_peer), false);
+    let outsider = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let outsider_peer = outsider.unique_name().unwrap();
+    let wrong_peer = CallContext::brokered(Some(&outsider_peer), false);
+    let confidential_call = CallContext::brokered(Some(&module_peer), true);
+    let stream = StreamRef {
+        id: "not-opened".to_owned(),
+        content_type: None,
+        len: Some(1),
+    };
+
+    assert!(
+        binding
+            .accept_stream_from_module(&wrong_peer, &stream)
+            .is_err()
+    );
+    assert!(
+        binding
+            .open_stream_to_module(
+                &wrong_peer,
+                StreamDescriptor::with_len(1),
+                Duration::from_secs(1),
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        binding
+            .accept_stream_from_module(&confidential_call, &stream)
+            .is_err()
+    );
+    assert!(
+        binding
+            .open_stream_to_module(
+                &confidential_call,
+                StreamDescriptor::with_len(1),
+                Duration::from_secs(1),
+            )
+            .await
+            .is_err()
+    );
+
+    binding.revoke();
+    assert!(
+        binding
+            .accept_stream_from_module(&context, &stream)
+            .is_err()
+    );
+    assert!(
+        binding
+            .open_stream_to_module(
+                &context,
+                StreamDescriptor::with_len(1),
+                Duration::from_secs(1),
+            )
+            .await
+            .is_err()
+    );
+    binding.close().await.unwrap();
+    broker_task.abort();
+}
+
+#[tokio::test]
+async fn callback_stream_acceptance_rejects_a_handle_opened_by_another_peer() {
+    let (_host, broker_task, binding, module, bus) = active_stream_binding().await;
+    let module_peer = module.unique_name().unwrap();
+    let context = CallContext::brokered(Some(&module_peer), false);
+    let outsider = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let mut outsider_writer = outsider
+        .open_stream(binding.unique_name(), StreamDescriptor::with_len(1))
+        .await
+        .unwrap();
+
+    assert!(
+        binding
+            .accept_stream_from_module(&context, &outsider_writer.stream_ref())
+            .is_err()
+    );
+
+    outsider_writer.write(b"x").await.unwrap();
+    outsider_writer.finish().await.unwrap();
+    binding.close().await.unwrap();
+    broker_task.abort();
+}
+
+struct ActualStreamCallback {
+    binding: Arc<HostCallbackBinding>,
+    observe_entered: Arc<Notify>,
+    observe_release: Arc<Notify>,
+    transfer_dispatches: Arc<AtomicUsize>,
+    undeclared_dispatches: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl Interface for ActualStreamCallback {
+    fn name(&self) -> InterfaceName {
+        endpoint().interface
+    }
+    fn members(&self) -> Vec<MemberName> {
+        vec![
+            endpoint().members[0].clone(),
+            stream_endpoint().members[0].clone(),
+            "Undeclared".parse().unwrap(),
+        ]
+    }
+    async fn call(&self, _: &MemberName, _: serde_json::Value) -> Result<serde_json::Value> {
+        Err(Error::failed("callback context is required"))
+    }
+    async fn call_with_context(
+        &self,
+        member: &MemberName,
+        args: serde_json::Value,
+        context: &CallContext,
+    ) -> Result<serde_json::Value> {
+        if member == &endpoint().members[0] {
+            self.observe_entered.notify_one();
+            self.observe_release.notified().await;
+            return Ok(serde_json::Value::Null);
+        }
+        if member.as_str() == "Undeclared" {
+            self.undeclared_dispatches.fetch_add(1, Ordering::SeqCst);
+            return Ok(serde_json::Value::Null);
+        }
+        self.transfer_dispatches.fetch_add(1, Ordering::SeqCst);
+        if member != &stream_endpoint().members[0] {
+            return Err(Error::failed("callback member is not declared"));
+        }
+
+        let (stream,): (StreamRef,) =
+            serde_json::from_value(args).map_err(|_| Error::failed("invalid stream request"))?;
+        let mut reader = self.binding.accept_stream_from_module(context, &stream)?;
+        let received = reader.read_to_end_capped(12).await?;
+        if received != b"module->host" {
+            return Err(Error::failed(
+                "module callback stream payload did not match",
+            ));
+        }
+        let stream_result = self
+            .binding
+            .open_stream_to_module(
+                context,
+                StreamDescriptor::with_len(12),
+                Duration::from_secs(2),
+            )
+            .await;
+        let mut writer = stream_result?;
+        let reply = writer.stream_ref();
+        tokio::spawn(async move {
+            let _ = writer.write(b"host->module").await;
+            let _ = writer.finish().await;
+        });
+        serde_json::to_value(reply).map_err(|_| Error::failed("stream reply encoding failed"))
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires TINYBUS_TEST_HOST_CALLBACK_MODULE built cdylib"]
+async fn admitted_module_uses_only_declared_stream_callbacks_and_revoke_blocks_reentry() {
+    let artifact = std::path::PathBuf::from(
+        std::env::var_os("TINYBUS_TEST_HOST_STREAM_CALLBACK_MODULE").unwrap(),
+    );
+    let hash = crate::module::hash::file_hex(std::fs::File::open(&artifact).unwrap()).unwrap();
+    let (_directory, artifact) = super::super::tests::staged_module(&artifact, &hash);
+    let bus = crate::transport::memory::MemoryBus::new();
+    let broker = Broker::new();
+    let broker_task = broker.spawn(bus.clone());
+    let host = Arc::new(ModuleHost::new(broker));
+    let binding = Arc::new(
+        host.prepare_host_callbacks_with_stream_endpoints(
+            vec![endpoint()],
+            vec![stream_endpoint()],
+        )
+        .await
+        .unwrap(),
+    );
+    let observe_entered = Arc::new(Notify::new());
+    let observe_release = Arc::new(Notify::new());
+    let transfer_dispatches = Arc::new(AtomicUsize::new(0));
+    let undeclared_dispatches = Arc::new(AtomicUsize::new(0));
+    binding
+        .serve_at(
+            endpoint().path,
+            ActualStreamCallback {
+                binding: binding.clone(),
+                observe_entered: observe_entered.clone(),
+                observe_release: observe_release.clone(),
+                transfer_dispatches: transfer_dispatches.clone(),
+                undeclared_dispatches: undeclared_dispatches.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+    let loaded = host
+        .load_file_with_host_callbacks(
+            artifact,
+            serde_json::json!({"host": binding.unique_name()}),
+            &binding,
+        )
+        .await
+        .unwrap();
+    let client = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let module = client
+        .proxy(
+            "org.example.EagerCallback",
+            "/module",
+            "org.example.EagerCallback",
+        )
+        .unwrap();
+    let round_trip =
+        tokio::spawn(async move { module.call::<serde_json::Value>("RoundTrip", ()).await });
+    if tokio::time::timeout(Duration::from_secs(10), observe_entered.notified())
+        .await
+        .is_err()
+    {
+        panic!("the admitted module did not complete its stream round trip");
+    }
+    binding.revoke();
+    observe_release.notify_one();
+    let round_trip_result = tokio::time::timeout(Duration::from_secs(10), round_trip)
+        .await
+        .expect("module should observe revocation")
+        .unwrap();
+    let result = round_trip_result.unwrap();
+    assert!(result.is_null());
+    assert_eq!(transfer_dispatches.load(Ordering::SeqCst), 1);
+    assert_eq!(undeclared_dispatches.load(Ordering::SeqCst), 0);
+    host.inner
+        .stop(&loaded.name, Duration::from_secs(2))
+        .await
+        .unwrap();
+    binding.close().await.unwrap();
+    broker_task.abort();
+}
+
+#[tokio::test]
 async fn rollback_after_attach_releases_the_actual_initialization_observer() {
     let broker = Broker::new();
-    let host = ModuleHost::new(broker);
+    let host = Arc::new(ModuleHost::new(broker));
     let binding = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
     let manifest = super::super::tests::manifest();
     let path = Path::new("observer-fixture.so");
@@ -1412,7 +1825,8 @@ fn runtime_drop_destroys_provider_future_before_offruntime_native_cleanup() {
                     guard: HostCallbackGuard(account.clone()),
                     observed: observed.clone(),
                 },
-                endpoint: endpoint(),
+                confidential_endpoint: Some(endpoint()),
+                stream_endpoint: None,
                 state: account.clone(),
             };
             let context = CallContext::brokered(account.module_peer().as_ref(), true);
@@ -1489,7 +1903,8 @@ async fn completing_provider_future_is_destroyed_before_its_running_account() {
             guard: HostCallbackGuard(account.clone()),
             observed: observed.clone(),
         },
-        endpoint: endpoint(),
+        confidential_endpoint: Some(endpoint()),
+        stream_endpoint: None,
         state: account.clone(),
     };
     let context = CallContext::brokered(account.module_peer().as_ref(), true);
