@@ -769,6 +769,34 @@ async fn a_closed_stream_nobody_collects_is_evicted_oldest_first() {
 }
 
 #[tokio::test]
+async fn an_unclaimed_aborted_stream_uses_the_bounded_closed_unread_slot() {
+    let (client, service) = bus().await;
+    service.set_stream_limits(StreamLimits {
+        max_streams_per_peer: 1,
+        ..StreamLimits::default()
+    });
+    let destination = BusName::new(SINK).unwrap();
+    let mut abandoned = client
+        .open_stream(&destination, StreamDescriptor::with_len(4))
+        .await
+        .unwrap();
+    let abandoned_ref = abandoned.stream_ref();
+    abandoned.write_chunk(b"a").await.unwrap();
+    abandoned.abort().await.unwrap();
+
+    // The next Open evicts an unclaimed terminal stream by the same policy as
+    // an unclaimed completed stream; abort retention cannot grow without bound.
+    let _next = client
+        .open_stream(&destination, StreamDescriptor::default())
+        .await
+        .unwrap();
+    assert!(matches!(
+        service.accept_stream(&abandoned_ref),
+        Err(Error::UnknownStream { .. })
+    ));
+}
+
+#[tokio::test]
 async fn a_closed_stream_still_counts_for_nothing_against_the_live_limit() {
     // Closing frees the slot: a peer that finishes its transfers can keep
     // opening new ones, which is the whole difference between the live cap and
