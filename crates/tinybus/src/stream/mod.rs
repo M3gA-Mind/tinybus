@@ -477,8 +477,26 @@ impl StreamRegistry {
     fn abort(&self, header: &Header, member: &MemberName, body: Value) -> Result<Value> {
         let (id,): (String,) =
             serde_json::from_value(body).map_err(|e| Error::bad_arguments(member.clone(), e))?;
-        let stream = self.lookup(&id, header)?;
-        self.kill(&id, &stream, "the sender aborted the stream");
+        let mut streams = self.inbound.lock().expect("stream registry lock");
+        let stream = streams
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| Error::UnknownStream { id: id.clone() })?;
+        if stream.owner != header.sender {
+            return Err(Error::UnknownStream { id });
+        }
+
+        stream.finish(Outcome::Aborted("the sender aborted the stream"));
+        stream.touch();
+        stream.seal();
+        // A method carrying the StreamRef can be dispatched after Abort. Keep
+        // an unclaimed reader so that call observes the terminal stream error
+        // instead of a missing handle. The existing closed-unread per-peer
+        // cap and idle reaper bound this retained state. An already-claimed
+        // reader needs no registry entry and is woken by sealing the stream.
+        if stream.reader.lock().expect("stream reader lock").is_none() {
+            streams.remove(&id);
+        }
         Ok(Value::Null)
     }
 
@@ -697,6 +715,10 @@ impl StreamWriter {
     }
 
     /// Abandon the stream, telling the receiver not to wait for the rest.
+    ///
+    /// If the receiver has not accepted the handle yet, it can still accept
+    /// the aborted stream and observe its terminal error. Until accepted, the
+    /// stream uses the same bounded closed-unread slot as a completed stream.
     pub async fn abort(mut self) -> Result<()> {
         self.finished = true;
         self.call("Abort", serde_json::json!([self.id])).await?;
