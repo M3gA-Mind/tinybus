@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-cargo build --locked --example module_clock --example module_clock_two --example module_wrong_target --example module_context --example module_context_eager --example module_host_callback --example module_controlled_init --example module_terminal --no-default-features --features modules,macros,__native-fixture-support
+cargo build --locked --example module_clock --example module_clock_two --example module_wrong_target --example module_context --example module_context_eager --example module_host_callback --example module_host_stream_callback --example module_controlled_init --example module_terminal --no-default-features --features modules,macros,__native-fixture-support
 set -euo pipefail
 target_dir=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
 module=$(find "$target_dir/debug/examples" -maxdepth 1 -type f -name 'libmodule_clock.so' -print -quit)
@@ -10,9 +10,10 @@ wrong_target=$(find "$target_dir/debug/examples" -maxdepth 1 -type f -name 'libm
 context_module=$(find "$target_dir/debug/examples" -maxdepth 1 -type f -name 'libmodule_context.so' -print -quit)
 context_eager_module=$(find "$target_dir/debug/examples" -maxdepth 1 -type f -name 'libmodule_context_eager.so' -print -quit)
 host_callback_module=$(find "$target_dir/debug/examples" -maxdepth 1 -type f \( -name 'libmodule_host_callback.so' -o -name 'libmodule_host_callback.dylib' \) -print -quit)
+host_stream_callback_module=$(find "$target_dir/debug/examples" -maxdepth 1 -type f \( -name 'libmodule_host_stream_callback.so' -o -name 'libmodule_host_stream_callback.dylib' \) -print -quit)
 controlled_init_module=$(find "$target_dir/debug/examples" -maxdepth 1 -type f \( -name 'libmodule_controlled_init.so' -o -name 'libmodule_controlled_init.dylib' \) -print -quit)
 terminal_module=$(find "$target_dir/debug/examples" -maxdepth 1 -type f \( -name 'libmodule_terminal.so' -o -name 'libmodule_terminal.dylib' \) -print -quit)
-for artifact in "$module" "$module_two" "$wrong_target" "$context_module" "$context_eager_module" "$host_callback_module" "$controlled_init_module" "$terminal_module"; do
+for artifact in "$module" "$module_two" "$wrong_target" "$context_module" "$context_eager_module" "$host_callback_module" "$host_stream_callback_module" "$controlled_init_module" "$terminal_module"; do
   if [ -z "$artifact" ] || [ ! -f "$artifact" ]; then
     echo "a module loader fixture is missing" >&2
     exit 1
@@ -50,7 +51,7 @@ export TINYBUS_TEST_TERMINAL_MODULE="$terminal_private/$terminal_library"
 # process/network branches are not meaningful per-file coverage. The
 # test-support module is integration-test glue whose platform-specific
 # dynamic-loader and timeout paths run in the dedicated OS jobs instead.
-export TINYBUS_TEST_MODULE="$module" TINYBUS_TEST_MODULE_TWO="$private/$library" TINYBUS_TEST_WRONG_TARGET="$wrong_target" TINYBUS_TEST_CONTEXT_MODULE="$context_module" TINYBUS_TEST_CONTEXT_EAGER_MODULE="$context_eager_module" TINYBUS_TEST_HOST_CALLBACK_MODULE="$host_callback_module" TINYBUS_TEST_CONTROLLED_INIT_MODULE="$controlled_init_module"
+export TINYBUS_TEST_MODULE="$module" TINYBUS_TEST_MODULE_TWO="$private/$library" TINYBUS_TEST_WRONG_TARGET="$wrong_target" TINYBUS_TEST_CONTEXT_MODULE="$context_module" TINYBUS_TEST_CONTEXT_EAGER_MODULE="$context_eager_module" TINYBUS_TEST_HOST_CALLBACK_MODULE="$host_callback_module" TINYBUS_TEST_HOST_STREAM_CALLBACK_MODULE="$host_stream_callback_module" TINYBUS_TEST_CONTROLLED_INIT_MODULE="$controlled_init_module"
 cargo llvm-cov --workspace --all-features --ignore-filename-regex 'crates/tinybus/src/ports/(listener|transport)\.rs$|crates/tinybus/src/module/github\.rs$|crates/tinybus/src/module/(host|mod)\.rs$|crates/tinybus/src/bin/(tinybus\.rs|tinybus/unix\.rs)$|crates/tinybus/src/connection\.rs$|crates/tinybus/src/test_support\.rs$' --no-report -- --include-ignored --skip terminal_runtime_tests::compiled_native_
 
 terminal_tests=$(cargo test --locked -p tinybus-module --all-features --features tinybus/macros -- --list --ignored | sed -n 's/^\(terminal_runtime_tests::compiled_native_.*\): test$/\1/p')

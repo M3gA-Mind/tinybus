@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-cargo build --locked --example module_clock --example module_clock_two --example module_wrong_target --example module_context --example module_context_eager --example module_host_callback --example module_controlled_init --example module_terminal --no-default-features --features modules,macros,__native-fixture-support
+cargo build --locked --example module_clock --example module_clock_two --example module_wrong_target --example module_context --example module_context_eager --example module_host_callback --example module_host_stream_callback --example module_controlled_init --example module_terminal --no-default-features --features modules,macros,__native-fixture-support
 cargo test --locked --no-default-features --features modules,macros,test-support test_support::tests
 case "${RUNNER_OS:-$(uname -s)}" in
   Windows|MINGW*|MSYS*|CYGWIN*) pwsh -NoProfile -File scripts/test-e2e.ps1 ;;
@@ -14,9 +14,10 @@ wrong_target=$(find "$target_dir/debug/examples" -maxdepth 1 -type f \( -name 'l
 context_module=$(find "$target_dir/debug/examples" -maxdepth 1 -type f \( -name 'libmodule_context.so' -o -name 'libmodule_context.dylib' \) -print -quit)
 context_eager_module=$(find "$target_dir/debug/examples" -maxdepth 1 -type f \( -name 'libmodule_context_eager.so' -o -name 'libmodule_context_eager.dylib' \) -print -quit)
 host_callback_module=$(find "$target_dir/debug/examples" -maxdepth 1 -type f \( -name 'libmodule_host_callback.so' -o -name 'libmodule_host_callback.dylib' \) -print -quit)
+host_stream_callback_module=$(find "$target_dir/debug/examples" -maxdepth 1 -type f \( -name 'libmodule_host_stream_callback.so' -o -name 'libmodule_host_stream_callback.dylib' \) -print -quit)
 controlled_init_module=$(find "$target_dir/debug/examples" -maxdepth 1 -type f \( -name 'libmodule_controlled_init.so' -o -name 'libmodule_controlled_init.dylib' \) -print -quit)
 terminal_module=$(find "$target_dir/debug/examples" -maxdepth 1 -type f \( -name 'libmodule_terminal.so' -o -name 'libmodule_terminal.dylib' \) -print -quit)
-for artifact in "$module" "$module_two" "$wrong_target" "$context_module" "$context_eager_module" "$host_callback_module" "$controlled_init_module" "$terminal_module"; do
+for artifact in "$module" "$module_two" "$wrong_target" "$context_module" "$context_eager_module" "$host_callback_module" "$host_stream_callback_module" "$controlled_init_module" "$terminal_module"; do
   if [ -z "$artifact" ] || [ ! -f "$artifact" ]; then
     echo "a module example artifact is missing; the loader tests would not exercise it" >&2
     exit 1
@@ -47,7 +48,7 @@ else
 fi
 printf '"%s" = "%s"\n' "$terminal_library" "$terminal_digest" > "$terminal_private/modules.toml"
 export TINYBUS_TEST_TERMINAL_MODULE="$terminal_private/$terminal_library"
-export TINYBUS_TEST_MODULE="$module" TINYBUS_TEST_MODULE_TWO="$private/$library" TINYBUS_TEST_WRONG_TARGET="$wrong_target" TINYBUS_TEST_CONTEXT_MODULE="$context_module" TINYBUS_TEST_CONTEXT_EAGER_MODULE="$context_eager_module" TINYBUS_TEST_HOST_CALLBACK_MODULE="$host_callback_module" TINYBUS_TEST_CONTROLLED_INIT_MODULE="$controlled_init_module"
+export TINYBUS_TEST_MODULE="$module" TINYBUS_TEST_MODULE_TWO="$private/$library" TINYBUS_TEST_WRONG_TARGET="$wrong_target" TINYBUS_TEST_CONTEXT_MODULE="$context_module" TINYBUS_TEST_CONTEXT_EAGER_MODULE="$context_eager_module" TINYBUS_TEST_HOST_CALLBACK_MODULE="$host_callback_module" TINYBUS_TEST_HOST_STREAM_CALLBACK_MODULE="$host_stream_callback_module" TINYBUS_TEST_CONTROLLED_INIT_MODULE="$controlled_init_module"
 cargo test --locked --no-default-features --workspace --features modules,macros,test-support,__native-fixture-support -- --ignored --skip terminal_runtime_tests::compiled_native_
 
 terminal_tests=$(cargo test --locked -p tinybus-module --features __native-fixture-support,tinybus/macros -- --list --ignored | sed -n 's/^\(terminal_runtime_tests::compiled_native_.*\): test$/\1/p')
