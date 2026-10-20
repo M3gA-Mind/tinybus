@@ -415,21 +415,26 @@ async fn a_dropped_writer_aborts_the_stream_instead_of_leaving_it_open() {
 }
 
 #[tokio::test]
-async fn an_aborted_stream_can_still_be_accepted_after_its_method_call_was_queued() {
+async fn an_aborted_stream_remains_available_as_a_terminal_failure_until_accepted() {
     let (client, service) = bus().await;
     let destination = BusName::new(SINK).unwrap();
-    let writer = client
+    let mut writer = client
         .open_stream(&destination, StreamDescriptor::with_len(4))
         .await
         .unwrap();
     let stream = writer.stream_ref();
+    writer.write_chunk(b"a").await.unwrap();
     writer.abort().await.unwrap();
 
-    // The writer can reach its terminal state before the method carrying this
+    // A stream can reach its terminal state before the method carrying its
     // handle is dispatched. The late receiver must observe an aborted stream,
     // rather than a missing handle that masks the sender's original failure.
     let mut reader = service.accept_stream(&stream).unwrap();
-    assert!(matches!(reader.next_chunk().await, Err(Error::StreamAborted { .. })));
+    assert_eq!(reader.next_chunk().await.unwrap().unwrap(), b"a");
+    assert!(matches!(
+        reader.next_chunk().await,
+        Err(Error::StreamAborted { .. })
+    ));
 }
 
 #[tokio::test]
