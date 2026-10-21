@@ -2500,9 +2500,23 @@ async fn authenticates_native_context(variable: &str) {
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(
+        modules.authenticated_peer(&info.name),
+        Some(module.clone()),
+        "the peer returned by the host API must match the compiled module's broker-stamped sender"
+    );
+    assert!(modules
+        .authenticated_peer(info.manifest.bus_name.as_str())
+        .is_none());
     let callback: (crate::BusName, crate::BusName) =
         proxy.call_confidential("Callback", ()).await.unwrap();
     assert_eq!(callback, (sender, module));
+    modules
+        .inner
+        .stop(&info.name, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert!(modules.authenticated_peer(&info.name).is_none());
     task.abort();
 }
 
