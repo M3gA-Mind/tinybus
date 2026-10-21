@@ -141,7 +141,9 @@ fn zip_archives_extract_only_enclosed_regular_files_and_directories() {
 fn release_extraction_tempdirs_are_private_regardless_of_umask() {
     use std::os::unix::fs::PermissionsExt;
 
-    let directory = private_extraction_tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
+    restrict_extraction_directory(directory.path()).unwrap();
 
     let mode = std::fs::metadata(directory.path())
         .unwrap()
@@ -151,6 +153,34 @@ fn release_extraction_tempdirs_are_private_regardless_of_umask() {
         mode & 0o777,
         0o700,
         "the extraction root must be owner-only"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tar_root_entry_cannot_widen_release_extraction_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = tempfile::tempdir().unwrap();
+    let archive_path = parent.path().join("release.tar");
+    let destination = parent.path().join("extracted");
+    std::fs::create_dir(&destination).unwrap();
+    restrict_extraction_directory(&destination).unwrap();
+
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut archive = tar::Builder::new(file);
+    let archived_root = parent.path().join("archived-root");
+    std::fs::create_dir(&archived_root).unwrap();
+    std::fs::set_permissions(&archived_root, std::fs::Permissions::from_mode(0o775)).unwrap();
+    archive.append_dir("./", &archived_root).unwrap();
+    archive.finish().unwrap();
+
+    extract_private("release.tar", &archive_path, &destination).unwrap();
+
+    assert_eq!(
+        std::fs::metadata(destination).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "archive root metadata must not widen the extraction directory"
     );
 }
 

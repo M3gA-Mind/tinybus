@@ -113,7 +113,7 @@ pub(crate) fn acquire(
     let archive_path = temp.path().join(asset_name);
     download(&agent, &located.archive_url, &archive_path)?;
     verify_archive(&archive_path, &manifest_sha)?;
-    extract(asset_name, &archive_path, temp.path())?;
+    extract_private(asset_name, &archive_path, temp.path())?;
     let module = canonical_module(cache::find_module(temp.path())?)?;
     Ok((temp, module))
 }
@@ -158,7 +158,7 @@ pub(crate) fn acquire_cached(release: &CachedRelease<'_>) -> Result<(PathBuf, St
     let archive_path = staging.path().join(release.asset_name);
     download(&agent, &located.archive_url, &archive_path)?;
     verify_archive(&archive_path, &manifest_sha)?;
-    extract(release.asset_name, &archive_path, staging.path())?;
+    extract_private(release.asset_name, &archive_path, staging.path())?;
     let module = cache::find_module(staging.path())?;
     let relative = module
         .strip_prefix(staging.path())
@@ -452,13 +452,34 @@ fn extract(name: &str, archive: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Extracts an archive and restores the extraction root's private permissions.
+fn extract_private(name: &str, archive: &Path, destination: &Path) -> Result<()> {
+    let extraction = extract(name, archive, destination);
+    let restriction = restrict_extraction_directory(destination);
+    extraction?;
+    restriction
+}
+
 fn refused(reason: impl Into<String>) -> Error {
     Error::module_refused(Path::new("github-release"), reason)
 }
 
 fn private_extraction_tempdir() -> Result<tempfile::TempDir> {
-    let temp =
-        tempfile::tempdir().map_err(|_| refused("module extraction directory is unavailable"))?;
+    let temp = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+        }
+        #[cfg(not(unix))]
+        {
+            tempfile::tempdir()
+        }
+    }
+    .map_err(|_| refused("module extraction directory is unavailable"))?;
     restrict_extraction_directory(temp.path())?;
     Ok(temp)
 }
