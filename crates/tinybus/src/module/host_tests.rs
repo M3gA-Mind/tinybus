@@ -1094,6 +1094,20 @@ async fn authenticated_peer_is_available_only_for_a_live_ready_module() {
         .authenticated_peer("clock")
         .expect("ready module has an authenticated peer");
     assert!(authenticated.is_unique());
+    {
+        let mut loaded = host.inner.loaded.lock().unwrap();
+        loaded[0].info.enabled = false;
+    }
+    assert!(host.authenticated_peer("clock").is_none());
+    {
+        let mut loaded = host.inner.loaded.lock().unwrap();
+        loaded[0].info.enabled = true;
+        loaded[0].info.state = ModuleState::Faulted {
+            reason: "fixture".into(),
+        };
+    }
+    assert!(host.authenticated_peer("clock").is_none());
+    host.inner.loaded.lock().unwrap()[0].info.state = ModuleState::Ready;
     // The fake's Sender method reports its caller (this test connection),
     // not the module's broker-assigned identity. The compiled-module proof
     // verifies that an outbound module call carries this identity.
