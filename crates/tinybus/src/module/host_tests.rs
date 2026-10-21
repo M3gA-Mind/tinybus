@@ -1054,6 +1054,53 @@ async fn the_sender_on_a_module_frame_is_stamped_by_the_broker_like_any_other_pe
 }
 
 #[tokio::test]
+async fn authenticated_peer_is_available_only_for_a_live_ready_module() {
+    let _test_guard = FAKE_MODULE_TEST_LOCK.lock().await;
+    let bus = MemoryBus::new();
+    let broker = Broker::new();
+    let broker_task = broker.spawn(bus.clone());
+    let host = ModuleHost::new(broker);
+
+    assert!(host.authenticated_peer("clock").is_none());
+    let mut lazy_manifest = manifest();
+    lazy_manifest.lazy_init = true;
+    unsafe {
+        host.attach_raw(
+            "clock.so",
+            TbAbiDescriptor::current("clock", "0.1.0"),
+            lazy_manifest,
+            lazy_echo_init,
+        )
+    }
+    .unwrap();
+    assert!(host.authenticated_peer("clock").is_none());
+    assert!(host
+        .authenticated_peer("ai.tinyhumans.module.Clock")
+        .is_none());
+
+    let connection = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let proxy = connection
+        .proxy(
+            "ai.tinyhumans.module.Clock",
+            "/ai/tinyhumans/module/Clock",
+            "ai.tinyhumans.module.Clock",
+        )
+        .unwrap();
+    let sender: Option<BusName> = proxy.call("Sender", ()).await.unwrap();
+    let authenticated = host
+        .authenticated_peer("clock")
+        .expect("ready module has an authenticated peer");
+    assert!(authenticated.is_unique());
+    assert_eq!(sender.as_ref(), Some(&authenticated));
+
+    host.stop("clock", Duration::from_secs(5)).await.unwrap();
+    assert!(host.authenticated_peer("clock").is_none());
+    broker_task.abort();
+}
+
+#[tokio::test]
 async fn one_wedged_module_does_not_stall_another_modules_traffic() {
     let _test_guard = FAKE_MODULE_TEST_LOCK.lock().await;
     let bus = MemoryBus::new();
