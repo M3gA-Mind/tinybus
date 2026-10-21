@@ -79,6 +79,20 @@ async fn try_serve_at_refuses_a_collision_without_replacing_the_live_interface()
 }
 
 #[tokio::test]
+async fn serve_at_keeps_its_existing_replacement_behavior() {
+    let (client, service) = brokered_pair().await;
+    service.serve_at(path(), ReplacementEcho).await.unwrap();
+
+    let result: Value = client
+        .proxy("ai.tinyhumans.Test", path(), "ai.tinyhumans.Test")
+        .unwrap()
+        .call("Echo", ())
+        .await
+        .unwrap();
+    assert_eq!(result, Value::String("replacement".to_string()));
+}
+
+#[tokio::test]
 async fn concurrent_try_serve_at_calls_have_exactly_one_winner() {
     let (client, service) = brokered_pair().await;
     let concurrent_path = ObjectPath::new("/ai/tinyhumans/TestConcurrent").unwrap();
