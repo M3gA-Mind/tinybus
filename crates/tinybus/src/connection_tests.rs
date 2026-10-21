@@ -39,8 +39,112 @@ impl Interface for Echo {
     }
 }
 
+struct ReplacementEcho;
+
+#[async_trait]
+impl Interface for ReplacementEcho {
+    fn name(&self) -> InterfaceName {
+        InterfaceName::new("ai.tinyhumans.Test").unwrap()
+    }
+
+    fn members(&self) -> Vec<MemberName> {
+        vec![MemberName::new("Echo").unwrap()]
+    }
+
+    async fn call(&self, _member: &MemberName, _args: Value) -> Result<Value> {
+        Ok(Value::String("replacement".to_string()))
+    }
+}
+
 fn path() -> ObjectPath {
     ObjectPath::new("/ai/tinyhumans/Test").unwrap()
+}
+
+#[tokio::test]
+async fn try_serve_at_refuses_a_collision_without_replacing_the_live_interface() {
+    let (client, service) = brokered_pair().await;
+    let error = service
+        .try_serve_at(path(), ReplacementEcho)
+        .await
+        .unwrap_err();
+    assert_eq!(error.wire_name(), Error::FAILED);
+
+    let result: Value = client
+        .proxy("ai.tinyhumans.Test", path(), "ai.tinyhumans.Test")
+        .unwrap()
+        .call("Echo", ("original",))
+        .await
+        .unwrap();
+    assert_eq!(result, serde_json::json!(["original"]));
+}
+
+#[tokio::test]
+async fn serve_at_keeps_its_existing_replacement_behavior() {
+    let (client, service) = brokered_pair().await;
+    service.serve_at(path(), ReplacementEcho).await.unwrap();
+
+    let result: Value = client
+        .proxy("ai.tinyhumans.Test", path(), "ai.tinyhumans.Test")
+        .unwrap()
+        .call("Echo", ())
+        .await
+        .unwrap();
+    assert_eq!(result, Value::String("replacement".to_string()));
+}
+
+#[tokio::test]
+async fn concurrent_try_serve_at_calls_have_exactly_one_winner() {
+    let (client, service) = brokered_pair().await;
+    let concurrent_path = ObjectPath::new("/ai/tinyhumans/TestConcurrent").unwrap();
+    let (first, second) = tokio::join!(
+        service.try_serve_at(concurrent_path.clone(), ReplacementEcho),
+        service.try_serve_at(concurrent_path.clone(), Echo),
+    );
+    assert_ne!(first.is_ok(), second.is_ok());
+
+    let result: Value = client
+        .proxy("ai.tinyhumans.Test", concurrent_path, "ai.tinyhumans.Test")
+        .unwrap()
+        .call("Echo", ("original",))
+        .await
+        .unwrap();
+    if first.is_ok() {
+        assert_eq!(result, Value::String("replacement".to_string()));
+    } else {
+        assert_eq!(result, serde_json::json!(["original"]));
+    }
+}
+
+struct DifferentInterface;
+
+#[async_trait]
+impl Interface for DifferentInterface {
+    fn name(&self) -> InterfaceName {
+        InterfaceName::new("ai.tinyhumans.Other").unwrap()
+    }
+
+    fn members(&self) -> Vec<MemberName> {
+        vec![MemberName::new("Echo").unwrap()]
+    }
+
+    async fn call(&self, _member: &MemberName, _args: Value) -> Result<Value> {
+        Ok(Value::String("other".to_string()))
+    }
+}
+
+#[tokio::test]
+async fn try_serve_at_refuses_any_occupied_object_path() {
+    let (client, service) = brokered_pair().await;
+    service.serve_at(path(), DifferentInterface).await.unwrap();
+    assert!(service.try_serve_at(path(), ReplacementEcho).await.is_err());
+
+    let result: Value = client
+        .proxy("ai.tinyhumans.Test", path(), "ai.tinyhumans.Other")
+        .unwrap()
+        .call("Echo", ())
+        .await
+        .unwrap();
+    assert_eq!(result, Value::String("other".to_string()));
 }
 
 fn call(member: &str, body: Value) -> Message {
