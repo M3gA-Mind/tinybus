@@ -404,6 +404,40 @@ impl ModuleHost {
         modules
     }
 
+    /// Return the broker-assigned unique peer name for a live, ready module.
+    ///
+    /// `module_name` is the module's sanitized descriptor name as returned by
+    /// [`ModuleInfo::name`], not its well-known bus name. The returned name is
+    /// the identity the broker stamps onto ordinary calls from that exact
+    /// loaded instance. This lookup is not an attestation or confidential-call
+    /// grant; confidential delivery continues to require the existing pinned
+    /// admission and callback-binding checks.
+    ///
+    /// Returns `None` for unknown, disabled, initializing, stopped, faulted,
+    /// or lifecycle-transitioning modules. A caller must not retain a name as
+    /// authority beyond the invocation that needs it.
+    #[must_use]
+    pub fn authenticated_peer(&self, module_name: &str) -> Option<BusName> {
+        let loaded = self.inner.loaded.lock().expect("module list lock");
+        let module = loaded
+            .iter()
+            .find(|module| module.info.name == module_name)?;
+        if !module.info.enabled
+            || module.lifecycle_busy
+            || module.transport.native_lifecycle_pending()
+            || !module.transport.is_ready()
+            || module.transport.is_faulted()
+            || module.transport.init_failed()
+        {
+            return None;
+        }
+        matches!(
+            module.snapshot().state,
+            ModuleState::Ready | ModuleState::Serving
+        )
+        .then(|| module.unique_name.clone())
+    }
+
     /// Load one newly installed module.
     ///
     /// A verified operator allowlist admits confidential delivery to the exact
