@@ -75,20 +75,21 @@ async fn try_serve_at_refuses_a_collision_without_replacing_the_live_interface()
         .call("Echo", ("original",))
         .await
         .unwrap();
-    assert_eq!(result, Value::String("original".to_string()));
+    assert_eq!(result, serde_json::json!(["original"]));
 }
 
 #[tokio::test]
 async fn concurrent_try_serve_at_calls_have_exactly_one_winner() {
     let (client, service) = brokered_pair().await;
+    let concurrent_path = ObjectPath::new("/ai/tinyhumans/TestConcurrent").unwrap();
     let (first, second) = tokio::join!(
-        service.try_serve_at(path(), ReplacementEcho),
-        service.try_serve_at(path(), Echo),
+        service.try_serve_at(concurrent_path.clone(), ReplacementEcho),
+        service.try_serve_at(concurrent_path.clone(), Echo),
     );
     assert_ne!(first.is_ok(), second.is_ok());
 
     let result: Value = client
-        .proxy("ai.tinyhumans.Test", path(), "ai.tinyhumans.Test")
+        .proxy("ai.tinyhumans.Test", concurrent_path, "ai.tinyhumans.Test")
         .unwrap()
         .call("Echo", ("original",))
         .await

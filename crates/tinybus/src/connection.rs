@@ -472,7 +472,9 @@ impl Connection {
         {
             Ok(())
         } else {
-            Err(Error::failed("interface is already served at this object path"))
+            Err(Error::failed(
+                "interface is already served at this object path",
+            ))
         }
     }
 
