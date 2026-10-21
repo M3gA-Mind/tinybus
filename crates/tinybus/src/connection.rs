@@ -456,6 +456,26 @@ impl Connection {
         Ok(())
     }
 
+    /// Export `interface` at `path` only if the same interface is not already
+    /// served there.
+    ///
+    /// Registration is atomic with respect to other calls to this method: a
+    /// collision leaves the existing implementation untouched. Use
+    /// [`Connection::serve_at`] when replacement is intentional.
+    pub async fn try_serve_at(&self, path: ObjectPath, interface: impl Interface) -> Result<()> {
+        if self
+            .inner
+            .objects
+            .write()
+            .await
+            .insert_if_absent(path, Arc::new(interface))
+        {
+            Ok(())
+        } else {
+            Err(Error::failed("interface is already served at this object path"))
+        }
+    }
+
     /// Stop exporting everything at `path`.
     pub async fn unserve(&self, path: &ObjectPath) -> bool {
         self.inner.objects.write().await.remove(path)
