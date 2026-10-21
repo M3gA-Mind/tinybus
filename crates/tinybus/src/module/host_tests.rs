@@ -2505,9 +2505,11 @@ async fn authenticates_native_context(variable: &str) {
         Some(module.clone()),
         "the peer returned by the host API must match the compiled module's broker-stamped sender"
     );
-    assert!(modules
-        .authenticated_peer(info.manifest.bus_name.as_str())
-        .is_none());
+    assert!(
+        modules
+            .authenticated_peer(info.manifest.bus_name.as_str())
+            .is_none()
+    );
     let callback: (crate::BusName, crate::BusName) =
         proxy.call_confidential("Callback", ()).await.unwrap();
     assert_eq!(callback, (sender, module));
