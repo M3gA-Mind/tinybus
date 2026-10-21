@@ -456,11 +456,11 @@ impl Connection {
         Ok(())
     }
 
-    /// Export `interface` at `path` only if the same interface is not already
-    /// served there.
+    /// Export `interface` at `path` only if no interface is already served
+    /// there.
     ///
     /// Registration is atomic with respect to other calls to this method: a
-    /// collision leaves the existing implementation untouched. Use
+    /// collision leaves every existing interface at that path untouched. Use
     /// [`Connection::serve_at`] when replacement is intentional.
     pub async fn try_serve_at(&self, path: ObjectPath, interface: impl Interface) -> Result<()> {
         if self

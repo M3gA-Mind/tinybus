@@ -111,8 +111,43 @@ async fn concurrent_try_serve_at_calls_have_exactly_one_winner() {
     if first.is_ok() {
         assert_eq!(result, Value::String("replacement".to_string()));
     } else {
-        assert_eq!(result, Value::String("original".to_string()));
+        assert_eq!(result, serde_json::json!(["original"]));
     }
+}
+
+struct DifferentInterface;
+
+#[async_trait]
+impl Interface for DifferentInterface {
+    fn name(&self) -> InterfaceName {
+        InterfaceName::new("ai.tinyhumans.Other").unwrap()
+    }
+
+    fn members(&self) -> Vec<MemberName> {
+        vec![MemberName::new("Echo").unwrap()]
+    }
+
+    async fn call(&self, _member: &MemberName, _args: Value) -> Result<Value> {
+        Ok(Value::String("other".to_string()))
+    }
+}
+
+#[tokio::test]
+async fn try_serve_at_refuses_any_occupied_object_path() {
+    let (client, service) = brokered_pair().await;
+    service
+        .serve_at(path(), DifferentInterface)
+        .await
+        .unwrap();
+    assert!(service.try_serve_at(path(), ReplacementEcho).await.is_err());
+
+    let result: Value = client
+        .proxy("ai.tinyhumans.Test", path(), "ai.tinyhumans.Other")
+        .unwrap()
+        .call("Echo", ())
+        .await
+        .unwrap();
+    assert_eq!(result, Value::String("other".to_string()));
 }
 
 fn call(member: &str, body: Value) -> Message {

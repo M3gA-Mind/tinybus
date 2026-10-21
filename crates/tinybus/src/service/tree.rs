@@ -42,7 +42,7 @@ impl ObjectTree {
         entry.push(interface);
     }
 
-    /// Export `interface` at `path` only when that interface name is vacant.
+    /// Export `interface` at `path` only when the complete path is vacant.
     ///
     /// Unlike [`Self::insert`], this never replaces a live implementation. The
     /// caller holds the connection's object-tree write lock across this check
@@ -52,15 +52,10 @@ impl ObjectTree {
         path: ObjectPath,
         interface: Arc<dyn Interface>,
     ) -> bool {
-        let name = interface.name();
-        if self
-            .objects
-            .get(&path)
-            .is_some_and(|existing| existing.iter().any(|item| item.name() == name))
-        {
+        if self.objects.contains_key(&path) {
             return false;
         }
-        self.objects.entry(path).or_default().push(interface);
+        self.objects.insert(path, vec![interface]);
         true
     }
 
