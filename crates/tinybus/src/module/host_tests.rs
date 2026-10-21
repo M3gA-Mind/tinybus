@@ -1079,6 +1079,17 @@ async fn authenticated_peer_is_available_only_for_a_live_ready_module() {
             .is_none()
     );
 
+    let connection = Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let proxy = connection
+        .proxy(
+            "ai.tinyhumans.module.Clock",
+            "/ai/tinyhumans/module/Clock",
+            "ai.tinyhumans.module.Clock",
+        )
+        .unwrap();
+    let _: Option<BusName> = proxy.call("Sender", ()).await.unwrap();
     let authenticated = host
         .authenticated_peer("clock")
         .expect("ready module has an authenticated peer");
