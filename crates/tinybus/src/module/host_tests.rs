@@ -2489,7 +2489,7 @@ async fn authenticates_native_context(variable: &str) {
     assert_eq!(
         proxy.attestation().await.unwrap(),
         Some(crate::attest::Attestation {
-            name: info.manifest.bus_name,
+            name: info.manifest.bus_name.clone(),
             sha256: hash
         })
     );
