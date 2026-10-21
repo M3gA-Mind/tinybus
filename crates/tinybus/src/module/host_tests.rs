@@ -2577,6 +2577,7 @@ async fn fixed_unique_module_calls_are_refused_in_terminal_states_before_detach(
         // Keep the real transport attached while setting its terminal state:
         // this probes the pre-detach window without racing the reader task.
         host.inner.loaded.lock().unwrap()[0].info.state = state;
+        assert!(host.authenticated_peer("clock").is_none());
         assert!(
             host.inner
                 .unavailable_for(&client.unique_name().unwrap())
