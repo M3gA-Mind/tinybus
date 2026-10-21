@@ -135,10 +135,7 @@ impl Interface for DifferentInterface {
 #[tokio::test]
 async fn try_serve_at_refuses_any_occupied_object_path() {
     let (client, service) = brokered_pair().await;
-    service
-        .serve_at(path(), DifferentInterface)
-        .await
-        .unwrap();
+    service.serve_at(path(), DifferentInterface).await.unwrap();
     assert!(service.try_serve_at(path(), ReplacementEcho).await.is_err());
 
     let result: Value = client
