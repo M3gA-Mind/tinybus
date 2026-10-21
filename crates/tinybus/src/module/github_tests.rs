@@ -136,6 +136,44 @@ fn zip_archives_extract_only_enclosed_regular_files_and_directories() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn tar_archive_root_permissions_cannot_relax_the_private_extraction_directory() {
+    use flate2::{Compression, write::GzEncoder};
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let archive_path = directory.path().join("release.tar.gz");
+    let destination = directory.path().join("extracted");
+    std::fs::create_dir(&destination).unwrap();
+
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let encoder = GzEncoder::new(file, Compression::default());
+    let mut archive = tar::Builder::new(encoder);
+    let mut root = tar::Header::new_gnu();
+    root.set_entry_type(tar::EntryType::Directory);
+    root.set_size(0);
+    root.set_mode(0o775);
+    root.set_cksum();
+    archive
+        .append_data(&mut root, ".", std::io::empty())
+        .unwrap();
+    let encoder = archive.into_inner().unwrap();
+    encoder.finish().unwrap();
+
+    extract("release.tar.gz", &archive_path, &destination).unwrap();
+
+    let mode = std::fs::metadata(&destination)
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o777,
+        0o700,
+        "archive metadata must not expose the extraction root"
+    );
+}
+
 #[test]
 /// Rejects traversal entries without writing outside the extraction directory.
 fn zip_archives_refuse_paths_outside_the_destination() {
