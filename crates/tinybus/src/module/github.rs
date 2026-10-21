@@ -111,6 +111,7 @@ pub(crate) fn acquire(
 
     let temp =
         tempfile::tempdir().map_err(|_| refused("module extraction directory is unavailable"))?;
+    restrict_extraction_directory(temp.path())?;
     let archive_path = temp.path().join(asset_name);
     download(&agent, &located.archive_url, &archive_path)?;
     verify_archive(&archive_path, &manifest_sha)?;
@@ -155,6 +156,7 @@ pub(crate) fn acquire_cached(release: &CachedRelease<'_>) -> Result<(PathBuf, St
     let manifest_sha = manifest_digest(&located, release.asset_name, release.expected_sha256)?;
 
     let staging = cache::stage(release.cache_dir)?;
+    restrict_extraction_directory(staging.path())?;
     let archive_path = staging.path().join(release.asset_name);
     download(&agent, &located.archive_url, &archive_path)?;
     verify_archive(&archive_path, &manifest_sha)?;
@@ -454,6 +456,19 @@ fn extract(name: &str, archive: &Path, destination: &Path) -> Result<()> {
 
 fn refused(reason: impl Into<String>) -> Error {
     Error::module_refused(Path::new("github-release"), reason)
+}
+
+#[cfg(unix)]
+fn restrict_extraction_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| refused("release extraction directory permissions could not be secured"))
+}
+
+#[cfg(not(unix))]
+fn restrict_extraction_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
