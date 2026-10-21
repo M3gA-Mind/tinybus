@@ -1074,9 +1074,10 @@ async fn authenticated_peer_is_available_only_for_a_live_ready_module() {
     }
     .unwrap();
     assert!(host.authenticated_peer("clock").is_none());
-    assert!(host
-        .authenticated_peer("ai.tinyhumans.module.Clock")
-        .is_none());
+    assert!(
+        host.authenticated_peer("ai.tinyhumans.module.Clock")
+            .is_none()
+    );
 
     let connection = Connection::connect(bus.connect().await.unwrap())
         .await
