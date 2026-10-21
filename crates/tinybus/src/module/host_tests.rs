@@ -1095,7 +1095,10 @@ async fn authenticated_peer_is_available_only_for_a_live_ready_module() {
     assert!(authenticated.is_unique());
     assert_eq!(sender.as_ref(), Some(&authenticated));
 
-    host.stop("clock", Duration::from_secs(5)).await.unwrap();
+    host.inner
+        .stop("clock", Duration::from_secs(5))
+        .await
+        .unwrap();
     assert!(host.authenticated_peer("clock").is_none());
     broker_task.abort();
 }
