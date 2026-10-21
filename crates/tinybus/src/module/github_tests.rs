@@ -138,13 +138,10 @@ fn zip_archives_extract_only_enclosed_regular_files_and_directories() {
 
 #[cfg(unix)]
 #[test]
-fn release_extraction_directory_is_private_even_when_tempdir_is_group_writable() {
+fn release_extraction_tempdirs_are_private_regardless_of_umask() {
     use std::os::unix::fs::PermissionsExt;
 
-    let directory = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o775)).unwrap();
-
-    restrict_extraction_directory(directory.path()).unwrap();
+    let directory = private_extraction_tempdir().unwrap();
 
     let mode = std::fs::metadata(directory.path())
         .unwrap()
@@ -153,7 +150,7 @@ fn release_extraction_directory_is_private_even_when_tempdir_is_group_writable()
     assert_eq!(
         mode & 0o777,
         0o700,
-        "the extraction root must not inherit a permissive umask"
+        "the extraction root must be owner-only"
     );
 }
 

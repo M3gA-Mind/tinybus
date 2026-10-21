@@ -109,9 +109,7 @@ pub(crate) fn acquire(
     let located = locate(&agent, owner, repo, tag, asset_name)?;
     let manifest_sha = manifest_digest(&located, asset_name, expected_sha256)?;
 
-    let temp =
-        tempfile::tempdir().map_err(|_| refused("module extraction directory is unavailable"))?;
-    restrict_extraction_directory(temp.path())?;
+    let temp = private_extraction_tempdir()?;
     let archive_path = temp.path().join(asset_name);
     download(&agent, &located.archive_url, &archive_path)?;
     verify_archive(&archive_path, &manifest_sha)?;
@@ -456,6 +454,13 @@ fn extract(name: &str, archive: &Path, destination: &Path) -> Result<()> {
 
 fn refused(reason: impl Into<String>) -> Error {
     Error::module_refused(Path::new("github-release"), reason)
+}
+
+fn private_extraction_tempdir() -> Result<tempfile::TempDir> {
+    let temp =
+        tempfile::tempdir().map_err(|_| refused("module extraction directory is unavailable"))?;
+    restrict_extraction_directory(temp.path())?;
+    Ok(temp)
 }
 
 #[cfg(unix)]
