@@ -462,11 +462,31 @@ mod resolver {
         sources: HashMap<String, ModuleSource>,
         install_dir: Option<PathBuf>,
     ) -> Fixture {
+        fixture_with_runtime(
+            record,
+            enabled,
+            sources,
+            install_dir,
+            Arc::new(|| Box::pin(async { Ok(shared_runtime()) })),
+        )
+    }
+
+    fn fixture_with_runtime(
+        record: &'static ReleaseRecord,
+        enabled: bool,
+        sources: HashMap<String, ModuleSource>,
+        install_dir: Option<PathBuf>,
+        runtime: RuntimeProvider,
+    ) -> Fixture {
         let sink = Arc::new(Recording::default());
         let config_calls = Arc::new(AtomicUsize::new(0));
         let runtime_calls = Arc::new(AtomicUsize::new(0));
         let counted = config_calls.clone();
         let started = runtime_calls.clone();
+        let measured_runtime = Arc::new(move || {
+            started.fetch_add(1, Ordering::SeqCst);
+            runtime()
+        });
         let resolver = Resolver::new(ResolverInputs {
             enabled,
             install_dir,
@@ -479,10 +499,7 @@ mod resolver {
             on_resolved: None,
             records: vec![record],
             terminal_marker: "This is terminal for the running process".to_string(),
-            runtime: Arc::new(move || {
-                started.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async { Ok(shared_runtime()) })
-            }),
+            runtime: measured_runtime,
             module_config: Arc::new(move |_| {
                 counted.fetch_add(1, Ordering::SeqCst);
                 serde_json::json!({})
@@ -495,6 +512,55 @@ mod resolver {
             runtime_calls,
             resolver,
         }
+    }
+
+    #[tokio::test]
+    async fn a_callback_request_does_not_claim_resolution_when_runtime_start_fails() {
+        use crate::module::HostCallbackEndpoint;
+
+        let record = record("resolver-callback-runtime-unavailable");
+        let runtime = shared_runtime();
+        let binding = Arc::new(
+            runtime
+                .host()
+                .prepare_host_callbacks(vec![HostCallbackEndpoint {
+                    path: "/callback".parse().unwrap(),
+                    interface: "org.example.Callback".parse().unwrap(),
+                    members: vec!["Observe".parse().unwrap()],
+                }])
+                .await
+                .unwrap(),
+        );
+        binding
+            .serve_at(
+                "/callback".parse().unwrap(),
+                ResolverCallback(Arc::new(AtomicUsize::new(0))),
+            )
+            .await
+            .unwrap();
+        let resolver = fixture_with_runtime(
+            record,
+            true,
+            HashMap::from([(
+                record.id.to_string(),
+                ModuleSource::LocalFile {
+                    path: "/unused/verified-module.so".to_owned(),
+                },
+            )]),
+            None,
+            Arc::new(|| Box::pin(async { Err(crate::Error::failed("runtime unavailable")) })),
+        );
+
+        let error = resolver
+            .resolver
+            .ensure_loaded_with_host_callbacks(record.id, binding, serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("module bus could not start"), "{error}");
+        assert_eq!(
+            resolver.resolver.state_of(record.id),
+            Availability::Available
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
