@@ -469,10 +469,7 @@ async fn abort_wakes_a_pending_write_and_retains_the_unclaimed_reader() {
         "Write",
         serde_json::json!([&id, 0, crate::stream::base64::encode(b"first")]),
     );
-    registry
-        .dispatch(&first.header, first.body)
-        .await
-        .unwrap();
+    registry.dispatch(&first.header, first.body).await.unwrap();
 
     let stream = registry.inbound.lock().unwrap().get(&id).unwrap().clone();
     let second = message(
@@ -491,10 +488,7 @@ async fn abort_wakes_a_pending_write_and_retains_the_unclaimed_reader() {
     assert!(!pending_write.is_finished());
 
     let abort = message("Abort", serde_json::json!([&id]));
-    registry
-        .dispatch(&abort.header, abort.body)
-        .await
-        .unwrap();
+    registry.dispatch(&abort.header, abort.body).await.unwrap();
     let write_result = tokio::time::timeout(Duration::from_secs(1), pending_write)
         .await
         .expect("abort must wake a chunk write blocked on the full window")
