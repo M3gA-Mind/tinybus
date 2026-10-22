@@ -498,6 +498,13 @@ mod resolver {
         let source = PathBuf::from(std::env::var_os("TINYBUS_TEST_HOST_CALLBACK_MODULE").unwrap());
         let hash = crate::module::hash::file_hex(std::fs::File::open(&source).unwrap()).unwrap();
         let staging = tempfile::tempdir_in(source.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        #[cfg(windows)]
+        crate::module::cache::secure_release_cache(source.parent().unwrap(), staging.path());
         let path = staging.path().join(source.file_name().unwrap());
         std::fs::copy(&source, &path).unwrap();
         std::fs::write(staging.path().join("modules.toml"),
