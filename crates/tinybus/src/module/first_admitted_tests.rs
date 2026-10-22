@@ -183,6 +183,10 @@ fn a_bundle_marker_is_never_honoured_from_the_download_cache() {
 fn marked_bundle(bundled: &std::path::Path) -> std::path::PathBuf {
     let dir = artifact_dir(bundled, "demo", "1.0.0", ASSET.host_key).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    for path in dir.ancestors().take_while(|path| path.starts_with(bundled)) {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     std::fs::write(
         dir.join(format!("{}.sha256", ASSET.archive)),
         format!("{}\n", ASSET.sha256),
