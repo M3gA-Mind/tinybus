@@ -54,7 +54,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::error::{Error, Result};
 use crate::message::Header;
@@ -206,6 +206,10 @@ struct Inbound {
     /// died mid-stream would leave a reader parked on a channel that can never
     /// close, which is precisely the hang this project exists to not have.
     outcome: Arc<std::sync::Mutex<Option<Outcome>>>,
+    /// Wakes a writer parked on a full window when the stream is aborted.
+    /// Unlike dropping the reader, this preserves an unclaimed reader so it can
+    /// still consume buffered chunks and observe the terminal outcome.
+    aborted: watch::Sender<bool>,
     last_activity: std::sync::Mutex<Instant>,
 }
 
@@ -218,7 +222,12 @@ impl Inbound {
     fn finish(&self, outcome: Outcome) {
         let mut slot = self.outcome.lock().expect("stream outcome lock");
         if slot.is_none() {
+            let aborted = matches!(&outcome, Outcome::Aborted(_));
             *slot = Some(outcome);
+            drop(slot);
+            if aborted {
+                self.aborted.send_replace(true);
+            }
         }
     }
 
@@ -332,6 +341,7 @@ impl StreamRegistry {
             chunks: std::sync::Mutex::new(Some(chunks)),
             reader: std::sync::Mutex::new(Some(reader)),
             outcome: Arc::new(std::sync::Mutex::new(None)),
+            aborted: watch::channel(false).0,
             last_activity: std::sync::Mutex::new(Instant::now()),
         });
 
@@ -400,6 +410,7 @@ impl StreamRegistry {
         let (id, seq, data): (String, u64, String) =
             serde_json::from_value(body).map_err(|e| Error::bad_arguments(member.clone(), e))?;
         let stream = self.lookup(&id, header)?;
+        let mut aborted = stream.aborted.subscribe();
         let limits = self.limits();
         let chunk = base64::decode(&data)?;
         if chunk.len() > MAX_CHUNK_LEN {
@@ -436,8 +447,22 @@ impl StreamRegistry {
         stream.touch();
         // The window is the whole flow-control story: this await is where a
         // sender that has run ahead of the reader waits, and the reply it is
-        // waiting on carries the sender's own deadline.
-        let delivered = chunks.send(chunk).await;
+        // waiting on carries the sender's own deadline. Abort also wakes this
+        // send while preserving an unclaimed reader for terminal observation.
+        if *aborted.borrow_and_update() {
+            return Err(Error::StreamAborted {
+                reason: "the sender aborted the stream".to_string(),
+            });
+        }
+        let delivered = tokio::select! {
+            biased;
+            _ = aborted.changed() => {
+                return Err(Error::StreamAborted {
+                    reason: "the sender aborted the stream".to_string(),
+                });
+            }
+            delivered = chunks.send(chunk) => delivered,
+        };
         drop(gate);
         if delivered.is_err() {
             // The reader was dropped. Tell the sender now rather than letting
