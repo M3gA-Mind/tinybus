@@ -120,7 +120,7 @@ impl CallbackState {
     pub(crate) async fn drain(self: &Arc<Self>, deadline: Duration) -> Result<()> {
         tokio::time::timeout(deadline, async {
             HostCallbackGuard(self.clone()).drained().await;
-            for child in self.live_children() {
+            for child in self.live_descendants() {
                 HostCallbackGuard(child).drained().await;
             }
         })
@@ -135,6 +135,15 @@ impl CallbackState {
             .collect();
         children.retain(|child| child.strong_count() != 0);
         live
+    }
+    fn live_descendants(&self) -> Vec<Arc<CallbackState>> {
+        let mut pending = self.live_children();
+        let mut descendants = Vec::new();
+        while let Some(child) = pending.pop() {
+            pending.extend(child.live_children());
+            descendants.push(child);
+        }
+        descendants
     }
     fn module_live(&self) -> bool {
         self.module_transport
@@ -501,17 +510,15 @@ impl HostCallbackBinding {
     /// Immediately and idempotently prevent new route and user-dispatch admission.
     /// Running user futures remain accounted for until actual completion/drop.
     pub fn revoke(&self) {
-        self.broker
+        let descendants = self.state.live_descendants();
+        let mut router = self
+            .broker
             .router
             .lock()
-            .expect("router lock")
-            .revoke_host_callbacks(&self.state);
-        for child in self.state.live_children() {
-            self.broker
-                .router
-                .lock()
-                .expect("router lock")
-                .revoke_host_callbacks(&child);
+            .expect("router lock");
+        router.revoke_host_callbacks(&self.state);
+        for child in descendants {
+            router.revoke_host_callbacks(&child);
         }
     }
 
@@ -601,6 +608,7 @@ impl HostCallbackBinding {
         }
         router.add_host_callbacks(child.clone())?;
         let mut children = self.state.children.lock().expect("callback children lock");
+        children.retain(|existing| existing.strong_count() != 0);
         children.push(Arc::downgrade(&child));
         drop(children);
         drop(router);
