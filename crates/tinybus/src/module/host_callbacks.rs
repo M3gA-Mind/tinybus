@@ -65,6 +65,10 @@ pub(crate) struct CallbackState {
     stream_endpoints: Vec<HostStreamCallbackEndpoint>,
     signals: Vec<HostCallbackSignal>,
     module_transport: Mutex<Option<std::sync::Weak<ModuleTransport>>>,
+    // A descendant callback future keeps its state alive, so retaining its parent
+    // chain lets root drain still find it after an intermediate binding is dropped.
+    // The reverse child links stay weak, avoiding an ownership cycle.
+    _parent: Option<Arc<CallbackState>>,
     children: Mutex<Vec<std::sync::Weak<CallbackState>>>,
     lifetime: Mutex<Lifetime>,
     drained: Notify,
@@ -586,6 +590,7 @@ impl HostCallbackBinding {
             stream_endpoints: Vec::new(),
             signals: Vec::new(),
             module_transport: Mutex::new(Some(Arc::downgrade(&module_transport))),
+            _parent: Some(self.state.clone()),
             children: Mutex::new(Vec::new()),
             lifetime: Mutex::new(Lifetime {
                 active: true,
@@ -984,6 +989,7 @@ impl ModuleHost {
                 stream_endpoints,
                 signals,
                 module_transport: Mutex::new(None),
+                _parent: None,
                 children: Mutex::new(Vec::new()),
                 lifetime: Mutex::new(Lifetime {
                     active: false,
