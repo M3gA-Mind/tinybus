@@ -116,6 +116,41 @@ fn an_asset_name_that_leaves_the_cache_directory_is_refused() {
 }
 
 #[test]
+fn a_concurrent_fill_that_verifies_is_kept_rather_than_replaced() {
+    // A sibling process committed and verified this release while we were
+    // downloading it; it may have the module mapped right now.
+    let directory = tempfile::tempdir().unwrap();
+    let cache_dir = directory.path().join("demo").join("1.0.0");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    std::fs::write(cache_dir.join("demo-1.0.0.tar.gz"), b"archive").unwrap();
+    let module = cache_dir.join(format!("libdemo_module.{}", cache::library_extension()));
+    std::fs::write(&module, b"library").unwrap();
+    let sibling_mapped = cache_dir.join("in-use-by-sibling");
+    std::fs::write(&sibling_mapped, b"").unwrap();
+    let digest = crate::module::sha256_file(cache_dir.join("demo-1.0.0.tar.gz")).unwrap();
+
+    let staging = cache::stage(&cache_dir).unwrap();
+    std::fs::write(staging.path().join("demo-1.0.0.tar.gz"), b"archive").unwrap();
+    std::fs::write(staging.path().join(module.file_name().unwrap()), b"library").unwrap();
+    let release = CachedRelease {
+        release_url: "https://github.com/tinyhumansai/demo/releases/tag/v1.0.0",
+        asset_name: "demo-1.0.0.tar.gz",
+        expected_sha256: Some(&digest),
+        cache_dir: &cache_dir,
+        allow_download: true,
+    };
+    let relative = module.strip_prefix(&cache_dir).unwrap().to_path_buf();
+    let (found, sha256) = commit_or_reuse(staging, &release, &relative, digest.clone()).unwrap();
+
+    assert!(
+        sibling_mapped.exists(),
+        "the sibling's verified cache directory was replaced"
+    );
+    assert_eq!(found, std::fs::canonicalize(module).unwrap());
+    assert_eq!(sha256, digest);
+}
+
+#[test]
 fn a_verified_cache_answers_without_the_network() {
     let directory = tempfile::tempdir().unwrap();
     let cache_dir = directory.path().join("demo").join("1.0.0");
