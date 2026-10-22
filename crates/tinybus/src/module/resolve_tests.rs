@@ -491,7 +491,7 @@ mod resolver {
             fn members(&self) -> Vec<MemberName> { vec!["Observe".parse().unwrap()] }
             async fn call(&self, _: &MemberName, _: serde_json::Value) -> crate::Result<serde_json::Value> {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(serde_json::Value::Null)
+                Ok(serde_json::json!("org.example.Callback"))
             }
         }
 
