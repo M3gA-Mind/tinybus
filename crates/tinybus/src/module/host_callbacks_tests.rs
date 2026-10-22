@@ -75,6 +75,54 @@ fn state(source: BusName, destination: BusName) -> Arc<CallbackState> {
     })
 }
 
+#[tokio::test]
+async fn reset_requests_receive_distinct_revocable_host_callback_bindings() {
+    let bus = crate::transport::memory::MemoryBus::new();
+    let broker = Broker::new();
+    let broker_task = broker.spawn(bus.clone());
+    let host = ModuleHost::new(broker.clone());
+    let parent = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
+    let module = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let module_peer = module.unique_name().unwrap();
+    let (module_transport, _) =
+        crate::module::transport::ModuleTransport::new("reset-test".into(), vec![]);
+    *parent.state.module_transport.lock().unwrap() =
+        Some(Arc::downgrade(&module_transport));
+    {
+        let mut lifetime = parent.state.lifetime.lock().unwrap();
+        lifetime.active = true;
+        lifetime.module = Some(module_peer.clone());
+    }
+    broker.attest_module(
+        &module_peer,
+        crate::attest::Attestation {
+            name: "org.example.ResetTest".parse().unwrap(),
+            sha256: "a".repeat(64),
+        },
+    );
+    let context = CallContext::brokered(Some(&module_peer), true);
+
+    let first_reset = parent
+        .create_child_binding(&context, vec![endpoint()])
+        .await
+        .unwrap();
+    let second_reset = parent
+        .create_child_binding(&context, vec![endpoint()])
+        .await
+        .unwrap();
+
+    assert_ne!(first_reset.unique_name(), second_reset.unique_name());
+    assert!(HostCallbackGuard(first_reset.state.clone()).authorizes(&context));
+    assert!(HostCallbackGuard(second_reset.state.clone()).authorizes(&context));
+    parent.revoke();
+    assert!(!HostCallbackGuard(first_reset.state.clone()).authorizes(&context));
+    assert!(!HostCallbackGuard(second_reset.state.clone()).authorizes(&context));
+
+    broker_task.abort();
+}
+
 struct MixedCallback;
 #[async_trait]
 impl Interface for MixedCallback {
