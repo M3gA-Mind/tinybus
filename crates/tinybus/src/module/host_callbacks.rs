@@ -204,6 +204,23 @@ impl CallbackState {
             .clone()
             .ok_or_else(|| Error::failed("directed signal recipient is unavailable"))
     }
+
+    fn authorized_stream_module(&self, context: &CallContext) -> Result<BusName> {
+        let state = self.lifetime.lock().expect("callback lifetime lock");
+        if context.is_confidential()
+            || self.stream_endpoints.is_empty()
+            || !self.module_live()
+            || !state.active
+            || state.module.is_none()
+            || context.authenticated_sender() != state.module.as_ref()
+        {
+            return Err(Error::failed("callback stream authority is unavailable"));
+        }
+        state
+            .module
+            .clone()
+            .ok_or_else(|| Error::failed("callback stream recipient is unavailable"))
+    }
 }
 
 /// Read-only liveness and authenticated module identity for a callback worker.
@@ -219,7 +236,10 @@ impl HostCallbackGuard {
         self.0.module_peer()
     }
 
-    /// Whether this binding remains active for this authenticated sender.
+    /// Whether this confidential callback binding remains active for this sender.
+    ///
+    /// Ordinary stream callbacks are checked separately with
+    /// [`HostCallbackGuard::authorizes_stream`].
     pub fn authorizes(&self, context: &CallContext) -> bool {
         let state = self.0.lifetime.lock().expect("callback lifetime lock");
         state.active
@@ -227,6 +247,12 @@ impl HostCallbackGuard {
             && context.is_confidential()
             && state.module.is_some()
             && context.authenticated_sender() == state.module.as_ref()
+    }
+
+    /// Whether this binding remains active for an ordinary stream callback
+    /// from its exact authenticated module sender.
+    pub fn authorizes_stream(&self, context: &CallContext) -> bool {
+        self.0.authorized_stream_module(context).is_ok()
     }
 
     /// Number of callbacks whose user futures have not yet completed or dropped.
@@ -398,20 +424,7 @@ impl HostCallbackBinding {
     }
 
     fn authorized_stream_module(&self, context: &CallContext) -> Result<BusName> {
-        let state = self.state.lifetime.lock().expect("callback lifetime lock");
-        if context.is_confidential()
-            || self.state.stream_endpoints.is_empty()
-            || !self.state.module_live()
-            || !state.active
-            || state.module.is_none()
-            || context.authenticated_sender() != state.module.as_ref()
-        {
-            return Err(Error::failed("callback stream authority is unavailable"));
-        }
-        state
-            .module
-            .clone()
-            .ok_or_else(|| Error::failed("callback stream recipient is unavailable"))
+        self.state.authorized_stream_module(context)
     }
 
     /// Construct an outgoing proxy using this private host connection.
