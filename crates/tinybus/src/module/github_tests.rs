@@ -284,3 +284,69 @@ fn zip_archives_do_not_apply_setuid_or_executable_permissions() {
     assert_eq!(mode & 0o7000, 0, "special permission bits are not applied");
     assert_eq!(mode & 0o111, 0, "executable permission is not applied");
 }
+
+#[cfg(unix)]
+#[test]
+/// Rejects tar symlink entries the same way the zip branch does.
+fn tar_archives_refuse_symlink_entries() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive_path = directory.path().join("m.tar.gz");
+    let destination = directory.path().join("extracted");
+    std::fs::create_dir(&destination).unwrap();
+
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut builder = tar::Builder::new(flate2::write::GzEncoder::new(
+        file,
+        flate2::Compression::default(),
+    ));
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Symlink);
+    header.set_size(0);
+    header.set_mode(0o777);
+    builder
+        .append_link(&mut header, "libx_module.dylib", "/outside.dylib")
+        .unwrap();
+    builder.into_inner().unwrap().finish().unwrap();
+
+    let result = extract("m.tar.gz", &archive_path, &destination);
+    let link = destination.join("libx_module.dylib");
+    assert!(
+        result.is_err(),
+        "tar symlink accepted; link exists={} -> {:?}",
+        link.symlink_metadata().is_ok(),
+        std::fs::read_link(&link).ok()
+    );
+    assert!(link.symlink_metadata().is_err());
+}
+
+#[test]
+/// Rejects tar hard-link entries, which can also alias a file outside the archive.
+fn tar_archives_refuse_hard_link_entries() {
+    let directory = tempfile::tempdir().unwrap();
+    let archive_path = directory.path().join("m.tar");
+    let destination = directory.path().join("extracted");
+    std::fs::create_dir(&destination).unwrap();
+
+    let file = std::fs::File::create(&archive_path).unwrap();
+    let mut builder = tar::Builder::new(file);
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Link);
+    header.set_size(0);
+    header.set_mode(0o644);
+    builder
+        .append_link(&mut header, "libx_module.dylib", "../outside.dylib")
+        .unwrap();
+    builder.finish().unwrap();
+
+    let error = extract("m.tar", &archive_path, &destination).unwrap_err();
+    assert!(
+        error.to_string().contains("unsupported entry type"),
+        "{error}"
+    );
+    assert!(
+        destination
+            .join("libx_module.dylib")
+            .symlink_metadata()
+            .is_err()
+    );
+}

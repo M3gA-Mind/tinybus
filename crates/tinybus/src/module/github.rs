@@ -397,21 +397,47 @@ fn validate_hash(hash: &str) -> Result<()> {
     Ok(())
 }
 
-/// Extracts a release archive into `destination`, refusing unsafe ZIP paths and entry types.
+/// Unpacks only regular files, the same entry types the ZIP branch accepts. A
+/// symlink or hard link could point a module path outside `destination`, so it
+/// is refused. Directory entries are skipped: `unpack_in` creates parents, and
+/// an archived directory's metadata must not widen the extraction root.
+fn unpack_tar(reader: impl std::io::Read, destination: &Path) -> Result<()> {
+    let mut archive = tar::Archive::new(reader);
+    let entries = archive
+        .entries()
+        .map_err(|_| refused("release archive is invalid"))?;
+    for entry in entries {
+        let mut entry = entry.map_err(|_| refused("release archive is invalid"))?;
+        match entry.header().entry_type() {
+            tar::EntryType::Directory => {}
+            tar::EntryType::Regular | tar::EntryType::Continuous => {
+                let inside = entry
+                    .unpack_in(destination)
+                    .map_err(|_| refused("release archive extraction failed"))?;
+                if !inside {
+                    return Err(refused("release archive contains an unsafe path"));
+                }
+            }
+            _ => {
+                return Err(refused(
+                    "release archive contains an unsupported entry type",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Extracts a release archive into `destination`, refusing unsafe paths and entry types.
 fn extract(name: &str, archive: &Path, destination: &Path) -> Result<()> {
     if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
         let file =
             std::fs::File::open(archive).map_err(|_| refused("release archive is unreadable"))?;
-        let decoder = flate2::read::GzDecoder::new(file);
-        tar::Archive::new(decoder)
-            .unpack(destination)
-            .map_err(|_| refused("release archive extraction failed"))?;
+        unpack_tar(flate2::read::GzDecoder::new(file), destination)?;
     } else if name.ends_with(".tar") {
         let file =
             std::fs::File::open(archive).map_err(|_| refused("release archive is unreadable"))?;
-        tar::Archive::new(file)
-            .unpack(destination)
-            .map_err(|_| refused("release archive extraction failed"))?;
+        unpack_tar(file, destination)?;
     } else if name.ends_with(".zip") {
         let file =
             std::fs::File::open(archive).map_err(|_| refused("release archive is unreadable"))?;
