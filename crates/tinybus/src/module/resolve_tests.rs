@@ -436,6 +436,26 @@ mod resolver {
         resolver: Resolver,
     }
 
+    struct ResolverCallback(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl crate::Interface for ResolverCallback {
+        fn name(&self) -> crate::InterfaceName {
+            "org.example.Callback".parse().unwrap()
+        }
+        fn members(&self) -> Vec<crate::MemberName> {
+            vec!["Observe".parse().unwrap()]
+        }
+        async fn call(
+            &self,
+            _: &crate::MemberName,
+            _: serde_json::Value,
+        ) -> crate::Result<serde_json::Value> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!("org.example.Callback"))
+        }
+    }
+
     fn fixture(
         record: &'static ReleaseRecord,
         enabled: bool,
@@ -481,19 +501,6 @@ mod resolver {
     #[ignore = "requires TINYBUS_TEST_HOST_CALLBACK_MODULE to point at the built cdylib"]
     async fn resolver_loads_a_verified_module_with_only_its_prepared_host_callback() {
         use crate::module::HostCallbackEndpoint;
-        use crate::{Interface, InterfaceName, MemberName};
-        use std::sync::atomic::AtomicUsize;
-
-        struct Callback(Arc<AtomicUsize>);
-        #[async_trait::async_trait]
-        impl Interface for Callback {
-            fn name(&self) -> InterfaceName { "org.example.Callback".parse().unwrap() }
-            fn members(&self) -> Vec<MemberName> { vec!["Observe".parse().unwrap()] }
-            async fn call(&self, _: &MemberName, _: serde_json::Value) -> crate::Result<serde_json::Value> {
-                self.0.fetch_add(1, Ordering::SeqCst);
-                Ok(serde_json::json!("org.example.Callback"))
-            }
-        }
 
         let source = PathBuf::from(std::env::var_os("TINYBUS_TEST_HOST_CALLBACK_MODULE").unwrap());
         let hash = crate::module::hash::file_hex(std::fs::File::open(&source).unwrap()).unwrap();
@@ -522,7 +529,7 @@ mod resolver {
             members: vec!["Observe".parse().unwrap()],
         }]).await.unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
-        binding.serve_at("/callback".parse().unwrap(), Callback(calls.clone())).await.unwrap();
+        binding.serve_at("/callback".parse().unwrap(), ResolverCallback(calls.clone())).await.unwrap();
         let f = fixture(record, true, HashMap::from([(
             record.id.to_string(), ModuleSource::LocalFile { path: path.to_string_lossy().into_owned() }
         )]), None);
@@ -532,6 +539,34 @@ mod resolver {
         assert!(loaded.is_ok(), "{loaded:?}; callbacks={}", calls.load(Ordering::SeqCst));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "resolver init did not use its exact prepared callback");
         assert!(runtime.host().list().iter().any(|module| module.manifest.bus_name.as_str() == "org.example.EagerCallback"));
+    }
+
+    #[tokio::test]
+    async fn resolver_refuses_host_callbacks_for_pinned_sources_before_loading() {
+        use crate::module::HostCallbackEndpoint;
+
+        let record = record("resolver-callback-pinned-refusal");
+        let runtime = shared_runtime();
+        let binding = Arc::new(runtime.host().prepare_host_callbacks(vec![HostCallbackEndpoint {
+            path: "/callback".parse().unwrap(),
+            interface: "org.example.Callback".parse().unwrap(),
+            members: vec!["Observe".parse().unwrap()],
+        }]).await.unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        binding.serve_at("/callback".parse().unwrap(), ResolverCallback(calls.clone())).await.unwrap();
+        let f = fixture(record, true, HashMap::from([(
+            record.id.to_string(), ModuleSource::Pinned
+        )]), None);
+
+        let error = f.resolver.ensure_loaded_with_host_callbacks(
+            record.id,
+            binding,
+            serde_json::json!({ "host": "untrusted-config-must-not-be-used" }),
+        ).await.unwrap_err();
+        assert!(error.contains("verified local-file source"), "{error}");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "unsupported source reached a callback");
+        assert_eq!(f.config_calls.load(Ordering::SeqCst), 0, "resolver's generic config ran");
+        assert_eq!(f.resolver.state_of(record.id), Availability::Failed);
     }
 
     #[tokio::test]

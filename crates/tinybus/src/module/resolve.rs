@@ -682,7 +682,11 @@ impl Resolver {
                     self.blocking(move || Self::load_local(runtime, &path, record.id, module_config))
                         .await
                 };
-                return recover_admission(result, &runtime.host().list(), record);
+                return if callbacks.is_some() {
+                    result
+                } else {
+                    recover_admission(result, &runtime.host().list(), record)
+                };
             }
             Some(ModuleSource::Linked) => {
                 if callbacks.is_some() {

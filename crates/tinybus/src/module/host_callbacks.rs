@@ -1045,6 +1045,29 @@ impl ModuleHost {
         .await
     }
 
+    /// Acquire a release-cache artifact against its pinned checksum and load
+    /// it with an exact callback binding and resolver identity. The one-use
+    /// binding means this method makes one admission attempt; callers must
+    /// treat any refusal as terminal rather than retrying another artifact.
+    pub async fn load_github_release_cached_with_host_callbacks_for(
+        &self,
+        release: &crate::module::CachedRelease<'_>,
+        config: serde_json::Value,
+        binding: &HostCallbackBinding,
+        expected_bus_name: &str,
+        expected_object_path: &str,
+    ) -> Result<ModuleInfo> {
+        let (module, _archive_sha256) = crate::module::github::acquire_cached(release)?;
+        self.load_file_with_host_callbacks_for(
+            module,
+            config,
+            binding,
+            expected_bus_name,
+            expected_object_path,
+        )
+        .await
+    }
+
     async fn load_file_with_host_callbacks_matching(
         &self,
         path: impl AsRef<Path>,
