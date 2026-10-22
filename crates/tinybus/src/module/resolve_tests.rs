@@ -511,7 +511,7 @@ mod resolver {
         }]).await.unwrap());
         let calls = Arc::new(AtomicUsize::new(0));
         binding.serve_at("/callback".parse().unwrap(), Callback(calls.clone())).await.unwrap();
-        let mut f = fixture(record, true, HashMap::from([(
+        let f = fixture(record, true, HashMap::from([(
             record.id.to_string(), ModuleSource::LocalFile { path: path.to_string_lossy().into_owned() }
         )]), None);
 
