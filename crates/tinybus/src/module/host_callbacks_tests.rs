@@ -59,6 +59,8 @@ fn state(source: BusName, destination: BusName) -> Arc<CallbackState> {
         stream_endpoints: vec![],
         signals: vec![signal_declaration()],
         module_transport: Mutex::new(None),
+        _parent: None,
+        children: Mutex::new(Vec::new()),
         lifetime: Mutex::new(Lifetime {
             active: true,
             used: true,
@@ -72,6 +74,219 @@ fn state(source: BusName, destination: BusName) -> Arc<CallbackState> {
         physical_drained: std::sync::Condvar::new(),
         physical_wait_started: Notify::new(),
     })
+}
+
+#[tokio::test]
+async fn reset_requests_receive_distinct_revocable_host_callback_bindings() {
+    let bus = crate::transport::memory::MemoryBus::new();
+    let broker = Broker::new();
+    let broker_task = broker.spawn(bus.clone());
+    let host = ModuleHost::new(broker.clone());
+    let parent = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
+    let module = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let module_peer = module.unique_name().unwrap();
+    let (module_transport, _) =
+        crate::module::transport::ModuleTransport::new("reset-test".into(), vec![]);
+    *parent.state.module_transport.lock().unwrap() = Some(Arc::downgrade(&module_transport));
+    {
+        let mut lifetime = parent.state.lifetime.lock().unwrap();
+        lifetime.active = true;
+        lifetime.module = Some(module_peer.clone());
+    }
+    broker.attest_module(
+        &module_peer,
+        crate::attest::Attestation {
+            name: "org.example.ResetTest".parse().unwrap(),
+            sha256: "a".repeat(64),
+        },
+    );
+    let context = CallContext::brokered(Some(&module_peer), true);
+
+    let first_reset = parent
+        .create_child_binding(&context, vec![endpoint()])
+        .await
+        .unwrap();
+    let second_reset = parent
+        .create_child_binding(&context, vec![endpoint()])
+        .await
+        .unwrap();
+    let grandchild = first_reset
+        .create_child_binding(&context, vec![endpoint()])
+        .await
+        .unwrap();
+
+    assert_ne!(first_reset.unique_name(), second_reset.unique_name());
+    assert!(HostCallbackGuard(first_reset.state.clone()).authorizes(&context));
+    assert!(HostCallbackGuard(second_reset.state.clone()).authorizes(&context));
+    assert!(HostCallbackGuard(grandchild.state.clone()).authorizes(&context));
+    parent.revoke();
+    assert!(!HostCallbackGuard(first_reset.state.clone()).authorizes(&context));
+    assert!(!HostCallbackGuard(second_reset.state.clone()).authorizes(&context));
+    assert!(!HostCallbackGuard(grandchild.state.clone()).authorizes(&context));
+
+    broker_task.abort();
+}
+
+#[tokio::test]
+async fn draining_a_binding_waits_for_running_grandchild_callbacks() {
+    let bus = crate::transport::memory::MemoryBus::new();
+    let broker = Broker::new();
+    let broker_task = broker.spawn(bus.clone());
+    let host = ModuleHost::new(broker.clone());
+    let parent = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
+    let module = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let module_peer = module.unique_name().unwrap();
+    broker.attest_module(
+        &module_peer,
+        crate::attest::Attestation {
+            name: "org.example.NestedDrainTest".parse().unwrap(),
+            sha256: "a".repeat(64),
+        },
+    );
+    let (module_transport, _) =
+        crate::module::transport::ModuleTransport::new("nested-drain-test".into(), vec![]);
+    *parent.state.module_transport.lock().unwrap() = Some(Arc::downgrade(&module_transport));
+    {
+        let mut lifetime = parent.state.lifetime.lock().unwrap();
+        lifetime.active = true;
+        lifetime.module = Some(module_peer.clone());
+    }
+    let context = CallContext::brokered(Some(&module_peer), true);
+    let child = parent
+        .create_child_binding(&context, vec![endpoint()])
+        .await
+        .unwrap();
+    let grandchild = child
+        .create_child_binding(&context, vec![endpoint()])
+        .await
+        .unwrap();
+    grandchild.state.lifetime.lock().unwrap().running = 1;
+
+    let mut drain = Box::pin(parent.state.drain(Duration::from_secs(1)));
+    let first_poll =
+        std::future::poll_fn(|context| std::task::Poll::Ready(drain.as_mut().poll(context))).await;
+    assert!(
+        first_poll.is_pending(),
+        "drain must include live grandchildren"
+    );
+
+    grandchild.state.lifetime.lock().unwrap().running = 0;
+    grandchild.state.drained.notify_waiters();
+    drain.await.unwrap();
+
+    broker_task.abort();
+}
+
+#[tokio::test]
+async fn root_drain_retains_ancestry_for_running_grandchild_after_child_drop() {
+    let bus = crate::transport::memory::MemoryBus::new();
+    let broker = Broker::new();
+    let broker_task = broker.spawn(bus.clone());
+    let host = ModuleHost::new(broker.clone());
+    let parent = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
+    let module = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let module_peer = module.unique_name().unwrap();
+    broker.attest_module(
+        &module_peer,
+        crate::attest::Attestation {
+            name: "org.example.DescendantAncestryTest".parse().unwrap(),
+            sha256: "a".repeat(64),
+        },
+    );
+    let (module_transport, _) =
+        crate::module::transport::ModuleTransport::new("descendant-ancestry-test".into(), vec![]);
+    *parent.state.module_transport.lock().unwrap() = Some(Arc::downgrade(&module_transport));
+    {
+        let mut lifetime = parent.state.lifetime.lock().unwrap();
+        lifetime.active = true;
+        lifetime.module = Some(module_peer.clone());
+    }
+    let context = CallContext::brokered(Some(&module_peer), true);
+    let child = parent
+        .create_child_binding(&context, vec![endpoint()])
+        .await
+        .unwrap();
+    let grandchild = child
+        .create_child_binding(&context, vec![endpoint()])
+        .await
+        .unwrap();
+    grandchild.state.lifetime.lock().unwrap().running = 1;
+    let running = Running(grandchild.state.clone());
+
+    drop(grandchild);
+    drop(child);
+
+    let mut drain = Box::pin(parent.state.drain(Duration::from_secs(1)));
+    let first_poll =
+        std::future::poll_fn(|context| std::task::Poll::Ready(drain.as_mut().poll(context))).await;
+    let waited_for_running_grandchild = first_poll.is_pending();
+
+    drop(running);
+    if waited_for_running_grandchild {
+        drain.await.unwrap();
+    }
+    broker_task.abort();
+
+    assert!(
+        waited_for_running_grandchild,
+        "root drain must retain the path to a running grandchild after its child binding is dropped"
+    );
+}
+
+#[tokio::test]
+async fn child_creation_prunes_expired_parent_entries() {
+    let bus = crate::transport::memory::MemoryBus::new();
+    let broker = Broker::new();
+    let broker_task = broker.spawn(bus.clone());
+    let host = ModuleHost::new(broker.clone());
+    let parent = host.prepare_host_callbacks(vec![endpoint()]).await.unwrap();
+    let module = crate::Connection::connect(bus.connect().await.unwrap())
+        .await
+        .unwrap();
+    let module_peer = module.unique_name().unwrap();
+    broker.attest_module(
+        &module_peer,
+        crate::attest::Attestation {
+            name: "org.example.ExpiredChildTest".parse().unwrap(),
+            sha256: "a".repeat(64),
+        },
+    );
+    let (module_transport, _) =
+        crate::module::transport::ModuleTransport::new("expired-child-test".into(), vec![]);
+    *parent.state.module_transport.lock().unwrap() = Some(Arc::downgrade(&module_transport));
+    {
+        let mut lifetime = parent.state.lifetime.lock().unwrap();
+        lifetime.active = true;
+        lifetime.module = Some(module_peer.clone());
+    }
+    let context = CallContext::brokered(Some(&module_peer), true);
+    let expired = parent
+        .create_child_binding(&context, vec![endpoint()])
+        .await
+        .unwrap();
+    drop(expired);
+
+    let _replacement = parent
+        .create_child_binding(&context, vec![endpoint()])
+        .await
+        .unwrap();
+    assert!(
+        parent
+            .state
+            .children
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|child| child.strong_count() != 0)
+    );
+
+    broker_task.abort();
 }
 
 struct MixedCallback;

@@ -65,6 +65,11 @@ pub(crate) struct CallbackState {
     stream_endpoints: Vec<HostStreamCallbackEndpoint>,
     signals: Vec<HostCallbackSignal>,
     module_transport: Mutex<Option<std::sync::Weak<ModuleTransport>>>,
+    // A descendant callback future keeps its state alive, so retaining its parent
+    // chain lets root drain still find it after an intermediate binding is dropped.
+    // The reverse child links stay weak, avoiding an ownership cycle.
+    _parent: Option<Arc<CallbackState>>,
+    children: Mutex<Vec<std::sync::Weak<CallbackState>>>,
     lifetime: Mutex<Lifetime>,
     drained: Notify,
     physical_drained: std::sync::Condvar,
@@ -110,12 +115,39 @@ impl CallbackState {
                 .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+        drop(state);
+        for child in self.live_children() {
+            child.wait_drained();
+        }
     }
 
     pub(crate) async fn drain(self: &Arc<Self>, deadline: Duration) -> Result<()> {
-        tokio::time::timeout(deadline, HostCallbackGuard(self.clone()).drained())
-            .await
-            .map_err(|_| Error::failed("module callback work exceeded lifecycle deadline"))
+        tokio::time::timeout(deadline, async {
+            HostCallbackGuard(self.clone()).drained().await;
+            for child in self.live_descendants() {
+                HostCallbackGuard(child).drained().await;
+            }
+        })
+        .await
+        .map_err(|_| Error::failed("module callback work exceeded lifecycle deadline"))
+    }
+    fn live_children(&self) -> Vec<Arc<CallbackState>> {
+        let mut children = self.children.lock().expect("callback children lock");
+        let live = children
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
+        children.retain(|child| child.strong_count() != 0);
+        live
+    }
+    fn live_descendants(&self) -> Vec<Arc<CallbackState>> {
+        let mut pending = self.live_children();
+        let mut descendants = Vec::new();
+        while let Some(child) = pending.pop() {
+            pending.extend(child.live_children());
+            descendants.push(child);
+        }
+        descendants
     }
     fn module_live(&self) -> bool {
         self.module_transport
@@ -482,11 +514,124 @@ impl HostCallbackBinding {
     /// Immediately and idempotently prevent new route and user-dispatch admission.
     /// Running user futures remain accounted for until actual completion/drop.
     pub fn revoke(&self) {
-        self.broker
-            .router
+        let mut router = self.broker.router.lock().expect("router lock");
+        // Serialize against child creation: it holds this lock while checking
+        // the parent and recording the child, so the walk sees every child
+        // created before revocation and later attempts fail the liveness check.
+        router.revoke_host_callbacks(&self.state);
+        let descendants = self.state.live_descendants();
+        for child in descendants {
+            router.revoke_host_callbacks(&child);
+        }
+    }
+
+    /// Create a fresh callback destination for the module bound to this live
+    /// binding. The child has only the declared endpoints, and is revoked with
+    /// this parent or when the module stops. Hosts use child bindings when a
+    /// module operation needs a new isolated host-owned capability scope.
+    ///
+    /// # Errors
+    /// Returns an error unless `context` is an authorized callback from the
+    /// exact live module, or if endpoint declarations or registration fail.
+    pub async fn create_child_binding(
+        &self,
+        context: &CallContext,
+        endpoints: Vec<HostCallbackEndpoint>,
+    ) -> Result<HostCallbackBinding> {
+        if !HostCallbackGuard(self.state.clone()).authorizes(context) {
+            return Err(Error::failed("callback child requires its live module"));
+        }
+        if endpoints.is_empty()
+            || endpoints.len() > 32
+            || endpoints.iter().any(|endpoint| {
+                endpoint.members.is_empty()
+                    || endpoint.members.len() > 64
+                    || endpoint
+                        .members
+                        .iter()
+                        .enumerate()
+                        .any(|(index, member)| endpoint.members[..index].contains(member))
+            })
+            || endpoints.iter().enumerate().any(|(index, endpoint)| {
+                endpoints[..index].iter().any(|previous| {
+                    previous.path == endpoint.path && previous.interface == endpoint.interface
+                })
+            })
+        {
+            return Err(Error::failed(
+                "callback child endpoint declaration is invalid",
+            ));
+        }
+        let (host, peer) = MemoryTransport::pair();
+        let unique = self.broker.attach(Arc::new(peer));
+        let transport = Arc::new(host);
+        let mut rollback = PeerRollback {
+            broker: self.broker.clone(),
+            peer: unique,
+            transport: transport.clone(),
+            committed: false,
+        };
+        let connection = Connection::attach(transport.clone());
+        connection.handshake().await?;
+        let destination = connection
+            .unique_name()
+            .ok_or_else(|| Error::failed("callback connection has no unique name"))?;
+        let module_transport = self
+            .state
+            .module_transport
             .lock()
-            .expect("router lock")
-            .revoke_host_callbacks(&self.state);
+            .expect("callback module lock")
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| Error::failed("callback module is no longer live"))?;
+        let child = Arc::new(CallbackState {
+            destination,
+            endpoints,
+            stream_endpoints: Vec::new(),
+            signals: Vec::new(),
+            module_transport: Mutex::new(Some(Arc::downgrade(&module_transport))),
+            _parent: Some(self.state.clone()),
+            children: Mutex::new(Vec::new()),
+            lifetime: Mutex::new(Lifetime {
+                active: true,
+                used: false,
+                revoked: false,
+                module: self.state.module_peer(),
+                running: 0,
+                served: Vec::new(),
+                registering: Vec::new(),
+            }),
+            drained: Notify::new(),
+            physical_drained: std::sync::Condvar::new(),
+            #[cfg(test)]
+            physical_wait_started: Notify::new(),
+        });
+        let mut router = self.broker.router.lock().expect("router lock");
+        if !HostCallbackGuard(self.state.clone()).authorizes(context) {
+            return Err(Error::failed("callback parent was revoked during creation"));
+        }
+        router.add_host_callbacks(child.clone())?;
+        let mut children = self.state.children.lock().expect("callback children lock");
+        children.retain(|existing| existing.strong_count() != 0);
+        children.push(Arc::downgrade(&child));
+        drop(children);
+        drop(router);
+        rollback.committed = true;
+        Ok(HostCallbackBinding {
+            owner: self.owner.clone(),
+            broker: self.broker.clone(),
+            connection,
+            state: child,
+            transport,
+            #[cfg(test)]
+            after_attach: Mutex::new(None),
+            #[cfg(test)]
+            fixture_controller: Mutex::new(None),
+            #[cfg(test)]
+            before_load_decision: Mutex::new(None),
+            #[cfg(test)]
+            after_load_termination: Mutex::new(None),
+        })
     }
     /// Revoke and close the local connection. This does not cancel running user code.
     pub async fn close(&self) -> Result<()> {
@@ -844,6 +989,8 @@ impl ModuleHost {
                 stream_endpoints,
                 signals,
                 module_transport: Mutex::new(None),
+                _parent: None,
+                children: Mutex::new(Vec::new()),
                 lifetime: Mutex::new(Lifetime {
                     active: false,
                     used: false,
