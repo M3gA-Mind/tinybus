@@ -474,6 +474,33 @@ impl Resolver {
             return Err(LoadError::Disabled(label));
         }
 
+        if callbacks.is_some() {
+            if !matches!(
+                self.inner.sources.get(id),
+                Some(ModuleSource::LocalFile { .. })
+            ) {
+                return Err(LoadError::Failed(format!(
+                    "module '{id}' host callbacks require a verified local-file source; \
+                     release-cache and search-path callback loading are unavailable"
+                )));
+            }
+            let runtime = self.runtime().await.map_err(|_| {
+                LoadError::Failed(format!(
+                    "module '{id}' is unavailable: the module bus could not start"
+                ))
+            })?;
+            if runtime
+                .host()
+                .list()
+                .iter()
+                .any(|info| info.manifest.bus_name.as_str() == record.bus_name)
+            {
+                return Err(LoadError::Failed(format!(
+                    "module '{id}' is already loaded without this callback binding"
+                )));
+            }
+        }
+
         let receiver = match resolution::global().claim(id) {
             Claim::Done(Resolution::Ready) => {
                 return if callbacks.is_some() {
@@ -665,16 +692,23 @@ impl Resolver {
                     let id = record.id;
                     let handle = tokio::runtime::Handle::current();
                     tokio::task::spawn_blocking(move || {
-                        handle
-                            .block_on(host.load_file_with_host_callbacks_for(
+                        handle.block_on(async move {
+                            host.load_file_with_host_callbacks_for(
                                 path,
                                 module_config,
                                 &binding,
                                 record.bus_name,
                                 record.object_path,
-                            ))
-                            .map(|_| ())
-                            .map_err(|error| format!("module '{id}' callback load failed: {error}"))
+                            )
+                            .await
+                            .map_err(|error| {
+                                format!("module '{id}' callback load failed: {error}")
+                            })?;
+                            host.retain_host_callback_binding(record.bus_name, binding)
+                                .map_err(|error| {
+                                    format!("module '{id}' callback retention failed: {error}")
+                                })
+                        })
                     })
                     .await
                     .map_err(|error| format!("module callback loader did not finish: {error}"))?

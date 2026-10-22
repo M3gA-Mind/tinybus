@@ -550,6 +550,7 @@ mod resolver {
             )
             .await
             .unwrap();
+        let callback_host = binding.unique_name().to_string();
         let f = fixture(
             record,
             true,
@@ -566,8 +567,8 @@ mod resolver {
             .resolver
             .ensure_loaded_with_host_callbacks(
                 record.id,
-                binding.clone(),
-                serde_json::json!({ "host": binding.unique_name() }),
+                binding,
+                serde_json::json!({ "host": callback_host }),
             )
             .await;
         assert!(
@@ -579,6 +580,80 @@ mod resolver {
             calls.load(Ordering::SeqCst),
             1,
             "resolver init did not use its exact prepared callback"
+        );
+        runtime
+            .proxy("org.example.EagerCallback", "/org/example/EagerCallback")
+            .unwrap()
+            .call::<serde_json::Value>("Observe", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "resolver dropped the callback binding after module initialization"
+        );
+
+        let already_serving = Box::leak(Box::new(ReleaseRecord {
+            id: "resolver-callback-already-serving-alias",
+            bus_name: "org.example.EagerCallback",
+            object_path: "/org/example/EagerCallback",
+            version: "0.0.0",
+            release_url: "https://github.com/tinyhumansai/tinybus/releases/tag/v0.0.0",
+            assets: &[],
+        }));
+        let alias = fixture(
+            already_serving,
+            true,
+            HashMap::from([(
+                already_serving.id.to_string(),
+                ModuleSource::LocalFile {
+                    path: path.to_string_lossy().into_owned(),
+                },
+            )]),
+            None,
+        );
+        let refused_binding = Arc::new(
+            runtime
+                .host()
+                .prepare_host_callbacks(vec![HostCallbackEndpoint {
+                    path: "/callback".parse().unwrap(),
+                    interface: "org.example.Callback".parse().unwrap(),
+                    members: vec!["Observe".parse().unwrap()],
+                }])
+                .await
+                .unwrap(),
+        );
+        refused_binding
+            .serve_at(
+                "/callback".parse().unwrap(),
+                ResolverCallback(calls.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            alias
+                .resolver
+                .ensure_loaded_with_host_callbacks(
+                    already_serving.id,
+                    refused_binding,
+                    serde_json::json!({}),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            alias.resolver.state_of(already_serving.id),
+            Availability::Available,
+            "already-serving callback rejection poisoned ordinary resolution"
+        );
+        alias
+            .resolver
+            .ensure_loaded(already_serving.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            alias.resolver.state_of(already_serving.id),
+            Availability::Ready
         );
         assert!(
             runtime
@@ -641,7 +716,7 @@ mod resolver {
             0,
             "resolver's generic config ran"
         );
-        assert_eq!(f.resolver.state_of(record.id), Availability::Failed);
+        assert_eq!(f.resolver.state_of(record.id), Availability::Available);
     }
 
     #[tokio::test]

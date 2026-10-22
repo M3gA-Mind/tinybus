@@ -815,6 +815,41 @@ impl<I: Interface> Interface for GuardedInterface<I> {
 }
 
 impl ModuleHost {
+    /// Retain the resolver-owned callback capability with the admitted module.
+    /// The module host is the lifetime owner because it owns the loaded library.
+    pub(crate) fn retain_host_callback_binding(
+        &self,
+        bus_name: &str,
+        binding: Arc<HostCallbackBinding>,
+    ) -> Result<()> {
+        if !Arc::ptr_eq(&self.inner.broker.router, &binding.broker.router)
+            || !binding
+                .owner
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, &self.inner))
+        {
+            return Err(Error::failed(
+                "callback binding belongs to another host owner",
+            ));
+        }
+        let mut loaded = self.inner.loaded.lock().expect("module list lock");
+        let module = loaded
+            .iter_mut()
+            .find(|module| module.info.manifest.bus_name.as_str() == bus_name)
+            .ok_or_else(|| Error::failed("callback module is no longer loaded"))?;
+        if !module
+            .callback_state
+            .as_ref()
+            .is_some_and(|state| Arc::ptr_eq(state, &binding.state))
+        {
+            return Err(Error::failed(
+                "callback binding does not belong to the loaded module",
+            ));
+        }
+        module._callback_binding = Some(binding);
+        Ok(())
+    }
+
     /// Create a private local recipient for at most 32 exact callback interfaces.
     /// No authority exists until a verified module is loaded with this binding.
     pub async fn prepare_host_callbacks(
