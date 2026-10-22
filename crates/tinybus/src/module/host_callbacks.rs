@@ -510,9 +510,12 @@ impl HostCallbackBinding {
     /// Immediately and idempotently prevent new route and user-dispatch admission.
     /// Running user futures remain accounted for until actual completion/drop.
     pub fn revoke(&self) {
-        let descendants = self.state.live_descendants();
         let mut router = self.broker.router.lock().expect("router lock");
+        // Serialize against child creation: it holds this lock while checking
+        // the parent and recording the child, so the walk sees every child
+        // created before revocation and later attempts fail the liveness check.
         router.revoke_host_callbacks(&self.state);
+        let descendants = self.state.live_descendants();
         for child in descendants {
             router.revoke_host_callbacks(&child);
         }
