@@ -504,8 +504,7 @@ mod resolver {
 
         let source = PathBuf::from(std::env::var_os("TINYBUS_TEST_HOST_CALLBACK_MODULE").unwrap());
         let hash = crate::module::hash::file_hex(std::fs::File::open(&source).unwrap()).unwrap();
-        let staging_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
-        std::fs::create_dir_all(&staging_root).unwrap();
+        let staging_root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
         let staging = tempfile::tempdir_in(staging_root).unwrap();
         #[cfg(unix)]
         {
