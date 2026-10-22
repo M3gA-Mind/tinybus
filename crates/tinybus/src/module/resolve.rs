@@ -665,10 +665,12 @@ impl Resolver {
                     let id = record.id;
                     let handle = tokio::runtime::Handle::current();
                     tokio::task::spawn_blocking(move || {
-                        handle.block_on(host.load_file_with_host_callbacks(
+                        handle.block_on(host.load_file_with_host_callbacks_for(
                             path,
                             module_config,
                             &binding,
+                            record.bus_name,
+                            record.object_path,
                         ))
                         .map(|_| ())
                         .map_err(|error| format!("module '{id}' callback load failed: {error}"))

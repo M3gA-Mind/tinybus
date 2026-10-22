@@ -1020,6 +1020,38 @@ impl ModuleHost {
         config: serde_json::Value,
         binding: &HostCallbackBinding,
     ) -> Result<ModuleInfo> {
+        self.load_file_with_host_callbacks_matching(path, config, binding, None)
+            .await
+    }
+
+    /// Load a verified module with callbacks only if its manifest has the exact
+    /// registry identity expected by the caller. Identity is checked before the
+    /// initializer runs, so the callback recipient cannot observe configuration
+    /// intended for a different module.
+    pub async fn load_file_with_host_callbacks_for(
+        &self,
+        path: impl AsRef<Path>,
+        config: serde_json::Value,
+        binding: &HostCallbackBinding,
+        expected_bus_name: &str,
+        expected_object_path: &str,
+    ) -> Result<ModuleInfo> {
+        self.load_file_with_host_callbacks_matching(
+            path,
+            config,
+            binding,
+            Some((expected_bus_name, expected_object_path)),
+        )
+        .await
+    }
+
+    async fn load_file_with_host_callbacks_matching(
+        &self,
+        path: impl AsRef<Path>,
+        config: serde_json::Value,
+        binding: &HostCallbackBinding,
+        expected_identity: Option<(&str, &str)>,
+    ) -> Result<ModuleInfo> {
         if !Arc::ptr_eq(&self.inner.broker.router, &binding.broker.router)
             || !binding
                 .owner
@@ -1062,6 +1094,15 @@ impl ModuleHost {
             Error::module_refused(path, "scoped callbacks require a verified artifact")
         })?;
         let artifact = loader::load(path, self.inner.strict.load(Ordering::Acquire))?;
+        if expected_identity.is_some_and(|(bus_name, object_path)| {
+            artifact.manifest.bus_name.as_str() != bus_name
+                || artifact.manifest.object_path.as_str() != object_path
+        }) {
+            return Err(Error::module_refused(
+                path,
+                "verified module identity does not match the resolver record",
+            ));
+        }
         self.ensure_dependencies(&artifact.manifest, path)?;
         if allowlisted_hash(path, std::fs::File::open(path)?)?.as_ref() != Some(&hash) {
             return Err(Error::module_refused(

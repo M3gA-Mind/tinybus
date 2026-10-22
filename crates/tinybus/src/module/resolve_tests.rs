@@ -507,7 +507,14 @@ mod resolver {
         std::fs::copy(&source, &path).unwrap();
         std::fs::write(staging.path().join("modules.toml"),
             format!("{:?} = {hash:?}\n", source.file_name().unwrap().to_str().unwrap())).unwrap();
-        let record = record("resolver-host-callback");
+        let record = Box::leak(Box::new(ReleaseRecord {
+            id: "resolver-host-callback",
+            bus_name: "org.example.EagerCallback",
+            object_path: "/module",
+            version: "0.0.0",
+            release_url: "https://github.com/tinyhumansai/tinybus/releases/tag/v0.0.0",
+            assets: &[],
+        }));
         let runtime = shared_runtime();
         let binding = Arc::new(runtime.host().prepare_host_callbacks(vec![HostCallbackEndpoint {
             path: "/callback".parse().unwrap(),
@@ -524,7 +531,7 @@ mod resolver {
             serde_json::json!({ "host": binding.unique_name() })).await;
         assert!(loaded.is_ok(), "{loaded:?}; callbacks={}", calls.load(Ordering::SeqCst));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "resolver init did not use its exact prepared callback");
-        assert!(runtime.host().list().iter().any(|module| module.manifest.bus_name.as_str() == record.bus_name));
+        assert!(runtime.host().list().iter().any(|module| module.manifest.bus_name.as_str() == "org.example.EagerCallback"));
     }
 
     #[tokio::test]
