@@ -88,8 +88,7 @@ async fn reset_requests_receive_distinct_revocable_host_callback_bindings() {
     let module_peer = module.unique_name().unwrap();
     let (module_transport, _) =
         crate::module::transport::ModuleTransport::new("reset-test".into(), vec![]);
-    *parent.state.module_transport.lock().unwrap() =
-        Some(Arc::downgrade(&module_transport));
+    *parent.state.module_transport.lock().unwrap() = Some(Arc::downgrade(&module_transport));
     {
         let mut lifetime = parent.state.lifetime.lock().unwrap();
         lifetime.active = true;

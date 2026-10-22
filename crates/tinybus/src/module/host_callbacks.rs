@@ -124,12 +124,15 @@ impl CallbackState {
                 HostCallbackGuard(child).drained().await;
             }
         })
-            .await
-            .map_err(|_| Error::failed("module callback work exceeded lifecycle deadline"))
+        .await
+        .map_err(|_| Error::failed("module callback work exceeded lifecycle deadline"))
     }
     fn live_children(&self) -> Vec<Arc<CallbackState>> {
         let mut children = self.children.lock().expect("callback children lock");
-        let live = children.iter().filter_map(std::sync::Weak::upgrade).collect();
+        let live = children
+            .iter()
+            .filter_map(std::sync::Weak::upgrade)
+            .collect();
         children.retain(|child| child.strong_count() != 0);
         live
     }
@@ -545,7 +548,9 @@ impl HostCallbackBinding {
                 })
             })
         {
-            return Err(Error::failed("callback child endpoint declaration is invalid"));
+            return Err(Error::failed(
+                "callback child endpoint declaration is invalid",
+            ));
         }
         let (host, peer) = MemoryTransport::pair();
         let unique = self.broker.attach(Arc::new(peer));
@@ -595,11 +600,7 @@ impl HostCallbackBinding {
             return Err(Error::failed("callback parent was revoked during creation"));
         }
         router.add_host_callbacks(child.clone())?;
-        let mut children = self
-            .state
-            .children
-            .lock()
-            .expect("callback children lock");
+        let mut children = self.state.children.lock().expect("callback children lock");
         children.push(Arc::downgrade(&child));
         drop(children);
         drop(router);
