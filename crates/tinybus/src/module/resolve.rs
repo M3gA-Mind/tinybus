@@ -665,22 +665,25 @@ impl Resolver {
                     let id = record.id;
                     let handle = tokio::runtime::Handle::current();
                     tokio::task::spawn_blocking(move || {
-                        handle.block_on(host.load_file_with_host_callbacks_for(
-                            path,
-                            module_config,
-                            &binding,
-                            record.bus_name,
-                            record.object_path,
-                        ))
-                        .map(|_| ())
-                        .map_err(|error| format!("module '{id}' callback load failed: {error}"))
+                        handle
+                            .block_on(host.load_file_with_host_callbacks_for(
+                                path,
+                                module_config,
+                                &binding,
+                                record.bus_name,
+                                record.object_path,
+                            ))
+                            .map(|_| ())
+                            .map_err(|error| format!("module '{id}' callback load failed: {error}"))
                     })
                     .await
                     .map_err(|error| format!("module callback loader did not finish: {error}"))?
                 } else {
                     let module_config = (self.inner.module_config)(record.id);
-                    self.blocking(move || Self::load_local(runtime, &path, record.id, module_config))
-                        .await
+                    self.blocking(move || {
+                        Self::load_local(runtime, &path, record.id, module_config)
+                    })
+                    .await
                 };
                 return if callbacks.is_some() {
                     result

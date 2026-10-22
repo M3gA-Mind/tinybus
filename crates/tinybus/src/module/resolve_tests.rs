@@ -508,12 +508,19 @@ mod resolver {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
         }
         let path = staging.path().join(source.file_name().unwrap());
         std::fs::copy(&source, &path).unwrap();
-        std::fs::write(staging.path().join("modules.toml"),
-            format!("{:?} = {hash:?}\n", source.file_name().unwrap().to_str().unwrap())).unwrap();
+        std::fs::write(
+            staging.path().join("modules.toml"),
+            format!(
+                "{:?} = {hash:?}\n",
+                source.file_name().unwrap().to_str().unwrap()
+            ),
+        )
+        .unwrap();
         let record = Box::leak(Box::new(ReleaseRecord {
             id: "resolver-host-callback",
             bus_name: "org.example.EagerCallback",
@@ -523,22 +530,62 @@ mod resolver {
             assets: &[],
         }));
         let runtime = shared_runtime();
-        let binding = Arc::new(runtime.host().prepare_host_callbacks(vec![HostCallbackEndpoint {
-            path: "/callback".parse().unwrap(),
-            interface: "org.example.Callback".parse().unwrap(),
-            members: vec!["Observe".parse().unwrap()],
-        }]).await.unwrap());
+        let binding = Arc::new(
+            runtime
+                .host()
+                .prepare_host_callbacks(vec![HostCallbackEndpoint {
+                    path: "/callback".parse().unwrap(),
+                    interface: "org.example.Callback".parse().unwrap(),
+                    members: vec!["Observe".parse().unwrap()],
+                }])
+                .await
+                .unwrap(),
+        );
         let calls = Arc::new(AtomicUsize::new(0));
-        binding.serve_at("/callback".parse().unwrap(), ResolverCallback(calls.clone())).await.unwrap();
-        let f = fixture(record, true, HashMap::from([(
-            record.id.to_string(), ModuleSource::LocalFile { path: path.to_string_lossy().into_owned() }
-        )]), None);
+        binding
+            .serve_at(
+                "/callback".parse().unwrap(),
+                ResolverCallback(calls.clone()),
+            )
+            .await
+            .unwrap();
+        let f = fixture(
+            record,
+            true,
+            HashMap::from([(
+                record.id.to_string(),
+                ModuleSource::LocalFile {
+                    path: path.to_string_lossy().into_owned(),
+                },
+            )]),
+            None,
+        );
 
-        let loaded = f.resolver.ensure_loaded_with_host_callbacks(record.id, binding.clone(),
-            serde_json::json!({ "host": binding.unique_name() })).await;
-        assert!(loaded.is_ok(), "{loaded:?}; callbacks={}", calls.load(Ordering::SeqCst));
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "resolver init did not use its exact prepared callback");
-        assert!(runtime.host().list().iter().any(|module| module.manifest.bus_name.as_str() == "org.example.EagerCallback"));
+        let loaded = f
+            .resolver
+            .ensure_loaded_with_host_callbacks(
+                record.id,
+                binding.clone(),
+                serde_json::json!({ "host": binding.unique_name() }),
+            )
+            .await;
+        assert!(
+            loaded.is_ok(),
+            "{loaded:?}; callbacks={}",
+            calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "resolver init did not use its exact prepared callback"
+        );
+        assert!(
+            runtime
+                .host()
+                .list()
+                .iter()
+                .any(|module| module.manifest.bus_name.as_str() == "org.example.EagerCallback")
+        );
     }
 
     #[tokio::test]
@@ -547,25 +594,52 @@ mod resolver {
 
         let record = record("resolver-callback-pinned-refusal");
         let runtime = shared_runtime();
-        let binding = Arc::new(runtime.host().prepare_host_callbacks(vec![HostCallbackEndpoint {
-            path: "/callback".parse().unwrap(),
-            interface: "org.example.Callback".parse().unwrap(),
-            members: vec!["Observe".parse().unwrap()],
-        }]).await.unwrap());
+        let binding = Arc::new(
+            runtime
+                .host()
+                .prepare_host_callbacks(vec![HostCallbackEndpoint {
+                    path: "/callback".parse().unwrap(),
+                    interface: "org.example.Callback".parse().unwrap(),
+                    members: vec!["Observe".parse().unwrap()],
+                }])
+                .await
+                .unwrap(),
+        );
         let calls = Arc::new(AtomicUsize::new(0));
-        binding.serve_at("/callback".parse().unwrap(), ResolverCallback(calls.clone())).await.unwrap();
-        let f = fixture(record, true, HashMap::from([(
-            record.id.to_string(), ModuleSource::Pinned
-        )]), None);
+        binding
+            .serve_at(
+                "/callback".parse().unwrap(),
+                ResolverCallback(calls.clone()),
+            )
+            .await
+            .unwrap();
+        let f = fixture(
+            record,
+            true,
+            HashMap::from([(record.id.to_string(), ModuleSource::Pinned)]),
+            None,
+        );
 
-        let error = f.resolver.ensure_loaded_with_host_callbacks(
-            record.id,
-            binding,
-            serde_json::json!({ "host": "untrusted-config-must-not-be-used" }),
-        ).await.unwrap_err();
+        let error = f
+            .resolver
+            .ensure_loaded_with_host_callbacks(
+                record.id,
+                binding,
+                serde_json::json!({ "host": "untrusted-config-must-not-be-used" }),
+            )
+            .await
+            .unwrap_err();
         assert!(error.contains("verified local-file source"), "{error}");
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "unsupported source reached a callback");
-        assert_eq!(f.config_calls.load(Ordering::SeqCst), 0, "resolver's generic config ran");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "unsupported source reached a callback"
+        );
+        assert_eq!(
+            f.config_calls.load(Ordering::SeqCst),
+            0,
+            "resolver's generic config ran"
+        );
         assert_eq!(f.resolver.state_of(record.id), Availability::Failed);
     }
 
