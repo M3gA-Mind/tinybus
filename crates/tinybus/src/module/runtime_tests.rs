@@ -50,3 +50,54 @@ async fn work_outlives_the_caller_runtime_and_blocking_reports_errors() {
     let panicked = runtime.blocking(|| panic!("loader panic")).await;
     assert!(panicked.unwrap_err().contains("did not finish"));
 }
+
+#[tokio::test]
+async fn configured_worker_stack_supports_deep_synchronous_work() {
+    const CHILD: &str = "TINYBUS_CONFIGURED_STACK_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let runtime = ModuleRuntime::start_with_options(
+            &RuntimeNames::default(),
+            None,
+            RuntimeOptions {
+                thread_stack_size: Some(4 * 1024 * 1024),
+            },
+        )
+        .unwrap();
+        let result = runtime
+            .spawn(async { consume_worker_stack(96) })
+            .await
+            .unwrap();
+        assert_ne!(result, 0);
+        return;
+    }
+
+    // A stack overflow aborts the process, so isolate the regression check in
+    // a child test process. Without the configured 4 MiB Tokio worker stack,
+    // this 3 MiB recursive workload overflows Tokio's default worker stack.
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "module::runtime::tests::configured_worker_stack_supports_deep_synchronous_work",
+            "--nocapture",
+        ])
+        .env(CHILD, "1")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "configured-stack child exited with {status}"
+    );
+}
+
+#[inline(never)]
+fn consume_worker_stack(depth: usize) -> usize {
+    const FRAME_BYTES: usize = 32 * 1024;
+    let frame = [depth as u8; FRAME_BYTES];
+    std::hint::black_box(&frame);
+    let value = if depth == 0 {
+        0
+    } else {
+        consume_worker_stack(depth - 1)
+    };
+    value + usize::from(frame[depth % FRAME_BYTES])
+}
