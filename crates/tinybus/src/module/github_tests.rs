@@ -350,3 +350,56 @@ fn tar_archives_refuse_hard_link_entries() {
             .is_err()
     );
 }
+
+/// Serves one archive request: headers announcing 20 bytes, then `sent` bytes
+/// one every 50 ms, then silence for two seconds before closing.
+fn slow_archive_server(sent: usize) -> (String, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/m.tar.gz", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = std::io::Read::read(&mut stream, &mut buf);
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n")
+            .unwrap();
+        for _ in 0..sent {
+            std::thread::sleep(Duration::from_millis(50));
+            if stream.write_all(b"x").is_err() {
+                return;
+            }
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    });
+    (url, server)
+}
+
+#[test]
+/// The body budget is an idle timeout: a body that keeps arriving (one byte
+/// every 50 ms, about one second in all) outlives a 300 ms stall budget.
+fn a_slow_but_progressing_download_is_not_cut_off() {
+    let (url, server) = slow_archive_server(20);
+    let directory = tempfile::tempdir().unwrap();
+    let dest = directory.path().join("m.tar.gz");
+    let started = std::time::Instant::now();
+    let result = download(&agent_with(Duration::from_millis(300)), &url, &dest);
+    let elapsed = started.elapsed();
+    let _ = server.join();
+    assert!(result.is_ok(), "after {elapsed:?}: {:?}", result.err());
+    assert_eq!(std::fs::metadata(&dest).unwrap().len(), 20);
+}
+
+#[test]
+/// A transfer that stops delivering fails within the stall budget rather than
+/// waiting for the server to give up.
+fn a_stalled_download_fails_within_the_stall_budget() {
+    let (url, server) = slow_archive_server(5);
+    let directory = tempfile::tempdir().unwrap();
+    let dest = directory.path().join("m.tar.gz");
+    let started = std::time::Instant::now();
+    let result = download(&agent_with(Duration::from_millis(300)), &url, &dest);
+    let elapsed = started.elapsed();
+    assert!(result.is_err(), "a stalled body was accepted");
+    assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
+    let _ = server.join();
+}

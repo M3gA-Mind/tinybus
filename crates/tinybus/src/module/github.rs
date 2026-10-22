@@ -51,9 +51,14 @@ const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const RECV_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bulk transfer of an archive on whatever link the user has. Generous because
-/// a slow link is a fact, not a fault; the other budgets bound the stalls.
-const RECV_BODY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How long one read may wait for bytes. It restarts on every read, so a slow
+/// link that keeps delivering is never cut off, while a stalled transfer fails
+/// within this budget instead of waiting out the whole body ceiling.
+const STALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Outer bound on one body transfer. ponytail: a peer that trickles one byte
+/// per [`STALL_TIMEOUT`] is only stopped here; resume with `Range` if that
+/// ever matters.
+const RECV_BODY_CEILING: Duration = Duration::from_secs(60 * 60);
 
 /// A pinned release a host wants loaded through a persistent, verified cache.
 #[derive(Debug, Clone)]
@@ -193,12 +198,17 @@ pub(crate) fn acquire_cached(release: &CachedRelease<'_>) -> Result<(PathBuf, St
 /// One agent per acquisition, so the three requests share a connection pool
 /// and every one of them carries the same budgets.
 fn agent() -> ureq::Agent {
+    agent_with(STALL_TIMEOUT)
+}
+
+fn agent_with(stall: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_resolve(Some(RESOLVE_TIMEOUT))
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_send_request(Some(SEND_REQUEST_TIMEOUT))
         .timeout_recv_response(Some(RECV_RESPONSE_TIMEOUT))
-        .timeout_recv_body(Some(RECV_BODY_TIMEOUT))
+        .timeout_per_read(Some(stall))
+        .timeout_recv_body(Some(RECV_BODY_CEILING))
         .build()
         .new_agent()
 }
@@ -327,8 +337,14 @@ fn download(agent: &ureq::Agent, url: &str, destination: &Path) -> Result<()> {
     let mut reader = body.with_config().limit(MAX_RELEASE_BYTES + 1).reader();
     let mut file = std::fs::File::create(destination)
         .map_err(|_| refused("release asset could not be stored"))?;
-    let written = std::io::copy(&mut reader, &mut file)
-        .map_err(|_| refused("GitHub release asset could not be read"))?;
+    let written = std::io::copy(&mut reader, &mut file).map_err(|error| {
+        let error = ureq::Error::from(error);
+        if let ureq::Error::BodyExceedsLimit(_) = error {
+            return refused("GitHub release asset exceeds the 512 MiB size cap");
+        }
+        warn!(error = %error, "release asset could not be read");
+        refused("GitHub release asset could not be read")
+    })?;
     if written > MAX_RELEASE_BYTES {
         return Err(refused("GitHub release asset exceeds the 512 MiB size cap"));
     }
