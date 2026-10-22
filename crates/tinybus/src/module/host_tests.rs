@@ -19,6 +19,18 @@ static BLOCKING_REINIT_RECEIVER: OnceLock<StdMutex<Option<std::sync::mpsc::Recei
     OnceLock::new();
 static BLOCKING_REINIT_STARTED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(unix)]
+fn make_private_tree(root: &Path, path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    for component in path
+        .ancestors()
+        .take_while(|component| component.starts_with(root))
+    {
+        std::fs::set_permissions(component, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+}
+
 struct FakeModule {
     tx: std::sync::mpsc::SyncSender<Vec<u8>>,
 }
@@ -511,7 +523,9 @@ async fn cancelling_a_waiting_stop_clears_its_pending_transition() {
 
 #[tokio::test]
 async fn a_lazy_manifest_registers_an_unmapped_library_and_the_first_call_loads_it() {
-    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    make_private_tree(directory.path(), directory.path());
     let extension = if cfg!(windows) {
         "dll"
     } else if cfg!(target_os = "macos") {
@@ -582,7 +596,7 @@ async fn a_lazy_manifest_registers_an_unmapped_library_and_the_first_call_loads_
 async fn a_bundle_marker_equal_to_the_pin_admits_the_extraction_without_its_archive() {
     use crate::module::{ReleaseAsset, ReleasePlan, artifact_dir, load_first_admitted};
 
-    let bundled = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let bundled = tempfile::tempdir().unwrap();
     let user_cache = tempfile::tempdir().unwrap();
     let asset = ReleaseAsset {
         host_key: "macos-15-arm64",
@@ -591,6 +605,8 @@ async fn a_bundle_marker_equal_to_the_pin_admits_the_extraction_without_its_arch
     };
     let dir = artifact_dir(bundled.path(), "clock", "0.1.0", asset.host_key).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    make_private_tree(bundled.path(), &dir);
     let artifact = dir.join(format!(
         "clock.{}",
         crate::module::cache::library_extension()
@@ -659,7 +675,7 @@ async fn a_bundle_marker_equal_to_the_pin_admits_the_extraction_without_its_arch
 async fn a_bundle_marker_without_an_allowlist_is_refused_rather_than_loaded_unhashed() {
     use crate::module::{ReleaseAsset, ReleasePlan, artifact_dir, load_first_admitted};
 
-    let bundled = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let bundled = tempfile::tempdir().unwrap();
     let user_cache = tempfile::tempdir().unwrap();
     let asset = ReleaseAsset {
         host_key: "macos-15-arm64",
@@ -668,6 +684,8 @@ async fn a_bundle_marker_without_an_allowlist_is_refused_rather_than_loaded_unha
     };
     let dir = artifact_dir(bundled.path(), "clock", "0.1.0", asset.host_key).unwrap();
     std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
+    make_private_tree(bundled.path(), &dir);
     let artifact = dir.join(format!(
         "clock.{}",
         crate::module::cache::library_extension()
@@ -708,7 +726,7 @@ async fn a_bundle_marker_without_an_allowlist_is_refused_rather_than_loaded_unha
 
 #[test]
 fn an_invalid_lazy_sidecar_refuses_the_artifact_instead_of_loading_it_eagerly() {
-    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
     let artifact = directory.path().join(if cfg!(windows) {
         "clock.dll"
     } else if cfg!(target_os = "macos") {
@@ -725,7 +743,7 @@ fn an_invalid_lazy_sidecar_refuses_the_artifact_instead_of_loading_it_eagerly() 
 
 #[test]
 fn a_sidecar_without_lazy_init_refuses_the_artifact_instead_of_loading_it_eagerly() {
-    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+    let directory = tempfile::tempdir().unwrap();
     let artifact = directory.path().join(if cfg!(windows) {
         "clock.dll"
     } else if cfg!(target_os = "macos") {
