@@ -510,7 +510,7 @@ mod resolver {
         let record = Box::leak(Box::new(ReleaseRecord {
             id: "resolver-host-callback",
             bus_name: "org.example.EagerCallback",
-            object_path: "/module",
+            object_path: "/org/example/EagerCallback",
             version: "0.0.0",
             release_url: "https://github.com/tinyhumansai/tinybus/releases/tag/v0.0.0",
             assets: &[],
