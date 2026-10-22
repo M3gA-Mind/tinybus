@@ -38,7 +38,8 @@ use crate::module::platform::host_candidates;
 use crate::module::resolution::{self, Claim, Resolution, ResolutionState, Waited};
 use crate::module::runtime::ModuleRuntime;
 use crate::module::{
-    ReleaseAsset, ReleasePlan, ReleaseRecord, load_first_admitted, prune_stale_versions,
+    HostCallbackBinding, ReleaseAsset, ReleasePlan, ReleaseRecord, load_first_admitted,
+    prune_stale_versions,
 };
 
 fn recover_admission(
@@ -408,6 +409,27 @@ impl Resolver {
             .map_err(LoadError::into_message)
     }
 
+    /// Resolve a local override while binding one prepared host callback set
+    /// to the exact admitted module before initialization. The configuration is
+    /// frozen with that binding. This path deliberately refuses linked,
+    /// search-path, and release-cache sources until their admission paths can
+    /// preserve the same one-use peer binding; use `ensure_loaded` for ordinary
+    /// modules, which receive no callback authority.
+    ///
+    /// The binding must have been prepared by this resolver's runtime host and
+    /// all declared callback interfaces must already be served. A callback
+    /// resolution cannot join a generic in-flight or already-loaded module.
+    pub async fn ensure_loaded_with_host_callbacks(
+        &self,
+        id: &str,
+        binding: Arc<HostCallbackBinding>,
+        config: serde_json::Value,
+    ) -> Result<(), String> {
+        self.ensure_loaded_inner(id, None, Some((binding, config)))
+            .await
+            .map_err(LoadError::into_message)
+    }
+
     /// [`Self::ensure_loaded`] with a bound on how long this caller waits.
     ///
     /// The bound is on the *wait*, never on the resolution: a caller that gives
@@ -422,6 +444,15 @@ impl Resolver {
         &self,
         id: &str,
         within: Option<Duration>,
+    ) -> Result<(), LoadError> {
+        self.ensure_loaded_inner(id, within, None).await
+    }
+
+    async fn ensure_loaded_inner(
+        &self,
+        id: &str,
+        within: Option<Duration>,
+        callbacks: Option<(Arc<HostCallbackBinding>, serde_json::Value)>,
     ) -> Result<(), LoadError> {
         if !self.inner.enabled {
             if let Some(record) = self.find(id) {
@@ -444,7 +475,15 @@ impl Resolver {
         }
 
         let receiver = match resolution::global().claim(id) {
-            Claim::Done(Resolution::Ready) => return Ok(()),
+            Claim::Done(Resolution::Ready) => {
+                return if callbacks.is_some() {
+                    Err(LoadError::Failed(format!(
+                        "module '{id}' is already loaded without this callback binding"
+                    )))
+                } else {
+                    Ok(())
+                };
+            }
             Claim::Done(Resolution::Failed(reason)) => {
                 // The original resolution may have completed before a reporting
                 // client was bound. Revisit reporting at the cached caller; the
@@ -452,9 +491,16 @@ impl Resolver {
                 self.report(record, Reason::ResolutionFailed);
                 return Err(LoadError::Failed(reason));
             }
-            Claim::Wait(receiver) => receiver,
+            Claim::Wait(receiver) => {
+                if callbacks.is_some() {
+                    return Err(LoadError::Failed(format!(
+                        "module '{id}' is already resolving without this callback binding"
+                    )));
+                }
+                receiver
+            }
             Claim::Run { sender, receiver } => {
-                self.start_resolution(record, sender).await;
+                self.start_resolution(record, sender, callbacks).await;
                 receiver
             }
         };
@@ -530,6 +576,7 @@ impl Resolver {
         &self,
         record: &'static ReleaseRecord,
         sender: tokio::sync::watch::Sender<Option<Resolution>>,
+        callbacks: Option<(Arc<HostCallbackBinding>, serde_json::Value)>,
     ) {
         let this = self.clone();
         let id = record.id;
@@ -539,7 +586,7 @@ impl Resolver {
                 version = record.version,
                 "[tinybus::module] resolving"
             );
-            let resolution = match this.ladder(record).await {
+            let resolution = match this.ladder(record, callbacks).await {
                 Ok(()) => {
                     tracing::info!(module = id, "[tinybus::module] serving");
                     Resolution::Ready
@@ -573,7 +620,11 @@ impl Resolver {
     }
 
     /// Get `record` serving: loaded, override, search path, release cache, prune.
-    async fn ladder(&self, record: &'static ReleaseRecord) -> Result<(), String> {
+    async fn ladder(
+        &self,
+        record: &'static ReleaseRecord,
+        callbacks: Option<(Arc<HostCallbackBinding>, serde_json::Value)>,
+    ) -> Result<(), String> {
         let runtime = self.runtime().await.map_err(|_| {
             format!(
                 "module '{}' is unavailable: the module bus could not start",
@@ -589,6 +640,12 @@ impl Resolver {
             .iter()
             .any(|info| info.manifest.bus_name.as_str() == record.bus_name)
         {
+            if callbacks.is_some() {
+                return Err(format!(
+                    "module '{}' is already loaded without the requested callback binding",
+                    record.id
+                ));
+            }
             return Ok(());
         }
 
@@ -603,13 +660,35 @@ impl Resolver {
         match self.inner.sources.get(record.id) {
             Some(ModuleSource::LocalFile { path }) => {
                 let path = PathBuf::from(path);
-                let module_config = (self.inner.module_config)(record.id);
-                let result = self
-                    .blocking(move || Self::load_local(runtime, &path, record.id, module_config))
-                    .await;
+                let result = if let Some((binding, module_config)) = callbacks.clone() {
+                    let host = runtime.host();
+                    let id = record.id;
+                    let handle = tokio::runtime::Handle::current();
+                    tokio::task::spawn_blocking(move || {
+                        handle.block_on(host.load_file_with_host_callbacks(
+                            path,
+                            module_config,
+                            &binding,
+                        ))
+                        .map(|_| ())
+                        .map_err(|error| format!("module '{id}' callback load failed: {error}"))
+                    })
+                    .await
+                    .map_err(|error| format!("module callback loader did not finish: {error}"))?
+                } else {
+                    let module_config = (self.inner.module_config)(record.id);
+                    self.blocking(move || Self::load_local(runtime, &path, record.id, module_config))
+                        .await
+                };
                 return recover_admission(result, &runtime.host().list(), record);
             }
             Some(ModuleSource::Linked) => {
+                if callbacks.is_some() {
+                    return Err(format!(
+                        "module '{}' cannot use host callbacks from a linked source",
+                        record.id
+                    ));
+                }
                 let factory = self.inner.linked.get(record.id).copied();
                 let module_config = (self.inner.module_config)(record.id);
                 let result = self
@@ -618,6 +697,13 @@ impl Resolver {
                 return recover_admission(result, &runtime.host().list(), record);
             }
             Some(ModuleSource::Pinned) | None => {}
+        }
+
+        if callbacks.is_some() {
+            return Err(format!(
+                "module '{}' host callbacks require a verified local-file source; release-cache and search-path callback loading are unavailable",
+                record.id
+            ));
         }
 
         // The search path tinybus itself honours. A refused search-path artifact

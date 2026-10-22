@@ -480,7 +480,7 @@ mod resolver {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires TINYBUS_TEST_HOST_CALLBACK_MODULE to point at the built cdylib"]
     async fn resolver_loads_a_verified_module_with_only_its_prepared_host_callback() {
-        use crate::module::{HostCallbackEndpoint, HostCallbackBinding};
+        use crate::module::HostCallbackEndpoint;
         use crate::{Interface, InterfaceName, MemberName};
         use std::sync::atomic::AtomicUsize;
 
