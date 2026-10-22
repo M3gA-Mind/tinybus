@@ -523,7 +523,7 @@ async fn cancelling_a_waiting_stop_clears_its_pending_transition() {
 
 #[tokio::test]
 async fn a_lazy_manifest_registers_an_unmapped_library_and_the_first_call_loads_it() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
     #[cfg(unix)]
     make_private_tree(directory.path(), directory.path());
     let extension = if cfg!(windows) {
