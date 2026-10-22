@@ -520,8 +520,9 @@ mod resolver {
             record.id.to_string(), ModuleSource::LocalFile { path: path.to_string_lossy().into_owned() }
         )]), None);
 
-        f.resolver.ensure_loaded_with_host_callbacks(record.id, binding.clone(),
-            serde_json::json!({ "host": binding.unique_name() })).await.unwrap();
+        let loaded = f.resolver.ensure_loaded_with_host_callbacks(record.id, binding.clone(),
+            serde_json::json!({ "host": binding.unique_name() })).await;
+        assert!(loaded.is_ok(), "{loaded:?}; callbacks={}", calls.load(Ordering::SeqCst));
         assert_eq!(calls.load(Ordering::SeqCst), 1, "resolver init did not use its exact prepared callback");
         assert!(runtime.host().list().iter().any(|module| module.manifest.bus_name.as_str() == record.bus_name));
     }
