@@ -477,6 +477,50 @@ mod resolver {
         }
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires TINYBUS_TEST_HOST_CALLBACK_MODULE to point at the built cdylib"]
+    async fn resolver_loads_a_verified_module_with_only_its_prepared_host_callback() {
+        use crate::module::{HostCallbackEndpoint, HostCallbackBinding};
+        use crate::{Interface, InterfaceName, MemberName};
+        use std::sync::atomic::AtomicUsize;
+
+        struct Callback(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl Interface for Callback {
+            fn name(&self) -> InterfaceName { "org.example.Callback".parse().unwrap() }
+            fn members(&self) -> Vec<MemberName> { vec!["Observe".parse().unwrap()] }
+            async fn call(&self, _: &MemberName, _: serde_json::Value) -> crate::Result<serde_json::Value> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(serde_json::Value::Null)
+            }
+        }
+
+        let source = PathBuf::from(std::env::var_os("TINYBUS_TEST_HOST_CALLBACK_MODULE").unwrap());
+        let hash = crate::module::hash::file_hex(std::fs::File::open(&source).unwrap()).unwrap();
+        let staging = tempfile::tempdir_in(source.parent().unwrap()).unwrap();
+        let path = staging.path().join(source.file_name().unwrap());
+        std::fs::copy(&source, &path).unwrap();
+        std::fs::write(staging.path().join("modules.toml"),
+            format!("{:?} = {hash:?}\n", source.file_name().unwrap().to_str().unwrap())).unwrap();
+        let record = record("resolver-host-callback");
+        let runtime = shared_runtime();
+        let binding = Arc::new(runtime.host().prepare_host_callbacks(vec![HostCallbackEndpoint {
+            path: "/callback".parse().unwrap(),
+            interface: "org.example.Callback".parse().unwrap(),
+            members: vec!["Observe".parse().unwrap()],
+        }]).await.unwrap());
+        let calls = Arc::new(AtomicUsize::new(0));
+        binding.serve_at("/callback".parse().unwrap(), Callback(calls.clone())).await.unwrap();
+        let mut f = fixture(record, true, HashMap::from([(
+            record.id.to_string(), ModuleSource::LocalFile { path: path.to_string_lossy().into_owned() }
+        )]), None);
+
+        f.resolver.ensure_loaded_with_host_callbacks(record.id, binding.clone(),
+            serde_json::json!({ "host": binding.unique_name() })).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "resolver init did not use its exact prepared callback");
+        assert!(runtime.host().list().iter().any(|module| module.manifest.bus_name.as_str() == record.bus_name));
+    }
+
     #[tokio::test]
     async fn a_faulted_module_is_never_retried_in_process() {
         let record = record("resolver-faulted");
