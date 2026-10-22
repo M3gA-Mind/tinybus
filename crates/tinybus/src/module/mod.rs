@@ -60,7 +60,7 @@ pub use resolve::{
     ResolvedHook, Resolver, ResolverInputs, RuntimeFuture, RuntimeProvider,
 };
 #[cfg(feature = "modules")]
-pub use runtime::{ModuleRuntime, RuntimeNames, RuntimeSetup};
+pub use runtime::{ModuleRuntime, RuntimeNames, RuntimeOptions, RuntimeSetup};
 
 /// Entry points compiled into the host instead of loaded from a shared library.
 ///

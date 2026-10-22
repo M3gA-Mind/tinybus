@@ -60,6 +60,16 @@ impl Default for RuntimeNames {
     }
 }
 
+/// Optional configuration for the module runtime.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeOptions {
+    /// Stack size for each Tokio worker thread.
+    ///
+    /// `None` preserves Tokio's platform default. Hosts that load modules with
+    /// stack-heavy initialization can set a larger value.
+    pub thread_stack_size: Option<usize>,
+}
+
 /// The broker, the host's own connection to it, and the module loader.
 pub struct ModuleRuntime {
     /// The loader. Owns every admitted module for the process lifetime.
@@ -82,16 +92,31 @@ impl ModuleRuntime {
     /// Returns an error if the thread or Tokio runtime cannot be built, the
     /// in-memory transport cannot be connected, or `setup` fails.
     pub fn start(names: &RuntimeNames, setup: Option<RuntimeSetup>) -> crate::Result<Self> {
+        Self::start_with_options(names, setup, RuntimeOptions::default())
+    }
+
+    /// Start a runtime with explicit configuration and wait until it is ready.
+    ///
+    /// This has the same lifetime and error behavior as [`Self::start`]. The
+    /// options entry point lets hosts that load stack-heavy native modules
+    /// increase the Tokio worker-thread stack while keeping the default API
+    /// and behavior unchanged.
+    pub fn start_with_options(
+        names: &RuntimeNames,
+        setup: Option<RuntimeSetup>,
+        options: RuntimeOptions,
+    ) -> crate::Result<Self> {
         let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
         let worker = names.worker.clone();
         std::thread::Builder::new()
             .name(names.thread.clone())
             .spawn(move || {
-                let tokio_runtime = match tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .thread_name(worker)
-                    .build()
-                {
+                let mut builder = tokio::runtime::Builder::new_multi_thread();
+                builder.enable_all().thread_name(worker);
+                if let Some(stack_size) = options.thread_stack_size {
+                    builder.thread_stack_size(stack_size);
+                }
+                let tokio_runtime = match builder.build() {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         let _ = ready_tx.send(Err(crate::Error::Transport(error.to_string())));
