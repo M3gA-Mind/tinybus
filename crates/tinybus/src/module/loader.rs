@@ -12,6 +12,9 @@ use crate::{build_info, version::Version};
 
 type ManifestFn = unsafe extern "C" fn() -> TbSlice;
 
+/// Largest manifest a module may hand the loader.
+const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
+
 #[derive(Clone)]
 pub(crate) struct LoadedArtifact {
     pub(crate) descriptor: TbAbiDescriptor,
@@ -32,18 +35,12 @@ pub(crate) fn load(path: &Path, strict: bool) -> Result<LoadedArtifact> {
     let descriptor_ptr = platform::symbol(handle, b"TINYBUS_MODULE_ABI_V1\0", path)?;
 
     let prefix = unsafe { descriptor_ptr.cast::<DescriptorPrefix>().read_unaligned() };
-    if prefix.magic != ABI_MAGIC {
-        return Err(Error::module_refused(path, "ABI magic does not match"));
-    }
-    if prefix.abi_revision != ABI_REVISION {
-        return Err(Error::module_refused(path, "ABI revision does not match"));
-    }
-    if !(DESCRIPTOR_PREFIX_SIZE..=MAX_DESCRIPTOR_SIZE).contains(&prefix.descriptor_size) {
-        return Err(Error::module_refused(path, "descriptor size is invalid"));
-    }
-    if prefix.descriptor_size < size_of::<TbAbiDescriptor>() as u32 {
-        return Err(Error::module_refused(path, "descriptor is too small"));
-    }
+    gate_prefix(
+        path,
+        prefix.magic,
+        prefix.abi_revision,
+        prefix.descriptor_size,
+    )?;
     let descriptor = unsafe { descriptor_ptr.cast::<TbAbiDescriptor>().read_unaligned() };
     gate_descriptor(path, &descriptor, strict)?;
 
@@ -54,13 +51,7 @@ pub(crate) fn load(path: &Path, strict: bool) -> Result<LoadedArtifact> {
             path,
         )?)
     };
-    let slice = unsafe { manifest_fn() };
-    if slice.ptr.is_null() || slice.len > 1024 * 1024 {
-        return Err(Error::module_refused(path, "manifest bytes are invalid"));
-    }
-    let bytes = unsafe { std::slice::from_raw_parts(slice.ptr, slice.len) };
-    let manifest = serde_json::from_slice(bytes)
-        .map_err(|_| Error::module_refused(path, "manifest is not valid JSON"))?;
+    let manifest = unsafe { manifest_from(path, manifest_fn())? };
 
     let init: TbModuleInit = unsafe {
         std::mem::transmute(platform::symbol(handle, b"tinybus_module_init_v1\0", path)?)
@@ -72,24 +63,52 @@ pub(crate) fn load(path: &Path, strict: bool) -> Result<LoadedArtifact> {
     })
 }
 
+/// The checks an ABI descriptor's prefix must pass before the full descriptor
+/// may be read through it, and again on the full descriptor.
+fn gate_prefix(path: &Path, magic: u64, abi_revision: u32, descriptor_size: u32) -> Result<()> {
+    let refuse = |reason| Err(Error::module_refused(path, reason));
+    if magic != ABI_MAGIC {
+        return refuse("ABI magic does not match");
+    }
+    if abi_revision != ABI_REVISION {
+        return refuse("ABI revision does not match");
+    }
+    if !(DESCRIPTOR_PREFIX_SIZE..=MAX_DESCRIPTOR_SIZE).contains(&descriptor_size) {
+        return refuse("descriptor size is invalid");
+    }
+    if descriptor_size < size_of::<TbAbiDescriptor>() as u32 {
+        return refuse("descriptor is too small");
+    }
+    Ok(())
+}
+
+/// Parse the manifest `tinybus_module_manifest_v1` returned.
+///
+/// # Safety
+///
+/// Unless `slice.ptr` is null or `slice.len` is over the cap, `slice` must be
+/// readable for `slice.len` bytes.
+unsafe fn manifest_from(path: &Path, slice: TbSlice) -> Result<ModuleManifest> {
+    if slice.ptr.is_null() || slice.len > MAX_MANIFEST_BYTES {
+        return Err(Error::module_refused(path, "manifest bytes are invalid"));
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(slice.ptr, slice.len) };
+    serde_json::from_slice(bytes)
+        .map_err(|_| Error::module_refused(path, "manifest is not valid JSON"))
+}
+
 pub(crate) fn gate_descriptor(
     path: &Path,
     descriptor: &TbAbiDescriptor,
     strict: bool,
 ) -> Result<()> {
     let refuse = |reason| Error::module_refused(path, reason);
-    if descriptor.magic != ABI_MAGIC {
-        return Err(refuse("ABI magic does not match"));
-    }
-    if descriptor.abi_revision != ABI_REVISION {
-        return Err(refuse("ABI revision does not match"));
-    }
-    if !(DESCRIPTOR_PREFIX_SIZE..=MAX_DESCRIPTOR_SIZE).contains(&descriptor.descriptor_size) {
-        return Err(refuse("descriptor size is invalid"));
-    }
-    if descriptor.descriptor_size < size_of::<TbAbiDescriptor>() as u32 {
-        return Err(refuse("descriptor is too small"));
-    }
+    gate_prefix(
+        path,
+        descriptor.magic,
+        descriptor.abi_revision,
+        descriptor.descriptor_size,
+    )?;
     if descriptor.pointer_width != usize::BITS {
         return Err(refuse("pointer width does not match"));
     }

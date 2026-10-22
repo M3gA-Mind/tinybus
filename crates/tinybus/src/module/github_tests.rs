@@ -265,7 +265,8 @@ fn zip_archives_refuse_paths_outside_the_destination() {
     archive.write_all(b"outside").unwrap();
     archive.finish().unwrap();
 
-    assert!(extract("release.zip", &archive_path, &destination).is_err());
+    let error = extract("release.zip", &archive_path, &destination).unwrap_err();
+    assert!(error.to_string().contains("unsafe path"), "{error}");
     assert!(!directory.path().join("outside").exists());
 }
 
@@ -289,7 +290,11 @@ fn zip_archives_refuse_symlink_entries() {
         .unwrap();
     archive.finish().unwrap();
 
-    assert!(extract("release.zip", &archive_path, &destination).is_err());
+    let error = extract("release.zip", &archive_path, &destination).unwrap_err();
+    assert!(
+        error.to_string().contains("unsupported entry type"),
+        "{error}"
+    );
     assert!(!directory.path().join("outside").exists());
     assert!(!destination.join("module.so").exists());
 }
@@ -314,7 +319,11 @@ fn zip_archives_refuse_special_file_entries() {
     archive.write_all(b"not a regular file").unwrap();
     archive.finish().unwrap();
 
-    assert!(extract("release.zip", &archive_path, &destination).is_err());
+    let error = extract("release.zip", &archive_path, &destination).unwrap_err();
+    assert!(
+        error.to_string().contains("unsupported entry type"),
+        "{error}"
+    );
     assert!(!destination.join("module.so").exists());
 }
 
