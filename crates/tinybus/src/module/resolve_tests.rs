@@ -436,17 +436,57 @@ mod resolver {
         resolver: Resolver,
     }
 
+    struct ResolverCallback(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl crate::Interface for ResolverCallback {
+        fn name(&self) -> crate::InterfaceName {
+            "org.example.Callback".parse().unwrap()
+        }
+        fn members(&self) -> Vec<crate::MemberName> {
+            vec!["Observe".parse().unwrap()]
+        }
+        async fn call(
+            &self,
+            _: &crate::MemberName,
+            _: serde_json::Value,
+        ) -> crate::Result<serde_json::Value> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::json!("org.example.Callback"))
+        }
+    }
+
     fn fixture(
         record: &'static ReleaseRecord,
         enabled: bool,
         sources: HashMap<String, ModuleSource>,
         install_dir: Option<PathBuf>,
     ) -> Fixture {
+        fixture_with_runtime(
+            record,
+            enabled,
+            sources,
+            install_dir,
+            Arc::new(|| Box::pin(async { Ok(shared_runtime()) })),
+        )
+    }
+
+    fn fixture_with_runtime(
+        record: &'static ReleaseRecord,
+        enabled: bool,
+        sources: HashMap<String, ModuleSource>,
+        install_dir: Option<PathBuf>,
+        runtime: RuntimeProvider,
+    ) -> Fixture {
         let sink = Arc::new(Recording::default());
         let config_calls = Arc::new(AtomicUsize::new(0));
         let runtime_calls = Arc::new(AtomicUsize::new(0));
         let counted = config_calls.clone();
         let started = runtime_calls.clone();
+        let measured_runtime = Arc::new(move || {
+            started.fetch_add(1, Ordering::SeqCst);
+            runtime()
+        });
         let resolver = Resolver::new(ResolverInputs {
             enabled,
             install_dir,
@@ -459,10 +499,7 @@ mod resolver {
             on_resolved: None,
             records: vec![record],
             terminal_marker: "This is terminal for the running process".to_string(),
-            runtime: Arc::new(move || {
-                started.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async { Ok(shared_runtime()) })
-            }),
+            runtime: measured_runtime,
             module_config: Arc::new(move |_| {
                 counted.fetch_add(1, Ordering::SeqCst);
                 serde_json::json!({})
@@ -475,6 +512,407 @@ mod resolver {
             runtime_calls,
             resolver,
         }
+    }
+
+    fn linked_module_for(record: &ReleaseRecord) -> LinkedModule {
+        let mut manifest = super::module(record.id, &[], &[]);
+        manifest.bus_name = crate::BusName::new(record.bus_name).unwrap();
+        manifest.object_path = crate::ObjectPath::new(record.object_path).unwrap();
+        LinkedModule {
+            descriptor: crate::module::abi::TbAbiDescriptor::current(record.id, "1.0.0"),
+            manifest,
+            init: initialize_raced_module,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_foreign_callback_binding_does_not_poison_ordinary_resolution() {
+        use crate::module::HostCallbackEndpoint;
+        use crate::module::runtime::{ModuleRuntime, RuntimeNames};
+
+        let record = record("resolver_callback_bad_binding");
+        let _runtime = shared_runtime();
+        let foreign_runtime = ModuleRuntime::start(
+            &RuntimeNames {
+                thread: "tinybus-test-foreign-callback".to_owned(),
+                worker: "tinybus-test-foreign-callback-worker".to_owned(),
+            },
+            None,
+        )
+        .unwrap();
+        let binding = Arc::new(
+            foreign_runtime
+                .host()
+                .prepare_host_callbacks(vec![HostCallbackEndpoint {
+                    path: "/callback".parse().unwrap(),
+                    interface: "org.example.Callback".parse().unwrap(),
+                    members: vec!["Observe".parse().unwrap()],
+                }])
+                .await
+                .unwrap(),
+        );
+        binding
+            .serve_at(
+                "/callback".parse().unwrap(),
+                ResolverCallback(Arc::new(AtomicUsize::new(0))),
+            )
+            .await
+            .unwrap();
+        let mut f = fixture(
+            record,
+            true,
+            HashMap::from([(
+                record.id.to_string(),
+                ModuleSource::LocalFile {
+                    path: "/unused/verified-module.so".to_owned(),
+                },
+            )]),
+            None,
+        );
+
+        assert!(
+            f.resolver
+                .ensure_loaded_with_host_callbacks(record.id, binding, serde_json::json!({}))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            f.resolver.state_of(record.id),
+            Availability::Available,
+            "invalid callback binding poisoned the module resolution slot"
+        );
+
+        f.resolver.after_initial_host_check = Some(Arc::new(move |runtime, _| {
+            runtime
+                .host()
+                .attach_linked_with_config(linked_module_for(record), serde_json::json!({}))
+                .unwrap();
+        }));
+        f.resolver.ensure_loaded(record.id).await.unwrap();
+        assert_eq!(f.resolver.state_of(record.id), Availability::Ready);
+    }
+
+    #[tokio::test]
+    async fn a_direct_admission_race_keeps_callback_resolution_available() {
+        use crate::module::HostCallbackEndpoint;
+
+        let record = record("resolver_callback_admission_race");
+        let runtime = shared_runtime();
+        let binding = Arc::new(
+            runtime
+                .host()
+                .prepare_host_callbacks(vec![HostCallbackEndpoint {
+                    path: "/callback".parse().unwrap(),
+                    interface: "org.example.Callback".parse().unwrap(),
+                    members: vec!["Observe".parse().unwrap()],
+                }])
+                .await
+                .unwrap(),
+        );
+        binding
+            .serve_at(
+                "/callback".parse().unwrap(),
+                ResolverCallback(Arc::new(AtomicUsize::new(0))),
+            )
+            .await
+            .unwrap();
+        let mut f = fixture(
+            record,
+            true,
+            HashMap::from([(
+                record.id.to_string(),
+                ModuleSource::LocalFile {
+                    path: "/unused/verified-module.so".to_owned(),
+                },
+            )]),
+            None,
+        );
+        f.resolver.after_initial_host_check = Some(Arc::new(|runtime, record| {
+            runtime
+                .host()
+                .attach_linked_with_config(linked_module_for(record), serde_json::json!({}))
+                .unwrap();
+        }));
+
+        assert!(
+            f.resolver
+                .ensure_loaded_with_host_callbacks(record.id, binding, serde_json::json!({}))
+                .await
+                .is_err()
+        );
+        assert_eq!(f.resolver.state_of(record.id), Availability::Ready);
+        f.resolver.ensure_loaded(record.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_callback_request_does_not_claim_resolution_when_runtime_start_fails() {
+        use crate::module::HostCallbackEndpoint;
+
+        let record = record("resolver-callback-runtime-unavailable");
+        let runtime = shared_runtime();
+        let binding = Arc::new(
+            runtime
+                .host()
+                .prepare_host_callbacks(vec![HostCallbackEndpoint {
+                    path: "/callback".parse().unwrap(),
+                    interface: "org.example.Callback".parse().unwrap(),
+                    members: vec!["Observe".parse().unwrap()],
+                }])
+                .await
+                .unwrap(),
+        );
+        binding
+            .serve_at(
+                "/callback".parse().unwrap(),
+                ResolverCallback(Arc::new(AtomicUsize::new(0))),
+            )
+            .await
+            .unwrap();
+        let resolver = fixture_with_runtime(
+            record,
+            true,
+            HashMap::from([(
+                record.id.to_string(),
+                ModuleSource::LocalFile {
+                    path: "/unused/verified-module.so".to_owned(),
+                },
+            )]),
+            None,
+            Arc::new(|| Box::pin(async { Err(crate::Error::failed("runtime unavailable")) })),
+        );
+
+        let error = resolver
+            .resolver
+            .ensure_loaded_with_host_callbacks(record.id, binding, serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(error.contains("module bus could not start"), "{error}");
+        assert_eq!(
+            resolver.resolver.state_of(record.id),
+            Availability::Available
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires TINYBUS_TEST_HOST_CALLBACK_MODULE to point at the built cdylib"]
+    async fn resolver_loads_a_verified_module_with_only_its_prepared_host_callback() {
+        use crate::module::HostCallbackEndpoint;
+
+        let source = PathBuf::from(std::env::var_os("TINYBUS_TEST_HOST_CALLBACK_MODULE").unwrap());
+        let hash = crate::module::hash::file_hex(std::fs::File::open(&source).unwrap()).unwrap();
+        let staging_root = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        let staging = tempfile::tempdir_in(staging_root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(staging.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let path = staging.path().join(source.file_name().unwrap());
+        std::fs::copy(&source, &path).unwrap();
+        std::fs::write(
+            staging.path().join("modules.toml"),
+            format!(
+                "{:?} = {hash:?}\n",
+                source.file_name().unwrap().to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        let record = Box::leak(Box::new(ReleaseRecord {
+            id: "resolver-host-callback",
+            bus_name: "org.example.EagerCallback",
+            object_path: "/org/example/EagerCallback",
+            version: "0.0.0",
+            release_url: "https://github.com/tinyhumansai/tinybus/releases/tag/v0.0.0",
+            assets: &[],
+        }));
+        let runtime = shared_runtime();
+        let binding = Arc::new(
+            runtime
+                .host()
+                .prepare_host_callbacks(vec![HostCallbackEndpoint {
+                    path: "/callback".parse().unwrap(),
+                    interface: "org.example.Callback".parse().unwrap(),
+                    members: vec!["Observe".parse().unwrap()],
+                }])
+                .await
+                .unwrap(),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        binding
+            .serve_at(
+                "/callback".parse().unwrap(),
+                ResolverCallback(calls.clone()),
+            )
+            .await
+            .unwrap();
+        let callback_host = binding.unique_name().to_string();
+        let f = fixture(
+            record,
+            true,
+            HashMap::from([(
+                record.id.to_string(),
+                ModuleSource::LocalFile {
+                    path: path.to_string_lossy().into_owned(),
+                },
+            )]),
+            None,
+        );
+
+        let loaded = f
+            .resolver
+            .ensure_loaded_with_host_callbacks(
+                record.id,
+                binding,
+                serde_json::json!({ "host": callback_host }),
+            )
+            .await;
+        assert!(
+            loaded.is_ok(),
+            "{loaded:?}; callbacks={}",
+            calls.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "resolver init did not use its exact prepared callback"
+        );
+        runtime
+            .proxy("org.example.EagerCallback", "/org/example/EagerCallback")
+            .unwrap()
+            .call::<serde_json::Value>("Observe", serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "resolver dropped the callback binding after module initialization"
+        );
+
+        let already_serving = Box::leak(Box::new(ReleaseRecord {
+            id: "resolver-callback-already-serving-alias",
+            bus_name: "org.example.EagerCallback",
+            object_path: "/org/example/EagerCallback",
+            version: "0.0.0",
+            release_url: "https://github.com/tinyhumansai/tinybus/releases/tag/v0.0.0",
+            assets: &[],
+        }));
+        let alias = fixture(
+            already_serving,
+            true,
+            HashMap::from([(
+                already_serving.id.to_string(),
+                ModuleSource::LocalFile {
+                    path: path.to_string_lossy().into_owned(),
+                },
+            )]),
+            None,
+        );
+        let refused_binding = Arc::new(
+            runtime
+                .host()
+                .prepare_host_callbacks(vec![HostCallbackEndpoint {
+                    path: "/callback".parse().unwrap(),
+                    interface: "org.example.Callback".parse().unwrap(),
+                    members: vec!["Observe".parse().unwrap()],
+                }])
+                .await
+                .unwrap(),
+        );
+        refused_binding
+            .serve_at(
+                "/callback".parse().unwrap(),
+                ResolverCallback(calls.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            alias
+                .resolver
+                .ensure_loaded_with_host_callbacks(
+                    already_serving.id,
+                    refused_binding,
+                    serde_json::json!({}),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            alias.resolver.state_of(already_serving.id),
+            Availability::Available,
+            "already-serving callback rejection poisoned ordinary resolution"
+        );
+        alias
+            .resolver
+            .ensure_loaded(already_serving.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            alias.resolver.state_of(already_serving.id),
+            Availability::Ready
+        );
+        assert!(
+            runtime
+                .host()
+                .list()
+                .iter()
+                .any(|module| module.manifest.bus_name.as_str() == "org.example.EagerCallback")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_refuses_host_callbacks_for_pinned_sources_before_loading() {
+        use crate::module::HostCallbackEndpoint;
+
+        let record = record("resolver-callback-pinned-refusal");
+        let runtime = shared_runtime();
+        let binding = Arc::new(
+            runtime
+                .host()
+                .prepare_host_callbacks(vec![HostCallbackEndpoint {
+                    path: "/callback".parse().unwrap(),
+                    interface: "org.example.Callback".parse().unwrap(),
+                    members: vec!["Observe".parse().unwrap()],
+                }])
+                .await
+                .unwrap(),
+        );
+        let calls = Arc::new(AtomicUsize::new(0));
+        binding
+            .serve_at(
+                "/callback".parse().unwrap(),
+                ResolverCallback(calls.clone()),
+            )
+            .await
+            .unwrap();
+        let f = fixture(
+            record,
+            true,
+            HashMap::from([(record.id.to_string(), ModuleSource::Pinned)]),
+            None,
+        );
+
+        let error = f
+            .resolver
+            .ensure_loaded_with_host_callbacks(
+                record.id,
+                binding,
+                serde_json::json!({ "host": "untrusted-config-must-not-be-used" }),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.contains("verified local-file source"), "{error}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "unsupported source reached a callback"
+        );
+        assert_eq!(
+            f.config_calls.load(Ordering::SeqCst),
+            0,
+            "resolver's generic config ran"
+        );
+        assert_eq!(f.resolver.state_of(record.id), Availability::Available);
     }
 
     #[tokio::test]

@@ -815,6 +815,88 @@ impl<I: Interface> Interface for GuardedInterface<I> {
 }
 
 impl ModuleHost {
+    /// Check that a callback binding can be attempted without consuming it.
+    /// The loader repeats this check while atomically marking the binding used.
+    pub(crate) fn validate_host_callback_binding(
+        &self,
+        binding: &HostCallbackBinding,
+    ) -> Result<()> {
+        if !Arc::ptr_eq(&self.inner.broker.router, &binding.broker.router)
+            || !binding
+                .owner
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, &self.inner))
+        {
+            return Err(Error::failed(
+                "callback binding belongs to another host owner",
+            ));
+        }
+        let state = binding
+            .state
+            .lifetime
+            .lock()
+            .expect("callback lifetime lock");
+        if state.used
+            || state.revoked
+            || state.served.len() != binding.state.required_endpoint_count()
+        {
+            return Err(Error::failed(
+                "callback binding is already used or endpoints are missing",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether this exact capability was retained by a successfully loaded module.
+    pub(crate) fn retains_host_callback_binding(&self, binding: &Arc<HostCallbackBinding>) -> bool {
+        self.inner
+            .loaded
+            .lock()
+            .expect("module list lock")
+            .iter()
+            .any(|module| {
+                module
+                    ._callback_binding
+                    .as_ref()
+                    .is_some_and(|retained| Arc::ptr_eq(retained, binding))
+            })
+    }
+
+    /// Retain the resolver-owned callback capability with the admitted module.
+    /// The module host is the lifetime owner because it owns the loaded library.
+    pub(crate) fn retain_host_callback_binding(
+        &self,
+        bus_name: &str,
+        binding: Arc<HostCallbackBinding>,
+    ) -> Result<()> {
+        if !Arc::ptr_eq(&self.inner.broker.router, &binding.broker.router)
+            || !binding
+                .owner
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, &self.inner))
+        {
+            return Err(Error::failed(
+                "callback binding belongs to another host owner",
+            ));
+        }
+        let mut loaded = self.inner.loaded.lock().expect("module list lock");
+        let module = loaded
+            .iter_mut()
+            .find(|module| module.info.manifest.bus_name.as_str() == bus_name)
+            .ok_or_else(|| Error::failed("callback module is no longer loaded"))?;
+        if !module
+            .callback_state
+            .as_ref()
+            .is_some_and(|state| Arc::ptr_eq(state, &binding.state))
+        {
+            return Err(Error::failed(
+                "callback binding does not belong to the loaded module",
+            ));
+        }
+        module._callback_binding = Some(binding);
+        Ok(())
+    }
+
     /// Create a private local recipient for at most 32 exact callback interfaces.
     /// No authority exists until a verified module is loaded with this binding.
     pub async fn prepare_host_callbacks(
@@ -1020,6 +1102,38 @@ impl ModuleHost {
         config: serde_json::Value,
         binding: &HostCallbackBinding,
     ) -> Result<ModuleInfo> {
+        self.load_file_with_host_callbacks_matching(path, config, binding, None)
+            .await
+    }
+
+    /// Load a verified module with callbacks only if its manifest has the exact
+    /// registry identity expected by the caller. Identity is checked before the
+    /// initializer runs, so the callback recipient cannot observe configuration
+    /// intended for a different module.
+    pub async fn load_file_with_host_callbacks_for(
+        &self,
+        path: impl AsRef<Path>,
+        config: serde_json::Value,
+        binding: &HostCallbackBinding,
+        expected_bus_name: &str,
+        expected_object_path: &str,
+    ) -> Result<ModuleInfo> {
+        self.load_file_with_host_callbacks_matching(
+            path,
+            config,
+            binding,
+            Some((expected_bus_name, expected_object_path)),
+        )
+        .await
+    }
+
+    async fn load_file_with_host_callbacks_matching(
+        &self,
+        path: impl AsRef<Path>,
+        config: serde_json::Value,
+        binding: &HostCallbackBinding,
+        expected_identity: Option<(&str, &str)>,
+    ) -> Result<ModuleInfo> {
         if !Arc::ptr_eq(&self.inner.broker.router, &binding.broker.router)
             || !binding
                 .owner
@@ -1062,6 +1176,15 @@ impl ModuleHost {
             Error::module_refused(path, "scoped callbacks require a verified artifact")
         })?;
         let artifact = loader::load(path, self.inner.strict.load(Ordering::Acquire))?;
+        if expected_identity.is_some_and(|(bus_name, object_path)| {
+            artifact.manifest.bus_name.as_str() != bus_name
+                || artifact.manifest.object_path.as_str() != object_path
+        }) {
+            return Err(Error::module_refused(
+                path,
+                "verified module identity does not match the resolver record",
+            ));
+        }
         self.ensure_dependencies(&artifact.manifest, path)?;
         if allowlisted_hash(path, std::fs::File::open(path)?)?.as_ref() != Some(&hash) {
             return Err(Error::module_refused(
