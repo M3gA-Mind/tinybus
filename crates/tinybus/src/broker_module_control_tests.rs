@@ -2,10 +2,12 @@ use super::*;
 use crate::Connection;
 use crate::module::host::{ModuleControl, ModuleInfo, ModuleState, ModuleTransition};
 use crate::transport::memory::MemoryTransport;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const DENIED: &str = "ai.tinyhumans.tinybus.Error.ModuleControlDenied";
+const SLOW_MODULE: &str = "slow.so";
+const SLOW_LOAD: Duration = Duration::from_millis(1500);
 
 #[derive(Default)]
 struct RecordingControl(Mutex<Vec<&'static str>>);
@@ -39,9 +41,13 @@ impl ModuleControl for RecordingControl {
     }
     fn load(
         self: Arc<Self>,
-        _: PathBuf,
+        path: PathBuf,
         _: Value,
     ) -> Result<(ModuleInfo, Option<ModuleTransition>)> {
+        if path == Path::new(SLOW_MODULE) {
+            // Mapping a real library, or a GitHub load's download, blocks.
+            std::thread::sleep(SLOW_LOAD);
+        }
         Ok((self.changed("LoadModule"), None))
     }
     fn load_github(
@@ -363,4 +369,35 @@ async fn replacing_module_host_does_not_relax_broker_controller_admission() {
     .await
     .unwrap();
     assert_eq!(*replacement.0.lock().unwrap(), vec!["LoadModule"]);
+}
+
+/// The default test runtime has one thread: a load that blocks it would hold
+/// every other connection's call until the load returned.
+#[tokio::test]
+async fn a_slow_module_load_does_not_stall_other_bus_calls() {
+    let broker = Broker::new();
+    let _control = install_control(&broker);
+    let loader = peer(&broker, false).await;
+    let other = peer(&broker, false).await;
+    let started = std::time::Instant::now();
+    let load = tokio::spawn(async move {
+        invoke(
+            &loader,
+            "LoadModule",
+            serde_json::json!([SLOW_MODULE]),
+            None,
+        )
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    invoke(&other, "ListModules", serde_json::json!([]), None)
+        .await
+        .unwrap();
+    let waited = started.elapsed();
+    assert!(
+        waited < SLOW_LOAD / 2,
+        "ListModules waited {waited:?} behind another peer's module load"
+    );
+    load.await.unwrap().unwrap();
 }
