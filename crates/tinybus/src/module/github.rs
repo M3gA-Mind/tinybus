@@ -109,12 +109,11 @@ pub(crate) fn acquire(
     let located = locate(&agent, owner, repo, tag, asset_name)?;
     let manifest_sha = manifest_digest(&located, asset_name, expected_sha256)?;
 
-    let temp =
-        tempfile::tempdir().map_err(|_| refused("module extraction directory is unavailable"))?;
+    let temp = private_extraction_tempdir()?;
     let archive_path = temp.path().join(asset_name);
     download(&agent, &located.archive_url, &archive_path)?;
     verify_archive(&archive_path, &manifest_sha)?;
-    extract(asset_name, &archive_path, temp.path())?;
+    extract_private(asset_name, &archive_path, temp.path())?;
     let module = canonical_module(cache::find_module(temp.path())?)?;
     Ok((temp, module))
 }
@@ -155,10 +154,11 @@ pub(crate) fn acquire_cached(release: &CachedRelease<'_>) -> Result<(PathBuf, St
     let manifest_sha = manifest_digest(&located, release.asset_name, release.expected_sha256)?;
 
     let staging = cache::stage(release.cache_dir)?;
+    restrict_extraction_directory(staging.path())?;
     let archive_path = staging.path().join(release.asset_name);
     download(&agent, &located.archive_url, &archive_path)?;
     verify_archive(&archive_path, &manifest_sha)?;
-    extract(release.asset_name, &archive_path, staging.path())?;
+    extract_private(release.asset_name, &archive_path, staging.path())?;
     let module = cache::find_module(staging.path())?;
     let relative = module
         .strip_prefix(staging.path())
@@ -452,8 +452,49 @@ fn extract(name: &str, archive: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Extracts an archive and restores the extraction root's private permissions.
+fn extract_private(name: &str, archive: &Path, destination: &Path) -> Result<()> {
+    let extraction = extract(name, archive, destination);
+    let restriction = restrict_extraction_directory(destination);
+    extraction?;
+    restriction
+}
+
 fn refused(reason: impl Into<String>) -> Error {
     Error::module_refused(Path::new("github-release"), reason)
+}
+
+fn private_extraction_tempdir() -> Result<tempfile::TempDir> {
+    let temp = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            tempfile::Builder::new()
+                .permissions(std::fs::Permissions::from_mode(0o700))
+                .tempdir()
+        }
+        #[cfg(not(unix))]
+        {
+            tempfile::tempdir()
+        }
+    }
+    .map_err(|_| refused("module extraction directory is unavailable"))?;
+    restrict_extraction_directory(temp.path())?;
+    Ok(temp)
+}
+
+#[cfg(unix)]
+fn restrict_extraction_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|_| refused("release extraction directory permissions could not be secured"))
+}
+
+#[cfg(not(unix))]
+fn restrict_extraction_directory(_path: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[cfg(test)]
