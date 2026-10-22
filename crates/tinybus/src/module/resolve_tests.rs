@@ -593,6 +593,58 @@ mod resolver {
     }
 
     #[tokio::test]
+    async fn a_direct_admission_race_keeps_callback_resolution_available() {
+        use crate::module::HostCallbackEndpoint;
+
+        let record = record("resolver_callback_admission_race");
+        let runtime = shared_runtime();
+        let binding = Arc::new(
+            runtime
+                .host()
+                .prepare_host_callbacks(vec![HostCallbackEndpoint {
+                    path: "/callback".parse().unwrap(),
+                    interface: "org.example.Callback".parse().unwrap(),
+                    members: vec!["Observe".parse().unwrap()],
+                }])
+                .await
+                .unwrap(),
+        );
+        binding
+            .serve_at(
+                "/callback".parse().unwrap(),
+                ResolverCallback(Arc::new(AtomicUsize::new(0))),
+            )
+            .await
+            .unwrap();
+        let mut f = fixture(
+            record,
+            true,
+            HashMap::from([(
+                record.id.to_string(),
+                ModuleSource::LocalFile {
+                    path: "/unused/verified-module.so".to_owned(),
+                },
+            )]),
+            None,
+        );
+        f.resolver.after_initial_host_check = Some(Arc::new(|runtime, record| {
+            runtime
+                .host()
+                .attach_linked_with_config(linked_module_for(record), serde_json::json!({}))
+                .unwrap();
+        }));
+
+        assert!(
+            f.resolver
+                .ensure_loaded_with_host_callbacks(record.id, binding, serde_json::json!({}))
+                .await
+                .is_err()
+        );
+        assert_eq!(f.resolver.state_of(record.id), Availability::Ready);
+        f.resolver.ensure_loaded(record.id).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_callback_request_does_not_claim_resolution_when_runtime_start_fails() {
         use crate::module::HostCallbackEndpoint;
 

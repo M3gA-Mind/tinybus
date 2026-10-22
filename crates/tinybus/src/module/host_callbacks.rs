@@ -847,6 +847,21 @@ impl ModuleHost {
         Ok(())
     }
 
+    /// Whether this exact capability was retained by a successfully loaded module.
+    pub(crate) fn retains_host_callback_binding(&self, binding: &Arc<HostCallbackBinding>) -> bool {
+        self.inner
+            .loaded
+            .lock()
+            .expect("module list lock")
+            .iter()
+            .any(|module| {
+                module
+                    ._callback_binding
+                    .as_ref()
+                    .is_some_and(|retained| Arc::ptr_eq(retained, binding))
+            })
+    }
+
     /// Retain the resolver-owned callback capability with the admitted module.
     /// The module host is the lifetime owner because it owns the loaded library.
     pub(crate) fn retain_host_callback_binding(

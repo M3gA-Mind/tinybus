@@ -535,12 +535,27 @@ impl Resolver {
                 receiver
             }
             Claim::Run { sender, receiver } => {
-                self.start_resolution(record, sender, callbacks).await;
+                self.start_resolution(record, sender, callbacks.clone())
+                    .await;
                 receiver
             }
         };
         match resolution::global().wait(id, receiver, within).await {
-            Waited::Ready => Ok(()),
+            Waited::Ready => {
+                if let Some((binding, _)) = callbacks.as_ref() {
+                    let runtime = self.runtime().await.map_err(|_| {
+                        LoadError::Failed(format!(
+                            "module '{id}' is unavailable: the module bus could not start"
+                        ))
+                    })?;
+                    if !runtime.host().retains_host_callback_binding(binding) {
+                        return Err(LoadError::Failed(format!(
+                            "module '{id}' was loaded without the requested callback binding"
+                        )));
+                    }
+                }
+                Ok(())
+            }
             Waited::Failed(reason) => {
                 self.report(record, Reason::ResolutionFailed);
                 Err(LoadError::Failed(reason))
@@ -727,11 +742,7 @@ impl Resolver {
                     })
                     .await
                 };
-                return if callbacks.is_some() {
-                    result
-                } else {
-                    recover_admission(result, &runtime.host().list(), record)
-                };
+                return recover_admission(result, &runtime.host().list(), record);
             }
             Some(ModuleSource::Linked) => {
                 if callbacks.is_some() {
