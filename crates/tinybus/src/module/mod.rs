@@ -49,7 +49,7 @@ pub use github::CachedRelease;
 #[cfg(feature = "modules")]
 pub use host::callbacks::{
     HostCallbackBinding, HostCallbackEndpoint, HostCallbackGuard, HostCallbackProxy,
-    HostCallbackSignal,
+    HostCallbackSignal, HostStreamCallbackEndpoint,
 };
 #[cfg(feature = "modules")]
 pub use host::{ModuleHost, ModuleInfo, ModuleState};

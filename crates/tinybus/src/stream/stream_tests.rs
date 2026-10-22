@@ -415,6 +415,95 @@ async fn a_dropped_writer_aborts_the_stream_instead_of_leaving_it_open() {
 }
 
 #[tokio::test]
+async fn an_aborted_stream_remains_available_as_a_terminal_failure_until_accepted() {
+    let (client, service) = bus().await;
+    let destination = BusName::new(SINK).unwrap();
+    let mut writer = client
+        .open_stream(&destination, StreamDescriptor::with_len(4))
+        .await
+        .unwrap();
+    let stream = writer.stream_ref();
+    writer.write_chunk(b"a").await.unwrap();
+    writer.abort().await.unwrap();
+
+    // A stream can reach its terminal state before the method carrying its
+    // handle is dispatched. The late receiver must observe an aborted stream,
+    // rather than a missing handle that masks the sender's original failure.
+    let mut reader = service.accept_stream(&stream).unwrap();
+    assert_eq!(reader.next_chunk().await.unwrap().unwrap(), b"a");
+    assert!(matches!(
+        reader.next_chunk().await,
+        Err(Error::StreamAborted { .. })
+    ));
+}
+
+#[tokio::test]
+async fn abort_wakes_a_pending_write_and_retains_the_unclaimed_reader() {
+    let registry = Arc::new(crate::stream::StreamRegistry::new());
+    registry.set_limits(StreamLimits {
+        window_chunks: 1,
+        ..StreamLimits::default()
+    });
+    let owner: BusName = ":1.77".parse().unwrap();
+    let message = |member: &str, body: Value| {
+        let mut message = Message::method_call(
+            BusName::new(SINK).unwrap(),
+            ObjectPath::new(STREAM_PATH).unwrap(),
+            STREAM_INTERFACE.parse().unwrap(),
+            MemberName::new(member).unwrap(),
+            body,
+        );
+        message.header.sender = Some(owner.clone());
+        message
+    };
+
+    let open = message("Open", serde_json::json!([StreamDescriptor::default()]));
+    let id = registry
+        .dispatch(&open.header, open.body)
+        .await
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let first = message(
+        "Write",
+        serde_json::json!([&id, 0, crate::stream::base64::encode(b"first")]),
+    );
+    registry.dispatch(&first.header, first.body).await.unwrap();
+
+    let stream = registry.inbound.lock().unwrap().get(&id).unwrap().clone();
+    let second = message(
+        "Write",
+        serde_json::json!([&id, 1, crate::stream::base64::encode(b"second")]),
+    );
+    let registry_for_write = Arc::clone(&registry);
+    let pending_write = tokio::spawn(async move {
+        registry_for_write
+            .dispatch(&second.header, second.body)
+            .await
+    });
+    while stream.next_seq.load(std::sync::atomic::Ordering::Relaxed) < 2 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!pending_write.is_finished());
+
+    let abort = message("Abort", serde_json::json!([&id]));
+    registry.dispatch(&abort.header, abort.body).await.unwrap();
+    let write_result = tokio::time::timeout(Duration::from_secs(1), pending_write)
+        .await
+        .expect("abort must wake a chunk write blocked on the full window")
+        .unwrap();
+    assert!(matches!(write_result, Err(Error::StreamAborted { .. })));
+
+    let mut reader = registry.take_reader(&id).unwrap();
+    assert_eq!(reader.next_chunk().await.unwrap().unwrap(), b"first");
+    assert!(matches!(
+        reader.next_chunk().await,
+        Err(Error::StreamAborted { .. })
+    ));
+}
+
+#[tokio::test]
 async fn writing_to_a_stream_nobody_will_read_fails_instead_of_hanging_forever() {
     let (client, service) = bus().await;
     service.set_stream_limits(StreamLimits {
@@ -743,6 +832,34 @@ async fn a_closed_stream_nobody_collects_is_evicted_oldest_first() {
     );
     let mut kept = service.accept_stream(&handles[2]).unwrap();
     assert_eq!(kept.next_chunk().await.unwrap().unwrap(), b"data");
+}
+
+#[tokio::test]
+async fn an_unclaimed_aborted_stream_uses_the_bounded_closed_unread_slot() {
+    let (client, service) = bus().await;
+    service.set_stream_limits(StreamLimits {
+        max_streams_per_peer: 1,
+        ..StreamLimits::default()
+    });
+    let destination = BusName::new(SINK).unwrap();
+    let mut abandoned = client
+        .open_stream(&destination, StreamDescriptor::with_len(4))
+        .await
+        .unwrap();
+    let abandoned_ref = abandoned.stream_ref();
+    abandoned.write_chunk(b"a").await.unwrap();
+    abandoned.abort().await.unwrap();
+
+    // The next Open evicts an unclaimed terminal stream by the same policy as
+    // an unclaimed completed stream; abort retention cannot grow without bound.
+    let _next = client
+        .open_stream(&destination, StreamDescriptor::default())
+        .await
+        .unwrap();
+    assert!(matches!(
+        service.accept_stream(&abandoned_ref),
+        Err(Error::UnknownStream { .. })
+    ));
 }
 
 #[tokio::test]

@@ -42,6 +42,23 @@ impl ObjectTree {
         entry.push(interface);
     }
 
+    /// Export `interface` at `path` only when the complete path is vacant.
+    ///
+    /// Unlike [`Self::insert`], this never replaces a live implementation. The
+    /// caller holds the connection's object-tree write lock across this check
+    /// and insert, so concurrent registrations cannot both claim one address.
+    pub(crate) fn insert_if_absent(
+        &mut self,
+        path: ObjectPath,
+        interface: Arc<dyn Interface>,
+    ) -> bool {
+        if self.objects.contains_key(&path) {
+            return false;
+        }
+        self.objects.insert(path, vec![interface]);
+        true
+    }
+
     /// Stop exporting everything at `path`. Returns whether anything went away.
     pub fn remove(&mut self, path: &ObjectPath) -> bool {
         self.objects.remove(path).is_some()
