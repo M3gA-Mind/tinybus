@@ -525,7 +525,7 @@ impl HostCallbackBinding {
         context: &CallContext,
         endpoints: Vec<HostCallbackEndpoint>,
     ) -> Result<HostCallbackBinding> {
-        if !self.state.authorizes(context) {
+        if !HostCallbackGuard(self.state.clone()).authorizes(context) {
             return Err(Error::failed("callback child requires its live module"));
         }
         if endpoints.is_empty()
@@ -590,7 +590,7 @@ impl HostCallbackBinding {
             #[cfg(test)]
             physical_wait_started: Notify::new(),
         });
-        if !self.state.authorizes(context) {
+        if !HostCallbackGuard(self.state.clone()).authorizes(context) {
             return Err(Error::failed("callback parent was revoked during creation"));
         }
         self.broker
