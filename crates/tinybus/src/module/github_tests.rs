@@ -468,3 +468,70 @@ fn a_stalled_download_fails_within_the_stall_budget() {
     assert!(elapsed < Duration::from_millis(1500), "took {elapsed:?}");
     let _ = server.join();
 }
+
+/// Bytes that do not hash to the manifest digest are refused and leave neither
+/// a cache directory nor staging debris behind.
+#[test]
+fn a_download_that_disagrees_with_its_manifest_is_refused_and_cleaned_up() {
+    use std::io::{BufRead as _, Write as _};
+    let pinned = "e".repeat(64);
+    let manifest = format!("[sha256]\n\"m.tar.gz\" = \"{pinned}\"\n");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().take(2) {
+            let mut stream = stream.unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut line)
+                .unwrap();
+            let body: &[u8] = if line.contains("checksum.toml") {
+                manifest.as_bytes()
+            } else {
+                b"truncated archive bytes"
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(body);
+        }
+    });
+    cache::TEST_RELEASE_BASE.with(|slot| *slot.borrow_mut() = Some(base));
+    let root = tempfile::tempdir().unwrap();
+    let cache_dir = root.path().join("m").join("1.0.0").join("host");
+
+    let error = acquire_cached(&CachedRelease {
+        release_url: "https://github.com/o/r/releases/tag/v1",
+        asset_name: "m.tar.gz",
+        expected_sha256: Some(&pinned),
+        cache_dir: &cache_dir,
+        allow_download: true,
+    })
+    .expect_err("bytes disagree with the manifest");
+
+    assert!(
+        error
+            .to_string()
+            .contains("does not match its checksum manifest"),
+        "{error}"
+    );
+    assert!(!cache_dir.exists());
+    let debris: Vec<_> = walk(root.path())
+        .into_iter()
+        .filter(|path| path.to_string_lossy().contains(".staging"))
+        .collect();
+    assert!(debris.is_empty(), "{debris:?}");
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        out.push(entry.path());
+        if entry.path().is_dir() {
+            out.extend(walk(&entry.path()));
+        }
+    }
+    out
+}
