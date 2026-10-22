@@ -815,6 +815,38 @@ impl<I: Interface> Interface for GuardedInterface<I> {
 }
 
 impl ModuleHost {
+    /// Check that a callback binding can be attempted without consuming it.
+    /// The loader repeats this check while atomically marking the binding used.
+    pub(crate) fn validate_host_callback_binding(
+        &self,
+        binding: &HostCallbackBinding,
+    ) -> Result<()> {
+        if !Arc::ptr_eq(&self.inner.broker.router, &binding.broker.router)
+            || !binding
+                .owner
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, &self.inner))
+        {
+            return Err(Error::failed(
+                "callback binding belongs to another host owner",
+            ));
+        }
+        let state = binding
+            .state
+            .lifetime
+            .lock()
+            .expect("callback lifetime lock");
+        if state.used
+            || state.revoked
+            || state.served.len() != binding.state.required_endpoint_count()
+        {
+            return Err(Error::failed(
+                "callback binding is already used or endpoints are missing",
+            ));
+        }
+        Ok(())
+    }
+
     /// Retain the resolver-owned callback capability with the admitted module.
     /// The module host is the lifetime owner because it owns the loaded library.
     pub(crate) fn retain_host_callback_binding(

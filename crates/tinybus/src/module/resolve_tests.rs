@@ -514,6 +514,84 @@ mod resolver {
         }
     }
 
+    fn linked_module_for(record: &ReleaseRecord) -> LinkedModule {
+        let mut manifest = super::module(record.id, &[], &[]);
+        manifest.bus_name = crate::BusName::new(record.bus_name).unwrap();
+        manifest.object_path = crate::ObjectPath::new(record.object_path).unwrap();
+        LinkedModule {
+            descriptor: crate::module::abi::TbAbiDescriptor::current(record.id, "1.0.0"),
+            manifest,
+            init: initialize_raced_module,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_foreign_callback_binding_does_not_poison_ordinary_resolution() {
+        use crate::module::HostCallbackEndpoint;
+        use crate::module::runtime::{ModuleRuntime, RuntimeNames};
+
+        let record = record("resolver_callback_bad_binding");
+        let _runtime = shared_runtime();
+        let foreign_runtime = ModuleRuntime::start(
+            &RuntimeNames {
+                thread: "tinybus-test-foreign-callback".to_owned(),
+                worker: "tinybus-test-foreign-callback-worker".to_owned(),
+            },
+            None,
+        )
+        .unwrap();
+        let binding = Arc::new(
+            foreign_runtime
+                .host()
+                .prepare_host_callbacks(vec![HostCallbackEndpoint {
+                    path: "/callback".parse().unwrap(),
+                    interface: "org.example.Callback".parse().unwrap(),
+                    members: vec!["Observe".parse().unwrap()],
+                }])
+                .await
+                .unwrap(),
+        );
+        binding
+            .serve_at(
+                "/callback".parse().unwrap(),
+                ResolverCallback(Arc::new(AtomicUsize::new(0))),
+            )
+            .await
+            .unwrap();
+        let mut f = fixture(
+            record,
+            true,
+            HashMap::from([(
+                record.id.to_string(),
+                ModuleSource::LocalFile {
+                    path: "/unused/verified-module.so".to_owned(),
+                },
+            )]),
+            None,
+        );
+
+        assert!(
+            f.resolver
+                .ensure_loaded_with_host_callbacks(record.id, binding, serde_json::json!({}))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            f.resolver.state_of(record.id),
+            Availability::Available,
+            "invalid callback binding poisoned the module resolution slot"
+        );
+
+        f.resolver.after_initial_host_check = Some(Arc::new(move |runtime, _| {
+            runtime
+                .host()
+                .attach_linked_with_config(linked_module_for(record), serde_json::json!({}))
+                .unwrap();
+        }));
+        f.resolver.ensure_loaded(record.id).await.unwrap();
+        assert_eq!(f.resolver.state_of(record.id), Availability::Ready);
+    }
+
     #[tokio::test]
     async fn a_callback_request_does_not_claim_resolution_when_runtime_start_fails() {
         use crate::module::HostCallbackEndpoint;

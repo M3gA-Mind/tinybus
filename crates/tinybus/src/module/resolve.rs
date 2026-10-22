@@ -474,7 +474,7 @@ impl Resolver {
             return Err(LoadError::Disabled(label));
         }
 
-        if callbacks.is_some() {
+        if let Some((binding, _)) = callbacks.as_ref() {
             if !matches!(
                 self.inner.sources.get(id),
                 Some(ModuleSource::LocalFile { .. })
@@ -489,6 +489,14 @@ impl Resolver {
                     "module '{id}' is unavailable: the module bus could not start"
                 ))
             })?;
+            runtime
+                .host()
+                .validate_host_callback_binding(binding)
+                .map_err(|error| {
+                    LoadError::Failed(format!(
+                        "module '{id}' callback binding is invalid: {error}"
+                    ))
+                })?;
             if runtime
                 .host()
                 .list()
