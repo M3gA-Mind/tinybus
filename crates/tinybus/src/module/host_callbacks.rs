@@ -590,19 +590,19 @@ impl HostCallbackBinding {
             #[cfg(test)]
             physical_wait_started: Notify::new(),
         });
+        let mut router = self.broker.router.lock().expect("router lock");
         if !HostCallbackGuard(self.state.clone()).authorizes(context) {
             return Err(Error::failed("callback parent was revoked during creation"));
         }
-        self.broker
-            .router
-            .lock()
-            .expect("router lock")
-            .add_host_callbacks(child.clone())?;
-        self.state
+        router.add_host_callbacks(child.clone())?;
+        let mut children = self
+            .state
             .children
             .lock()
-            .expect("callback children lock")
-            .push(Arc::downgrade(&child));
+            .expect("callback children lock");
+        children.push(Arc::downgrade(&child));
+        drop(children);
+        drop(router);
         rollback.committed = true;
         Ok(HostCallbackBinding {
             owner: self.owner.clone(),
