@@ -724,6 +724,11 @@ async fn callback_streams_reject_other_peers_nonconfidential_calls_and_revoked_b
     let outsider_peer = outsider.unique_name().unwrap();
     let wrong_peer = CallContext::brokered(Some(&outsider_peer), false);
     let confidential_call = CallContext::brokered(Some(&module_peer), true);
+    let guard = binding.guard();
+    assert!(!guard.authorizes(&context));
+    assert!(guard.authorizes_stream(&context));
+    assert!(!guard.authorizes_stream(&wrong_peer));
+    assert!(!guard.authorizes_stream(&confidential_call));
     let stream = StreamRef {
         id: "not-opened".to_owned(),
         content_type: None,
@@ -762,6 +767,7 @@ async fn callback_streams_reject_other_peers_nonconfidential_calls_and_revoked_b
     );
 
     binding.revoke();
+    assert!(!guard.authorizes_stream(&context));
     assert!(
         binding
             .accept_stream_from_module(&context, &stream)
