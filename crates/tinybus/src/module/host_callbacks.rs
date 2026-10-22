@@ -511,11 +511,7 @@ impl HostCallbackBinding {
     /// Running user futures remain accounted for until actual completion/drop.
     pub fn revoke(&self) {
         let descendants = self.state.live_descendants();
-        let mut router = self
-            .broker
-            .router
-            .lock()
-            .expect("router lock");
+        let mut router = self.broker.router.lock().expect("router lock");
         router.revoke_host_callbacks(&self.state);
         for child in descendants {
             router.revoke_host_callbacks(&child);

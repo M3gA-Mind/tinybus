@@ -166,11 +166,12 @@ async fn draining_a_binding_waits_for_running_grandchild_callbacks() {
     grandchild.state.lifetime.lock().unwrap().running = 1;
 
     let mut drain = Box::pin(parent.state.drain(Duration::from_secs(1)));
-    let first_poll = std::future::poll_fn(|context| {
-        std::task::Poll::Ready(drain.as_mut().poll(context))
-    })
-    .await;
-    assert!(first_poll.is_pending(), "drain must include live grandchildren");
+    let first_poll =
+        std::future::poll_fn(|context| std::task::Poll::Ready(drain.as_mut().poll(context))).await;
+    assert!(
+        first_poll.is_pending(),
+        "drain must include live grandchildren"
+    );
 
     grandchild.state.lifetime.lock().unwrap().running = 0;
     grandchild.state.drained.notify_waiters();
@@ -216,13 +217,15 @@ async fn child_creation_prunes_expired_parent_entries() {
         .create_child_binding(&context, vec![endpoint()])
         .await
         .unwrap();
-    assert!(parent
-        .state
-        .children
-        .lock()
-        .unwrap()
-        .iter()
-        .all(|child| child.strong_count() != 0));
+    assert!(
+        parent
+            .state
+            .children
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|child| child.strong_count() != 0)
+    );
 
     broker_task.abort();
 }
