@@ -59,6 +59,7 @@ fn state(source: BusName, destination: BusName) -> Arc<CallbackState> {
         stream_endpoints: vec![],
         signals: vec![signal_declaration()],
         module_transport: Mutex::new(None),
+        children: Mutex::new(Vec::new()),
         lifetime: Mutex::new(Lifetime {
             active: true,
             used: true,
