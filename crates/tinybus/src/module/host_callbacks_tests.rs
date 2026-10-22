@@ -139,6 +139,13 @@ async fn draining_a_binding_waits_for_running_grandchild_callbacks() {
         .await
         .unwrap();
     let module_peer = module.unique_name().unwrap();
+    broker.attest_module(
+        &module_peer,
+        crate::attest::Attestation {
+            name: "org.example.NestedDrainTest".parse().unwrap(),
+            sha256: "a".repeat(64),
+        },
+    );
     let (module_transport, _) =
         crate::module::transport::ModuleTransport::new("nested-drain-test".into(), vec![]);
     *parent.state.module_transport.lock().unwrap() = Some(Arc::downgrade(&module_transport));
@@ -183,6 +190,13 @@ async fn child_creation_prunes_expired_parent_entries() {
         .await
         .unwrap();
     let module_peer = module.unique_name().unwrap();
+    broker.attest_module(
+        &module_peer,
+        crate::attest::Attestation {
+            name: "org.example.ExpiredChildTest".parse().unwrap(),
+            sha256: "a".repeat(64),
+        },
+    );
     let (module_transport, _) =
         crate::module::transport::ModuleTransport::new("expired-child-test".into(), vec![]);
     *parent.state.module_transport.lock().unwrap() = Some(Arc::downgrade(&module_transport));
