@@ -1460,6 +1460,9 @@ impl Future for TerminalSetupPoll {
                 |future| future.as_mut().poll(cx),
             )
         }));
+        // PROBE ONLY (never merged): widen the window in which a poll holds the
+        // future outside its slot, to make the test's race deterministic.
+        std::thread::sleep(std::time::Duration::from_millis(300));
         *self
             .slot
             .lock()
