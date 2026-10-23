@@ -607,7 +607,12 @@ impl Broker {
             return Some((result, Vec::new()));
         }
 
-        let outcome = (|| -> Result<(Value, Vec<Value>)> {
+        // A load maps a library, a GitHub load downloads and verifies a release
+        // and a rescan walks directories: all blocking, so they run on the
+        // blocking pool rather than stalling every other connection's routing.
+        let member = member.clone();
+        let outcome = tokio::task::spawn_blocking(move || -> Result<(Value, Vec<Value>)> {
+            let member = &member;
             match operation {
                 ModuleMember::List => Ok((serde_json::to_value(control.list())?, Vec::new())),
                 ModuleMember::Get => {
@@ -712,7 +717,13 @@ impl Broker {
                     ))
                 }
             }
-        })();
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Err(Error::failed(format!(
+                "module control call failed: {error}"
+            )))
+        });
         Some(match outcome {
             Ok((value, states)) => (Ok(value), states),
             Err(error) => (Err(error), Vec::new()),
