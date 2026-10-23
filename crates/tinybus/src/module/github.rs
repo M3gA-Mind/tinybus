@@ -172,15 +172,40 @@ pub(crate) fn acquire_cached(release: &CachedRelease<'_>) -> Result<(PathBuf, St
         .map_err(|_| refused("release module is outside its staging directory"))?
         .to_path_buf();
     cache::write_digest_marker(staging.path(), release.asset_name, &manifest_sha)?;
+    commit_or_reuse(staging, release, &relative, manifest_sha)
+}
 
-    if let Err(error) = cache::commit(staging, release.cache_dir) {
-        // Another process may have committed the same release first; its files
-        // are as good as ours if they verify. Otherwise the failure stands.
-        if let Some(hit) = cache::find_verified(
+/// Move a verified staging directory into the cache, unless another process
+/// filled it while this one downloaded. [`cache::commit`] replaces whatever is
+/// there, and a directory that already verifies may hold a module a running
+/// sibling has mapped; its files are as good as ours, so they are kept.
+///
+/// ponytail: a sibling can still commit between the check and the rename; a
+/// cross-process `File::lock` closes that window once the Rust floor is 1.89.
+fn commit_or_reuse(
+    staging: tempfile::TempDir,
+    release: &CachedRelease<'_>,
+    relative: &Path,
+    manifest_sha: String,
+) -> Result<(PathBuf, String)> {
+    let concurrent_fill = || {
+        cache::find_verified(
             release.cache_dir,
             release.asset_name,
             release.expected_sha256,
-        ) {
+        )
+    };
+    if let Some(hit) = concurrent_fill() {
+        info!(
+            asset = release.asset_name,
+            "release cache: a concurrent fill already verifies; keeping it"
+        );
+        return Ok((hit.module, hit.sha256));
+    }
+    if let Err(error) = cache::commit(staging, release.cache_dir) {
+        // Another process may have committed the same release first; its files
+        // are as good as ours if they verify. Otherwise the failure stands.
+        if let Some(hit) = concurrent_fill() {
             warn!(
                 asset = release.asset_name,
                 "release cache: commit lost a race; using the concurrent fill"
