@@ -796,6 +796,17 @@ async fn actual_linked_rejected_physical_spawn_retains_received_resources_withou
     assert_eq!(fixture.requests.load(Ordering::Acquire), 1);
     assert_eq!(fixture.finishes.load(Ordering::Acquire), 0);
     let anchored = terminal::TerminalState::lookup(context).unwrap();
+    // A setup poll takes the future out of its slot and puts it back once the
+    // poll returns; wait for it to be reattached instead of sampling the slot
+    // while a poll still holds it.
+    let initial_future = anchored.resources.lock().unwrap().initial_future.clone();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while initial_future.lock().unwrap().is_none() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the retained initial future must be reattached to its slot");
     let resources = anchored.resources.lock().unwrap();
     assert!(resources.retained_factory.is_some());
     assert!(resources.runtime.is_some());
