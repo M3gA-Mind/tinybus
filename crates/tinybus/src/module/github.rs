@@ -109,6 +109,7 @@ pub(crate) fn acquire(
     asset_name: &str,
     expected_sha256: Option<&str>,
 ) -> Result<(tempfile::TempDir, PathBuf)> {
+    check_asset_name(asset_name)?;
     let (owner, repo, tag) = parse_release_url(release_url)?;
     let agent = agent();
     let located = locate(&agent, owner, repo, tag, asset_name)?;
@@ -138,6 +139,7 @@ pub(crate) fn acquire(
 /// downloads are disabled, the release cannot be fetched or fails verification,
 /// or the cache directory cannot be written.
 pub(crate) fn acquire_cached(release: &CachedRelease<'_>) -> Result<(PathBuf, String)> {
+    check_asset_name(release.asset_name)?;
     let (owner, repo, tag) = parse_release_url(release.release_url)?;
     if let Some(hit) = cache::find_verified(
         release.cache_dir,
@@ -500,6 +502,18 @@ fn extract_private(name: &str, archive: &Path, destination: &Path) -> Result<()>
     let restriction = restrict_extraction_directory(destination);
     extraction?;
     restriction
+}
+
+/// The asset name is joined onto the cache and extraction directories, so it
+/// must name one file inside them before anything touches the filesystem.
+fn check_asset_name(asset_name: &str) -> Result<()> {
+    if cache::is_safe_path_component(asset_name) {
+        Ok(())
+    } else {
+        Err(refused(format!(
+            "release asset name `{asset_name}` is not a plain file name"
+        )))
+    }
 }
 
 fn refused(reason: impl Into<String>) -> Error {

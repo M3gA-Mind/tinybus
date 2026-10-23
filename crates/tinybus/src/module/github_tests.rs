@@ -86,6 +86,36 @@ fn a_cache_miss_with_downloads_disabled_is_refused_without_the_network() {
 }
 
 #[test]
+fn an_asset_name_that_leaves_the_cache_directory_is_refused() {
+    // A verified archive one level above the version directory: a `..` asset
+    // name used to reach it and answer from outside the cache.
+    let directory = tempfile::tempdir().unwrap();
+    let cache_dir = directory.path().join("demo").join("1.0.0");
+    std::fs::create_dir_all(&cache_dir).unwrap();
+    let outside = directory.path().join("demo").join("escape.tar.gz");
+    std::fs::write(&outside, b"archive").unwrap();
+    std::fs::write(
+        cache_dir.join(format!("libdemo_module.{}", cache::library_extension())),
+        b"library",
+    )
+    .unwrap();
+    let digest = crate::module::sha256_file(&outside).unwrap();
+
+    let error = acquire_cached(&CachedRelease {
+        release_url: "https://github.com/tinyhumansai/demo/releases/tag/v1.0.0",
+        asset_name: "../escape.tar.gz",
+        expected_sha256: Some(&digest),
+        cache_dir: &cache_dir,
+        allow_download: false,
+    })
+    .expect_err("an asset name outside the cache directory must be refused");
+    assert!(
+        error.to_string().contains("not a plain file name"),
+        "{error}"
+    );
+}
+
+#[test]
 fn a_verified_cache_answers_without_the_network() {
     let directory = tempfile::tempdir().unwrap();
     let cache_dir = directory.path().join("demo").join("1.0.0");
