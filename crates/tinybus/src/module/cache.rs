@@ -533,7 +533,21 @@ pub(crate) fn commit(staging: tempfile::TempDir, dir: &Path) -> Result<()> {
 /// it through the REST API costs an unauthenticated request against a budget
 /// shared by everyone behind one address.
 pub(crate) fn release_download_url(owner: &str, repo: &str, tag: &str, asset_name: &str) -> String {
-    format!("https://github.com/{owner}/{repo}/releases/download/{tag}/{asset_name}")
+    #[cfg(test)]
+    let base = TEST_RELEASE_BASE
+        .with(|base| base.borrow().clone())
+        .unwrap_or_else(|| "https://github.com".to_owned());
+    #[cfg(not(test))]
+    let base = "https://github.com";
+    format!("{base}/{owner}/{repo}/releases/download/{tag}/{asset_name}")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Points this thread's release downloads at a local server, so a test can
+    /// drive a real download through verification without the network.
+    pub(crate) static TEST_RELEASE_BASE: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn refused(path: &Path, reason: &'static str) -> Error {
